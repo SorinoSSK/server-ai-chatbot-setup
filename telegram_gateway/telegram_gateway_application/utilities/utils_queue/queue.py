@@ -42,6 +42,11 @@ _channel_consume = None
 _consumer_thread = None
 _consumer_running = False
 
+# Tracks failed attempts per message body, so a deterministically-failing message is
+# eventually dropped instead of being requeued forever. In-memory only - only ever
+# touched from the single consumer thread (pika callbacks run sequentially), no lock needed.
+_message_attempts: dict[bytes, int] = {}
+
 # =============================================================================
 
 def _build_rabbitmq_parameters() -> pika.ConnectionParameters:
@@ -51,8 +56,8 @@ def _build_rabbitmq_parameters() -> pika.ConnectionParameters:
         port=settings.Q_PORT,
         virtual_host=settings.Q_VHOST,
         credentials=credentials,
-        heartbeat=600,
-        blocked_connection_timeout=300
+        heartbeat=settings.Q_HEARTBEAT,
+        blocked_connection_timeout=settings.Q_BLOCKED_CONNECTION_TIMEOUT
     )
 
 def initialise_rabbitmq_publish_connection() -> None:
@@ -204,29 +209,52 @@ def get_rabbitmq_consume_channel() -> pika.adapters.blocking_connection.Blocking
 
 def queue_push_task(payload: dict) -> bool:
     """
-    Push a task into a RabbitMQ queue.
+    Push a task into a RabbitMQ queue, retrying on connection failure up to Q_PUSH_MAX_ATTEMPTS times.
 
     Args:
         - payload (dict)
 
     Returns:
         - bool:
-            True if the message was successfully published to RabbitMQ; otherwise, False.
+            True if the message was successfully published to RabbitMQ; otherwise, False once all attempts are exhausted.
+
+    Notes:
+        - UnroutableError is not retried - the queue/binding itself is misconfigured, so retrying would not help.
+        - AMQPConnectionError/StreamLostError/ChannelWrongStateError/ChannelClosed are retried, with
+          Q_PUSH_RETRY_DELAY seconds between attempts - these are the failure types expected if RabbitMQ
+          itself is down/restarting, or the broker force-closed the channel.
+        - Any other exception is intentionally left uncaught here, rather than added to the retry set -
+          see poll_updates()'s outer except Exception, which logs the full traceback instead of folding
+          an unexpected bug into the same retry-and-give-up path as a genuine outage.
     """
-    try:
-        channel = get_rabbitmq_publish_channel()
-        channel.queue_declare(queue=settings.Q_CHANNEL_OUT, durable=True)
-        channel.basic_publish(
-            exchange="",
-            routing_key=settings.Q_CHANNEL_OUT,
-            body=json.dumps(payload),
-            properties=pika.BasicProperties(
-                delivery_mode=pika.DeliveryMode.Persistent
+    for attempt in range(1, settings.Q_PUSH_MAX_ATTEMPTS + 1):
+        try:
+            channel = get_rabbitmq_publish_channel()
+            channel.queue_declare(queue=settings.Q_CHANNEL_OUT, durable=True)
+            channel.basic_publish(
+                exchange="",
+                routing_key=settings.Q_CHANNEL_OUT,
+                body=json.dumps(payload),
+                properties=pika.BasicProperties(
+                    delivery_mode=pika.DeliveryMode.Persistent
+                )
             )
-        )
-        return True
-    except pika.exceptions.UnroutableError:
-        return False
+            return True
+        except pika.exceptions.UnroutableError:
+            logger.error("RabbitMQ rejected task as unroutable. Not retrying.")
+            return False
+        except (
+            pika.exceptions.AMQPConnectionError,
+            pika.exceptions.StreamLostError,
+            pika.exceptions.ChannelWrongStateError,
+            pika.exceptions.ChannelClosed,
+        ):
+            logger.warning(f"RabbitMQ push attempt {attempt}/{settings.Q_PUSH_MAX_ATTEMPTS} failed.")
+            if attempt < settings.Q_PUSH_MAX_ATTEMPTS:
+                time.sleep(settings.Q_PUSH_RETRY_DELAY)
+
+    logger.error(f"Failed to push task to RabbitMQ after {settings.Q_PUSH_MAX_ATTEMPTS} attempts.")
+    return False
 
 def queue_pull_task() -> dict | None:
     """
@@ -270,7 +298,13 @@ def queue_consume_task():
             Propagated internally to trigger reconnection handling.
     Notes:
         - Declares the queue before consuming.
-        - Acks processed messages; nacks failed ones with requeue enabled.
+        - Acks processed messages.
+        - An undecodable message body is dropped immediately (not requeued) - the bytes
+          never change on redelivery, so retrying cannot fix it.
+        - Any other processing failure is requeued and retried up to Q_CONSUME_MAX_ATTEMPTS
+          times (tracked per message body in _message_attempts), then dropped - see
+          message_handler.py's process_message() for failures it deliberately does not
+          raise (and so never reach this retry logic in the first place).
         - Reconnects automatically on connection/stream/channel failures.
         - Controlled by the global _consumer_running flag.
     """
@@ -287,11 +321,26 @@ def queue_consume_task():
             def callback(ch, method, properties, body):
                 try:
                     payload = body.decode()
+                except UnicodeDecodeError:
+                    logger.error("Received RabbitMQ message with an undecodable body. Dropping (not requeued).")
+                    ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
+                    return
+
+                try:
                     process_message(payload)
                     ch.basic_ack(delivery_tag=method.delivery_tag)
+                    _message_attempts.pop(body, None)
                 except Exception:
-                    logger.exception("Failed to process incoming RabbitMQ message.")
-                    ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
+                    attempts = _message_attempts.get(body, 0) + 1
+                    _message_attempts[body] = attempts
+
+                    if attempts >= settings.Q_CONSUME_MAX_ATTEMPTS:
+                        logger.exception(f"Giving up on message after {attempts} attempts. Dropping (not requeued).")
+                        _message_attempts.pop(body, None)
+                        ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
+                    else:
+                        logger.exception(f"Failed to process incoming RabbitMQ message (attempt {attempts}/{settings.Q_CONSUME_MAX_ATTEMPTS}). Requeuing...")
+                        ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
 
             channel.basic_consume(
                 queue=settings.Q_CHANNEL_IN,
@@ -306,10 +355,10 @@ def queue_consume_task():
             pika.exceptions.ChannelWrongStateError,
         ):
             logger.warning("RabbitMQ consumer disconnected. Reconnecting...")
-            time.sleep(5)
+            time.sleep(settings.Q_CONSUME_RETRY_DELAY)
         except Exception:
             logger.exception("Unexpected RabbitMQ consumer error detected.")
-            time.sleep(5)
+            time.sleep(settings.Q_CONSUME_RETRY_DELAY)
 
 def start_queue_consumer():
     """
