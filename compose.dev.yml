@@ -1,0 +1,66 @@
+services:
+  telegram-gateway:
+    image: "${CHATBOT_TELEGRAM_GATEWAY_DEV_IMAGE_NAME}"
+    container_name: "${CHATBOT_TELEGRAM_GATEWAY_DEV_CONTAINER_NAME}"
+    environment:
+      TZ: "Asia/Singapore"
+      TELEGRAM_BOT_TOKEN: "${CHATBOT_TELEGRAM_BOT_TOKEN}"
+      TELEGRAM_ALLOWED_CHAT_IDS: "${CHATBOT_TELEGRAM_ALLOWED_CHAT_IDS}"
+    # ports:
+    #   - "${CHATBOT_TELEGRAM_GATEWAY_DEV_PORT}:${CHATBOT_TELEGRAM_GATEWAY_DEV_PORT}"
+    volumes:
+      - "${DEV_PATH}/${CHATBOT_TELEGRAM_GATEWAY_PATH_NAME}/telegram_gateway_application:/telegram_gateway/telegram_gateway_application"
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    networks:
+      - "chatbot-app-network"
+    restart: unless-stopped
+
+  rabbitmq:
+    image: "rabbitmq:4.3.5-management"
+    container_name: "${CHATBOT_RABBITMQ_CONTAINER_NAME}"
+    environment:
+      RABBITMQ_DEFAULT_USER: "${CHATBOT_RABBITMQ_USERNAME}"
+      RABBITMQ_DEFAULT_PASS: "${CHATBOT_RABBITMQ_PASSWORD}"
+      RABBITMQ_DEFAULT_VHOST: "${CHATBOT_RABBITMQ_VHOST}"
+    # ports:
+    #   - "40000:5672"
+    #   - "40002:15672"
+    networks:
+      - "chatbot-app-network"
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "check_running"]
+      interval: "10s"
+      timeout: "5s"
+      retries: 5
+    restart: unless-stopped
+
+  redis:
+    image: "redis:7.4-alpine"
+    container_name: "${CHATBOT_REDIS_CONTAINER_NAME}"
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "always"]
+    # ports:
+    #   - "${CHATBOT_REDIS_PORT}:6379"
+    volumes:
+      - "redis_data:/data"
+    networks:
+      - "chatbot-app-network"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: "10s"
+      timeout: "5s"
+      retries: 5
+    restart: unless-stopped
+
+volumes:
+  redis_data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: "${CHATBOT_REDIS_DATA_PATH}"
+
+networks:
+  chatbot-app-network:
+    name: "chatbot-app-network"

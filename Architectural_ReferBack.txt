@@ -1,0 +1,1496 @@
+ ▐▛███▛█   Claude Code v2.1.251
+▝▜██████▀  Sonnet 5 · Claude Pro
+  ▝▝ ▝▝    ~/repository/V-Project-Multimedia-Application
+
+
+❯ No implementation is to be made. There is a new objectives to create a AI     
+  chat bot that would communicate with telegram to develop, deploy, and update  
+  code. The AI Bot should be able to test, pull, push, and modify code.         
+  However, the code must go through code review by a user on a frontend. The    
+  frontend will be tokenised in such a link to be sent to the user through a    
+  telegram bot. The link will exist solely for the code review and nothing      
+  else. E.g. www.exmaple.com/<some token>. No login will be required and the    
+  link will be taken down after a fix hour have gone by or if the user reject   
+  or accept the changes. If the link expire and is remove, the agent can task   
+  the telegram bot to re-send another tokenised link. a bearer token can be     
+  generated and sent by the telegram bot for a 2 layer protection. However,     
+  there is a critical requirement to it. The agent may be working with many     
+  different git repository, some maybe on github, some will be on it's host     
+  device that is never sent to a cloud. A git diff or a git system should be    
+  deployed on the host for the agent to pull the repository. The current code   
+  or application on the host is run fully on the host and a backup will be made 
+  within the host. The agent will be given a sand box and the sand box will     
+  allow the agent to test, develop, and deploy code. The agent will have full   
+  access to the sandbox it has and could refer to old code bade for references. 
+  The agent can only pull repository when a user allows it to, but it is        
+  allowed to push for review. The agent will organise each repository on it's   
+  own in an orderly mannger. Each features of the above will be made in a       
+  dockerised setup. The current plan is as follow: 1) create a new docker       
+  bridge to isolate network from all current application running on the         
+  network. 2) create a docker to manage messages going in and out of telegram   
+  bot 3) create a docker to contain AI agents the docker should be able to      
+  allow multiple AI Agents from different organisation to co-exist. 4) using    
+  rabbitMQ solely for communication between telegram bot and the ai agent       
+  container. 5) create a docker for AI agent to pull and push code for code     
+  that exist on the host, that container will have pipeline setup for code      
+  review and deployment. 6) a front end will be developed and deployed onto     
+  netlify for review. Suggest the feasibility of the architecture and weigh for 
+  weaknesses. Look into code review on how the git like docker should be like   
+  and whether a new container to contain the review endpoint API should be      
+  developed. Database has yet to be considered in this case.                    
+
+  Searched for 2 patterns (ctrl+o to expand)
+
+● Summary
+
+  The overall shape is sound — event‑driven, container‑per‑concern,
+  broker‑decoupled — and matches patterns you already use (RabbitMQ, SSE,
+  bearer‑token auth in mediaAPI). The main risks aren't in the six steps
+  themselves but in what sits between them: how a public Netlify frontend talks
+  to a host that must stay network‑isolated, how "git access" is exposed for
+  review, and how multi‑tenant agents are isolated from each other. Below is a
+  breakdown, then the specific answer to your git/review‑API question.
+
+  ---
+
+  Component view (as proposed + implied gaps)
+
+  Telegram  ──AMQP──►  [1] Telegram Gateway  ──AMQP──►  [3] AI Agent
+  Container(s)
+                                                              │
+                                                              │ (only when user
+  allows "pull")
+                                                              ▼
+                                                      [5] Repo/Sandbox Container
+                                                      (git ops, tests, sandbox,
+  pipeline)
+                                                              │
+                                                         diff/patch + result
+                                                              ▼
+                                            [NEW] Review API (public-facing
+  gateway)
+                                                              ▲
+                                                              │  HTTPS (token in
+  URL + bearer)
+                                                              ▼
+                                            [6] Frontend (Netlify, static)
+
+  Everything left of the "Review API" box should stay behind your new isolated
+  bridge network. Only the Review API should ever be reachable from the
+  internet.
+
+  ---
+
+  Feasibility per step
+
+  Step: 1. Isolated docker bridge
+  Feasibility: Good
+  Notes: Standard blast‑radius containment. Also segment within this network
+  (agent ↔ repo container shouldn't be flat/open either).
+  ────────────────────────────────────────
+  Step: 2. Telegram gateway container
+  Feasibility: Good
+  Notes: Matches typical bot‑adapter pattern; keep it dumb (translate Telegram ↔
+
+  AMQP only, no business logic).
+  ────────────────────────────────────────
+  Step: 3. Multi-org AI agent container
+  Feasibility: Risky as a single shared container
+  Notes: See "Weaknesses" below — recommend per‑agent/per‑org isolation, not one
+
+  shared process space.
+  ────────────────────────────────────────
+  Step: 4. RabbitMQ for telegram↔agent
+  Feasibility: Good, but incomplete
+  Notes: You'll also need messaging (or at least eventing) between
+  agent↔repo‑container and repo‑container↔review API. RabbitMQ can be reused
+  end‑to‑end; the public‑facing hop still needs HTTP/WebSocket since Netlify
+  can't speak AMQP.
+  ────────────────────────────────────────
+  Step: 5. Repo/pull‑push/pipeline container
+  Feasibility: Good concept
+  Notes: This should own all git credentials and all git operations. Nothing
+  else
+  should touch git directly.
+  ────────────────────────────────────────
+  Step: 6. Frontend on Netlify
+  Feasibility: Good for UI, insufficient alone
+  Notes: Netlify is static-only. You need a backend it can call — that's the
+  missing "Review API" piece.
+
+  ---
+
+  Key weaknesses to weigh
+
+  1. Public ingress punches a hole in your isolation goal
+  Step 1's entire purpose is isolating this stack from the network. But step 6
+  requires a public URL. You need one narrow, dedicated ingress point (reverse
+  proxy / tunnel, e.g. Traefik, Nginx, or Cloudflare Tunnel) that exposes only
+  the Review API's token‑validated endpoints — never the repo container, agent
+  container, or RabbitMQ directly.
+
+  2. Token-in-URL as sole first factor has known leak vectors
+  - Browser history, Referer headers, proxy/CDN logs, Telegram message
+    forwarding.
+  - Mitigations (all standard, all optional to implement now):
+    - Server-side TTL enforcement (don't trust a JWT exp alone — track
+      "used/expired" state).
+    - Single-use or single-session tokens; invalidate on first successful load,
+      not just after decision.
+    - Avoid embedding the token in a query string where possible (path segment
+      is marginally better; avoid GET-with-Referer-leak to third-party assets on
+      the review page).
+    - The bearer token idea is good as a genuine second factor (something
+      Telegram-side, something link-side) — just ensure it's checked server-side
+      on every review action, not just on page load.
+
+  3. "Git-like docker" — don't expose git protocol publicly
+  Two repo categories exist:
+  - GitHub-hosted repos: agent can clone/fetch normally using scoped credentials
+    held only inside the repo container.
+  - Host-only repos (never touch cloud): keep as bare repos on the host; agent
+    works against a local clone/worktree inside its sandbox.
+
+  For review, you don't need to expose git at all to the frontend. The repo
+  container should generate a diff/patch artifact + metadata (files changed,
+  test results, commit message) and hand that off — the frontend/reviewer only
+  ever sees a diff payload, not a live git endpoint. This is smaller attack
+  surface, keeps host-only repos fully off any public path, and avoids having to
+  secure a git server for the internet.
+
+  4. Should there be a separate Review API container? — Yes, recommended
+  Don't let the repo/pipeline container (step 5) be the thing Netlify talks to.
+  Reasons:
+  - Step 5's container holds git credentials and pipeline execution — it should
+    never be internet-facing.
+  - A thin Review API / BFF container should:
+    - Consume "diff ready" events from RabbitMQ (or receive them via internal
+      call from step 5).
+    - Mint/validate the tokenised link and bearer token.
+    - Serve the diff to the frontend, accept approve/reject, and publish the
+      decision back onto RabbitMQ for the agent to act on.
+    - Enforce TTL/expiry and trigger Telegram (via step 2) to re-issue a link on
+      expiry.
+  - This mirrors your existing mediaAPI pattern (route + SSE + queue utilities)
+    — you could realistically reuse sse_registry.py/queue.py-style patterns here
+    for pushing live diff status to the frontend instead of polling.
+
+  5. Multi-tenant agent container (step 3)
+  Housing agents from different organisations in one container is the biggest
+  risk in the plan if it means shared filesystem/process space. Recommend (as an
+  option, not a requirement) per-agent or per-org container/namespace isolation
+  — otherwise a bug or prompt-injection in one agent's context could reach
+  another org's credentials, sandbox, or repo cache. At minimum: separate
+  filesystem volumes, separate credential scopes, no shared memory/session
+  state.
+
+  6. Sandbox test/deploy execution
+  "Test, pull, push, modify" implies the agent may need to run code (spin up
+  test runners, maybe containers). If it needs Docker-in-Docker or Docker socket
+  access, that's a significant privilege escalation risk — worth flagging now
+  even though you're not implementing yet. A safer pattern is ephemeral,
+  disposable sandbox containers per test run rather than a long-lived sandbox
+  with broad exec rights.
+
+  7. "Agent can only pull when allowed, but can always push for review"
+  Good default-deny design. Just make sure the enforcement lives server-side (in
+  the repo container / gateway), not as an instruction the agent merely agrees
+  to follow — otherwise it's a policy, not a control.
+
+  8. Database — not yet considered, but will be needed for
+  - Token/session store with TTL (Redis is a natural fit given your expiry-based
+    design).
+  - Repo registry (which sandbox/credentials map to which repo, GitHub vs
+    host-only).
+  - Audit log of push → review → approve/reject → deploy (important given this
+    affects production code and host backups).
+  - No implementation needed now — just flagging it as a dependency of steps
+    5/6/Review API before those are built.
+
+  ---
+
+  Direct answers to your two specific questions
+
+  - Git-like docker on the host: yes, keep a dedicated repo container owning
+    bare repos / clones and all credentials; it should never speak git protocol
+    to the internet — it only emits diff artifacts and results.
+  - New container for the review endpoint API: yes, recommended as a separate,
+    minimal, internet-facing gateway distinct from the repo/pipeline container —
+    it's the only component that should be exposed, and it should be
+    stateless/thin, delegating actual git and pipeline work internally over
+    RabbitMQ or an internal-only API call.
+
+  Happy to go deeper on any one area — e.g. the token/session lifecycle, the
+  RabbitMQ topology across all five hops, or the sandbox execution isolation
+  options — whenever you're ready.
+
+✻ Cogitated for 1m 21s · done 8:29
+
+❯ I agree with point 4 that only the diff will be shown and this diff will be a 
+  tokenised link with a bearer token as protection with time out. If a          
+  malicious actor manage to access it, I could do a git revert on the backend   
+  or access through another open portal. I see your point in point 5, in that   
+  case, I will do a multi queue system in such, telegram bot will update to     
+  queue 1 for the main bot to begin, the main bot can add to queue e.g. queue 2 
+  for the second agent to work on the repository. A share repository or         
+  directory space will be there between each agent repository. I am now         
+  interested in your point 6, elaborate on what must be done for a disposable   
+  sandbox container. should the agent be able to spin a new container up on     
+  it's own within the docker container or it a new docker container on the      
+  outside should be made in such the agent can only access that external docker 
+  to test code. I am concerned on how code can be brough over for testing.      
+
+● Direct answer
+
+  External, on its own — not the agent spinning up its own containers. The AI
+  agent container should never hold Docker API access (socket or DinD). Put a
+  separate Sandbox Orchestrator container on the isolated network that is the
+  only thing that can create/destroy test containers; the agent talks to it only
+  via a request (queue or internal API), the same way you're already
+  structuring queue 1/2.
+
+  Why not let the agent manage Docker itself
+
+  Option: Mount host /var/run/docker.sock into agent container
+  Risk: Full control of the host's Docker daemon = effective root on host, can
+  see/kill/inspect every container including your review/telegram containers.
+  Defeats the isolated-bridge goal entirely.
+  Verdict: Avoid
+  ────────────────────────────────────────
+  Option: Docker-in-Docker (--privileged) inside agent container
+  Risk: Needs privileged mode; nested daemon has known container-escape history;
+
+  agent-generated code running with that much kernel access is a bad
+  combination.
+  Verdict: Avoid
+  ────────────────────────────────────────
+  Option: Docker socket proxy (e.g. restricted API surface:
+  create/start/stop/logs only)
+  Risk: Better, but still: agent process itself could be compromised (it's
+  running LLM-driven, possibly attacker-influenced code) and would have direct
+  control over container lifecycle.
+  Verdict: Only acceptable if the agent has zero other network reach and the
+  proxy is heavily scoped — still second choice.
+  ────────────────────────────────────────
+  Option: External Sandbox Orchestrator, agent has no Docker access at all, only
+
+  sends "run this task" messages
+  Risk: Blast radius contained to one purpose-built service; orchestrator
+  enforces limits centrally (timeouts, resource caps, network policy)
+  regardless of what the agent asks for.
+  Verdict: Recommended
+
+  This also mirrors your point 5 design nicely — it's just another queue
+  consumer, same pattern as the main bot / second agent split.
+
+  Agent Container ──(queue: "run tests for task X, commit Y")──► Sandbox
+  Orchestrator
+                                                                       │
+                                                          builds/starts
+  ephemeral container
+                                                                       │
+                                                              runs tests,
+  captures logs
+                                                                       │
+                  Agent Container ◄──(queue: result + logs)───────────┘
+                                                                       │
+                                                          container + image
+  destroyed
+
+  How code actually gets into the sandbox (your concern)
+
+  Three real options — pick based on whether host-only repos are involved:
+
+  Approach: Bind-mount the working copy
+  How it works: Repo container checks out the agent's branch/worktree to a
+  shared
+  internal volume; orchestrator mounts that path (RW) into the ephemeral
+  container.
+  Fit here: Simple, fast — but the sandbox container now has filesystem access
+  to
+  a path other agents' tasks might also touch if the shared directory isn't
+  per-task scoped. Needs strict per-task subdirectories, not a shared root.
+  ────────────────────────────────────────
+  Approach: Git clone inside the sandbox at boot
+  How it works: Orchestrator hands the sandbox container a short-lived, scoped
+  credential (or points it at your internal-only git service) and it clones
+  fresh.
+  Fit here: Clean and reproducible, but means transient git credentials exist
+  inside a container running possibly-untrusted agent code — needs credentials
+  to be single-use/expiring and never the agent's own long-lived PAT.
+  ────────────────────────────────────────
+  Approach: CI-style ephemeral image build (recommended)
+  How it works: Repo container produces a patch/tarball of the exact commit
+  under
+  test → Orchestrator builds a throwaway image (base image + COPY  code) → runs
+   it → discards image and container after.
+  Fit here: No bind mount to host filesystem at all, no credentials inside the
+  sandbox (repo container never hands out git access, just code), and it's the
+  same trusted pattern most CI systems (GitHub Actions runners, GitLab CI)
+  already use. Best isolation for agent-generated code specifically.
+
+  Given you're worried about "how code is brought over," the CI-style build is
+  the strongest fit: the sandbox never needs git, never needs a shared
+  filesystem with other agents, and every run starts from a known-clean base
+  image. The trade-off is slightly more build time per test run and you need a
+  lightweight internal registry or build cache if base images are reused often.
+
+  Other things a "disposable sandbox" needs, regardless of which option you pick
+
+  - Hard resource limits per container: CPU/memory/pids caps and a wall-clock
+    timeout, so a runaway or intentionally malicious test can't exhaust the
+    host.
+  - No privileged mode, run as non-root, default seccomp/AppArmor profile —
+    standard, but worth stating since this container runs code an AI wrote,
+    which is a higher-risk source than human-authored CI jobs.
+  - Network egress policy: default-deny, with an explicit allowlist if the code
+    under test needs package registries (npm/pip/etc.). Don't give sandboxes
+    free internet by default.
+  - Ephemeral only — no persistent volumes surviving the run, no shared writable
+    state between test runs, so nothing leaks between tasks/agents.
+  - Stronger sandbox runtime if you want extra headroom: gVisor or Kata
+    Containers instead of the default runc, since the workload is inherently
+    less trusted than normal CI. Optional, not required — flagging as a future
+    hardening step, not a must-do now.
+
+  One thing worth flagging in your queue/shared-directory update
+
+  Your "shared repository/directory space between each agent" reintroduces part
+  of the multi-tenant concern from earlier: if queue 2's agent and another org's
+  agent both have access to the same shared space, that's a leak path even if
+  their sandbox containers are separate. Worth deciding now whether that shared
+  space is meant to be:
+  - shared within one org's multiple agents (fine), or
+  - shared across orgs (would need per-agent subdirectories with enforced path
+    isolation, not a flat shared root).
+
+  Not something to fix immediately — just worth being explicit about before it's
+  built, since it's cheap to design correctly now and expensive to retrofit
+  later.
+
+  Happy to go deeper on the orchestrator's task-queue contract (what
+  messages/fields queue 2 should carry for a test request) or on the
+  token-revert mitigation you mentioned for point 4, if useful.
+
+✻ Cogitated for 55s · done 8:40
+
+❯ I am considering a collaborative or a counter-attack coding method. Agents    
+  should be able to counter each other until they come up with a valid code     
+  that consist of weightage from both side. The weightage and consideration     
+  must be summarised and sent to the user through telegram bot. Each side       
+  should have weightage considered with references and not blind weight.        
+
+● What this pattern is
+
+  This is essentially a multi-agent debate / adversarial-collaborative pattern:
+  two (or more) agents each propose a solution, critique each other's proposal,
+  revise, and converge on a merged result — with a scoring layer ("weightage")
+  that must be evidence-based rather than the agents just asserting confidence.
+  Architecturally, this needs a third, non-partisan role — an arbiter — that
+  neither agent controls, otherwise "weightage" is just whichever agent argues
+  more persuasively, not whichever is objectively better.
+
+  Where it fits in what you've already designed
+
+  You don't need a brand-new container family for this — it slots in as a new
+  logical role sitting between your agent queues and the repo/review pipeline:
+
+  queue2 (Agent A) ──┐
+                      ├──► Debate Orchestrator ──► Sandbox Orchestrator (runs
+  each proposal, per-agent isolated)
+  queue3 (Agent B) ──┘            │                        │
+                                   │◄── objective evidence ─┘ (test results,
+  lint, security scan, perf)
+                                   │
+                          apply scoring rubric
+                                   │
+                       converged? ──no──► send critique + scores back to both
+  agents → next round
+                                   │
+                                  yes
+                                   │
+                                   ▼
+                      Repo Container (produce merged diff artifact)
+                                   │
+                                   ▼
+                      Review API (tokenised link + bearer token)
+                                   │
+                                   ▼
+                  Telegram Bot → user: weightage summary + references + review
+  link
+
+  The Debate Orchestrator is a deterministic coordinator (not itself an LLM
+  making judgment calls) — its job is process control and score calculation, not
+  opinion.
+
+  Making "weightage" evidence-based, not blind
+
+  The key requirement you stated — "with references and not blind weight" —
+  means the score has to be traceable to something reproducible. Recommend a
+  fixed, versioned rubric rather than letting agents decide their own weighting
+  each round:
+
+  ┌─────────────────┬────────────────────┬─────────┬───────────────────────┐
+  │    Criterion    │  Evidence source   │ Example │     Why objective     │
+  │                 │                    │  weight │                       │
+  ├─────────────────┼────────────────────┼─────────┼───────────────────────┤
+  │ Tests pass /    │ Sandbox            │         │ Deterministic         │
+  │ coverage delta  │ Orchestrator run   │ 40%     │ pass/fail,            │
+  │                 │ output             │         │ reproducible          │
+  ├─────────────────┼────────────────────┼─────────┼───────────────────────┤
+  │ Static analysis │ Linter/security    │         │ Tool-generated, not   │
+  │  / lint         │ scanner output     │ 20%     │ agent-asserted        │
+  │ conformance     │                    │         │                       │
+  ├─────────────────┼────────────────────┼─────────┼───────────────────────┤
+  │ Adherence to    │ Diff against style │         │ Checkable against     │
+  │ existing repo   │  baseline / prior  │ 15%     │ actual codebase       │
+  │ conventions     │ commits            │         │ history               │
+  ├─────────────────┼────────────────────┼─────────┼───────────────────────┤
+  │ Performance (if │ Benchmark run in   │ 15%     │ Measured, not claimed │
+  │  relevant)      │ sandbox            │         │                       │
+  ├─────────────────┼────────────────────┼─────────┼───────────────────────┤
+  │                 │                    │         │ Kept small            │
+  │ Peer critique   │ Agent-vs-agent     │ 10%     │ deliberately — this   │
+  │ (subjective)    │ commentary         │         │ is the only "opinion" │
+  │                 │                    │         │  component            │
+  └─────────────────┴────────────────────┴─────────┴───────────────────────┘
+
+  The rubric itself should be a plain config (ideally version-controlled,
+  human-editable) so you — not the agents — control how much subjective critique
+  is allowed to matter. This is a design choice, not a fixed requirement; you
+  may weight it differently per repo.
+
+  Each score in the final summary should carry a reference: which test run ID,
+  which scan report, which prior commit was used for comparison — so when this
+  reaches Telegram, the user isn't shown "Agent A: 82%, Agent B: 71%" with no
+  backing, but "Agent A: 82% — 18/18 tests passed (run #4471), 0 security
+  findings (scan #229)…".
+
+  Convergence and termination — this needs hard limits
+
+  Adversarial loops between two LLM agents can oscillate without a stop
+  condition. The orchestrator should enforce:
+  - Max rounds (fixed cap, not open-ended).
+  - Convergence threshold (e.g. score delta within X% counts as "agreed").
+  - Explicit stalemate path: if max rounds hit without convergence, don't force
+    a merge — send both proposals with their evidence to the user via Telegram
+    and let the human decide. This fits your existing "human approves via review
+    link" flow rather than fighting it.
+
+  Isolation carries over from the sandbox discussion
+
+  Each agent's proposal should still run in its own ephemeral sandbox (per the
+  CI-style disposable container model from before) — don't let the two agents
+  share a test environment during the debate, especially if they could belong to
+  different orgs per your multi-tenant queue design. Otherwise one agent's test
+  run could interfere with or observe the other's, undermining the "counter"
+  fairness the pattern relies on.
+
+  Weaknesses to weigh
+
+  - Cost/latency: every round is a full LLM turn + a full sandbox test run for
+    each side — multiply by round count. Worth capping rounds tightly and
+    possibly short-circuiting if one proposal fails tests outright (no need for
+    a full debate round if one side doesn't even build).
+  - Gaming the rubric: if too much weight sits on "peer critique"
+    (agent-vs-agent opinion) rather than tool-generated evidence, an agent could
+    win by argument quality rather than code quality. Keep the subjective slice
+    small, as above — this is exactly what you flagged wanting to avoid.
+  - Rubric transparency vs. rigidity: a fixed rubric is auditable but may not
+    fit every repo (e.g. performance criteria irrelevant for a config-only
+    change). Consider making the rubric per-repo configurable rather than global
+    — optional, not required now.
+  - User fatigue: if every task produces a multi-round debate summary, Telegram
+    messages could get long/noisy. Worth deciding upfront whether the user
+    always wants the full weightage breakdown or just a collapsed summary with a
+    link to full evidence (which the Review API/frontend could host, keeping
+    Telegram itself terse).
+
+  Happy to sketch the actual message schema for the debate rounds (what
+  queue2/queue3 payloads should contain — proposal, evidence refs, round number)
+  if you want to get that concrete, or to go deeper on how the stalemate path
+  presents two competing diffs on the same review frontend.
+
+✻ Churned for 50s · done 8:46
+
+❯ I am confused, are you suggesting that all agents regards of where it is from 
+  will sit in a single container?                                               
+
+● No — apologies if that came across that way. Each agent should run as its own 
+  container instance, not co-located inside one shared container. What I meant
+  by "the AI agent container" back in step 3 was closer to one container 
+  image/template that gets instantiated per agent/per org — i.e. many container
+  instances from the same design, each isolated, not many agents sharing one
+  running container.
+
+  Corrected picture:
+
+  queue2 ──► Agent A Container (org 1) ─┐
+                                         ├──► Debate Orchestrator (its own
+  container)
+  queue3 ──► Agent B Container (org 2) ─┘              │
+                                                         ▼
+                                       Sandbox Orchestrator (its own container)
+                                            │                    │
+                                            ▼                    ▼
+                                 Ephemeral sandbox A     Ephemeral sandbox B
+                                 (Agent A's proposal)    (Agent B's proposal)
+
+  So:
+
+  - Agent A and Agent B — separate containers, separate filesystems, separate
+    credentials. Never share process/memory space, especially if they're from
+    different organisations.
+  - Debate Orchestrator — a separate, neutral container. It doesn't run any
+    agent logic itself; it only routes messages, applies the scoring rubric, and
+    decides convergence/stalemate. It has no more trust than a message router —
+    it shouldn't hold either agent's secrets.
+  - Sandbox Orchestrator — also separate, and it spins up one ephemeral test 
+    container per proposal, so Agent A's code and Agent B's code are never
+    tested in the same sandbox instance.
+
+  The only thing genuinely "shared" here is the queue/broker (RabbitMQ) and, per
+  your earlier message, the shared repo/directory space — and I flagged that
+  shared directory as something to scope per-agent (or per-org) rather than a
+  flat shared root, precisely to avoid this same "everyone in one place"
+  problem.
+
+  So to directly answer: no single container hosts multiple agents from
+  different sources — each gets its own container, its own sandbox, and its own
+  credential scope. Let me know if you'd like the container/orchestration
+  topology redrawn end-to-end with this correction folded in.
+
+✻ Crunched for 16s · done 8:50
+
+❯ In summary, Agent A and Agent B each has their own container and will         
+  communicate with Debate Orchestrator through a queue until a specific rubric  
+  is met, it will update the sandbox orchestrator and it will organise          
+  information to be sent to telegram for user to review. sandbox orchestrator   
+  will be the one informing the forntend endpoint to generate a review for the  
+  user to review. In that case, all 4 agents will share the same repository     
+  directory for referencing?                                                    
+
+● Close, but a couple of corrections — worth untangling before we talk about the
+  shared directory:
+
+  Correction 1: Sandbox Orchestrator is used during the debate, not just at the 
+  end
+
+  The Sandbox Orchestrator provides the evidence the rubric needs each round
+  (test pass/fail, lint, etc.) — so the Debate Orchestrator calls it every
+  round, not once after the rubric is met.
+
+  Correction 2: Sandbox Orchestrator should not talk to the frontend/Review API
+
+  That job belongs to the Repo (git) Container, not the Sandbox Orchestrator —
+  for the same reason as before: the sandbox is where untrusted/AI-generated
+  code executes, so it shouldn't also hold git credentials or be the thing that
+  triggers a public-facing review link. Keeping "run code" and "touch git" as
+  separate roles limits what a compromised sandbox could do.
+
+  Corrected flow
+
+  Agent A ──┐                                      ┌──► Sandbox: run Agent A's
+  proposal
+            ├──queue──► Debate Orchestrator ────────┤    (ephemeral, isolated)
+  Agent B ──┘              │  ▲                    └──► Sandbox: run Agent B's
+  proposal
+                            │  │ evidence (test results, lint, scores)
+                            │  └── Sandbox Orchestrator
+                            │
+                     rubric met? ──no──► send scores/critique back to A & B →
+  next round
+                            │
+                           yes
+                            ▼
+                     Repo Container (checks out final merged code, builds diff
+  artifact)
+                            │
+                            ▼
+                      Review API (mints tokenised link + bearer token)
+                            │
+                            ▼
+                    Telegram Bot → user (weightage summary + review link)
+
+  So: Debate Orchestrator is the coordinator throughout; Sandbox Orchestrator
+  only ever talks to Debate Orchestrator (gives it evidence); Repo Container
+  only gets involved once there's a final result, and it's the only one that
+  talks to the Review API.
+
+  Also worth naming precisely: only Agent A and Agent B are actual AI agents
+  here. Debate Orchestrator and Sandbox Orchestrator are deterministic
+  coordination services, not agents — worth keeping that distinction clear since
+  it affects trust level (services you control the logic of vs. LLM-driven
+  components).
+
+  Your question — shared repository directory
+
+  Yes, but with a nuance: shared reference, not shared mutable workspace.
+
+  - Since Agent A and Agent B are working on the same task/repo (they're
+    proposing rival solutions to merge), it makes sense for both to see the same
+    base commit/context — otherwise they can't meaningfully critique each
+    other's diff against the same starting point.
+  - What they should not share is one live, writable working directory. If both
+    write into the same checkout simultaneously, their edits and test runs will
+    collide and corrupt each other's results.
+  - Pattern: the Repo Container checks out two separate worktrees/branches from
+    the same base commit — one for Agent A's proposal, one for Agent B's — so
+    both reference identical starting code but edit and get tested
+    independently. This is the same "one clean working copy per task" principle
+    from the disposable-sandbox discussion, just applied per-agent instead of
+    per-test-run.
+
+  This is different from the earlier "shared directory across queue1/queue2
+  agents" concern, which was about potentially unrelated tasks/orgs sharing
+  space. Here, A and B are intentionally working the same repo/task, so a shared
+  read context is correct — it's the write path that needs separating.
+
+  Let me know if you'd like the worktree/branch naming convention or the
+  rubric-round message schema sketched out next.
+
+✻ Churned for 36s · done 8:55
+
+❯ I am concerned of the fix rubric if the debate orchestrator is not            
+  communicating with the user. That maybe a lot of false positive due to the    
+  strict cap which the user may not want to meet due to many reasons. Then who  
+  will be the one communicating with the user? The user may want to do a quick  
+  research and wants a quick response.                                          
+
+● Good catch — that's a real gap in what I described. Right now the flow only
+  talks to the user at the very end (final result) or at stalemate. A fixed
+  rubric with a hard round cap decided by nobody‑user‑facing means the system
+  could either burn time converging on something the user would've accepted two
+  rounds earlier, or converge "successfully" on something that technically meets
+  the rubric but isn't what the user actually wanted. Both are real failure
+  modes of this design as described.
+
+  Who should talk to the user
+
+  Still the Telegram Gateway — it stays the single user-facing channel, no new
+  component needed there. What's missing is making it bidirectional during the
+  debate, not just a notifier at the end:
+
+                        ┌──────────── status/checkpoint updates ─────────────┐
+                        │                                                     │
+  Telegram Gateway ◄────┴── Debate Orchestrator (round loop) ──► Sandbox
+  Orchestrator
+        │  ▲                       ▲
+        │  │                       │
+        │  └── control commands ───┘   (abort / expedite / adjust threshold)
+        ▼
+       User
+
+  Two concrete mechanisms to address this
+
+  1. Make the rubric/cap a per-task setting, not a fixed global
+  Instead of one hardcoded "5 rounds, 90% convergence" rule for everything, let
+  the user set intent at task submission time via Telegram — e.g. a quick
+  command or button: "fast" (skip debate, single agent, minimal checks) vs
+  "thorough" (full multi-round debate). Sensible default if they say nothing.
+  This directly answers "the user may not want to meet [the cap] due to many
+  reasons" — the cap becomes something they chose, not something imposed.
+
+  2. Add optional progress checkpoints, and let the user cut it short
+  Rather than the Debate Orchestrator running silently until it decides the
+  rubric is satisfied, it can push lightweight, non-blocking updates to Telegram
+  after each round (e.g. "Round 2/5 — Agent A 78%, Agent B 74%, top
+  disagreement: error handling approach"). The user can then reply with
+  something like "good enough, show me the diff" at any point — that reply goes
+  back through the Telegram Gateway onto a small control queue the Debate
+  Orchestrator is also subscribed to, which tells it to stop early and hand
+  whichever proposal currently scores highest (or both, if close) to the Repo
+  Container for review.
+
+  This turns "converge internally, then surface once" into "converge
+  progressively, surface early on request" — which is a better fit for someone
+  wanting a quick response versus someone happy to let it run longer for a more
+  contested change.
+
+  Trade-offs worth weighing
+
+  - More Telegram traffic: per-round updates mean more messages and more API
+    calls — worth rate-limiting or batching (e.g. only notify every N rounds, or
+    only on meaningful score swings) rather than every single round, to avoid
+    noise.
+  - Orchestrator complexity: the Debate Orchestrator's state machine now needs
+    to handle "user aborted mid-loop" cleanly — deciding what to hand off
+    (best-so-far, both proposals, or a partial merge) rather than just the
+    "converged" happy path.
+  - Rubric still isn't the final gate: since a human always reviews the actual
+    diff before it merges (per your original review-link requirement), the
+    rubric only ever decides when to ask the human, not whether the change is
+    correct. That's a useful framing — it takes some pressure off getting the
+    rubric "perfectly right," since a bad rubric decision just means asking too
+    early or too late, not shipping bad code.
+
+  Want me to sketch the control-queue message format (abort / adjust-threshold /
+  expedite) next, or how the "fast" vs "thorough" mode should change what the
+  Sandbox Orchestrator actually runs (e.g. skip performance benchmarking in fast
+  mode)?
+
+✻ Sautéed for 40s · done 8:59
+
+※ recap: Building a Telegram-driven AI coding bot architecture with isolated sandboxes and human code review. We just added a bidirectional Telegram control channel so users can set fast/thorough modes and cut debates short. Next: define the control-queue message format for abort/expedite/adjust-threshold. (disable recaps in /config)
+
+❯ I will be interested in the finaly result and not the debate process. that is 
+  what the summary is for. I am more concerned with the user talking as if the  
+  user is writing commandlines. Let's assume your debate orchestrator meant it  
+  will decide what the task will be, It can decide if it takes response from    
+  Agent A or Agent B, or if it decides that both are required then a a single   
+  agent will summaries the conversation from both output before reaching the    
+  telegram gateway.                                                             
+
+● Two things to fold in — both are good refinements and simplify what I
+  described earlier.
+
+  Dropping the mid-debate chatter
+
+  Since you only want the final result, we can drop the round-by-round progress
+  updates and the "abort mid-loop" control queue I proposed last turn — that was
+  solving a problem you've now told me you don't have. Telegram Gateway goes
+  back to being one-directional for the debate itself: silence during the
+  rounds, one final summary + review link at the end (plus whatever
+  accept/reject interaction happens on the review step, which was already part
+  of the design).
+
+  No command-line style interaction
+
+  Good instinct to flag this. Telegram bots have a native way to avoid users
+  typing structured commands: inline keyboard buttons (Telegram's
+  InlineKeyboardMarkup/callback queries). Anywhere a decision is needed from the
+  user — mode selection, accept/reject on review — it should be a tap on a
+  button the bot presents, not a typed command with syntax to remember. Worth
+  stating as a firm UX requirement for the Telegram Gateway rather than
+  something agents/orchestrators need to worry about — it's purely how that one
+  container renders its messages.
+
+  Debate Orchestrator deciding the outcome, plus a Summariser Agent
+
+  This is a sound refinement. The Debate Orchestrator already computes rubric
+  scores each round — extending it to also decide how to conclude (pick A, pick
+  B, or synthesise both) is a natural extra branch in the same decision logic,
+  not a new component. What is a new component is the Summariser Agent — a
+  third, separate agent container whose only job is to read both agents' outputs
+  (and the scoring evidence) and produce one coherent, human-readable
+  explanation, invoked only when the Debate Orchestrator decides both
+  contributions are needed.
+
+  Agent A ──┐
+            ├──► Debate Orchestrator (rubric decision: A / B / both)
+  Agent B ──┘            │
+                ┌─────────┼─────────┐
+            pick A     pick B    both needed
+                │         │           │
+                │         │           ▼
+                │         │   Summariser Agent (own container)
+                │         │           │
+                └─────────┴─────┬─────┘
+                                 ▼
+                      Sandbox Orchestrator (re-validate final result)
+                                 │
+                                 ▼
+                          Repo Container (diff artifact)
+                                 │
+                                 ▼
+                           Review API (tokenised link)
+                                 │
+                                 ▼
+                Telegram Gateway → user (final summary only, buttons for
+  accept/reject)
+
+  A few things worth deciding explicitly here, since they affect risk:
+
+  - Is the Summariser Agent writing an explanation, or writing merged code? If
+    it's just narrating "why this outcome was reached, with references to A/B's
+    evidence," that's low-risk — it's not producing anything that runs. If it's
+    actually combining code from both proposals into a new merged diff, that's a
+    new code artifact nobody has tested yet, and it should go back through the
+    Sandbox Orchestrator once more before reaching the Repo Container —
+    otherwise you could hand the user a review link for code that's never
+    actually been run. I've included that re-validation step in the diagram as
+    the safer default; worth confirming that's what you intend before dropping
+    it.
+  - The Summariser Agent stays its own container, same isolation principle as A
+    and B — it's still an LLM-driven agent, not part of the deterministic Debate
+    Orchestrator.
+  - The final Telegram message is where the "weightage with references" from
+    earlier naturally lands — the Summariser Agent (or the Debate Orchestrator,
+    if you'd rather keep it template-driven rather than LLM-authored) formats
+    that into the one message the user actually sees, with the review link
+    attached.
+
+  Want me to define what goes into that final message payload (fields the
+  Summariser/Debate Orchestrator must supply to Telegram Gateway), or focus next
+  on the accept/reject button flow tying back into the Review API?
+
+✻ Crunched for 46s · done 9:16
+
+❯ I will agree with 3 agents with one doing summarising. Code debate should be  
+  done one both agent A and agent B, summariser summarises output main points   
+  and reasoning but not the code. finaly code should end when both agent agree  
+  or rebate round reaches limit.                                                
+
+● Good — that's a clean simplification. Confirming the finalised shape:
+
+  Finalised roles
+
+  - Agent A / Agent B: the only two that touch code. They debate/rebate directly
+    with each other's proposals, round after round.
+  - Debate Orchestrator: deterministic coordinator — runs the rounds, checks
+    agreement, applies the round cap, decides when it's over.
+  - Summariser Agent: text-only. Takes the transcript/reasoning from both sides
+    and writes the "why" for the human — never touches or rewrites code.
+
+  Updated flow
+
+  Agent A ──┐
+            ├──► Debate Orchestrator ──► Sandbox Orchestrator (test each round's
+  proposals)
+  Agent B ──┘         │
+                       │
+            agreement reached OR round cap hit
+                       │
+                final code (as-is, already tested — no re-synthesis)
+                       │
+          ┌────────────┴────────────┐
+          ▼                         ▼
+    Repo Container            Summariser Agent
+    (diff artifact)         (text summary + reasoning,
+          │                  no code)
+          ▼                         │
+    Review API                      │
+    (tokenised link)                │
+          │                         │
+          └──────────► Debate Orchestrator (joins link + summary) ──► Telegram
+  Gateway ──► User
+
+  Because the Summariser never touches code, the final code is simply whatever
+  Agent A/B already agreed on (or the winner at the round cap) — it's already
+  been through the Sandbox Orchestrator in its last debate round, so no extra
+  re-validation pass is needed before it goes to the Repo Container. That's a
+  nice side-benefit of keeping the Summariser text-only: one less place a fresh,
+  untested artifact could sneak into the review.
+
+  One point you haven't specified yet
+
+  You said the debate ends on agreement or round cap — but not what happens if
+  the cap is hit without agreement (two unresolved proposals). Reasonable
+  default, unless you'd rather decide otherwise: the Debate Orchestrator picks
+  whichever proposal scores higher on the rubric at that point, and the
+  Summariser's write-up explicitly notes it was cap-terminated rather than
+  mutually agreed, so the user isn't misled into thinking both sides converged.
+  Alternative would be surfacing both proposals for the user to pick — happy to
+  switch to that if you'd prefer the human to break the tie instead of the
+  rubric.
+
+  Let me know which tie-break behaviour you want, or if there's another piece of
+  this you'd like to define next (e.g. what "agreement" formally means between
+  Agent A and Agent B — identical code, or just both scoring above some
+  threshold).
+
+✻ Cogitated for 29s · done 9:21
+
+❯ I am thinking of this. Agent A -score, Agent B -score, Agent A -score, Agent  
+  B-score. It should be in sequence with both debating on each other's changes. 
+  The change that is closest to what the user want will be sent out of if both  
+  agent agree upon that the final change is closest to what the user wants      
+
+● That changes the shape from "two rival branches merged" to a single evolving 
+  code artifact passed back and forth — closer to structured pair-programming
+  than parallel competition. That's actually simpler to build. Let me lay out
+  the update.
+
+  Turn-based (baton-pass) model
+
+  Turn 1: Agent A revises → Sandbox tests → score
+  Turn 2: Agent B critiques/revises Agent A's change → Sandbox tests → score
+  Turn 3: Agent A critiques/revises Agent B's change → Sandbox tests → score
+  Turn 4: Agent B critiques/revises Agent A's change → Sandbox tests → score
+  ...
+  until: both agents' latest verdict = "this satisfies what the user wants" on
+  the same state,
+         or turn/round cap reached
+
+  Debate Orchestrator
+     │  hands current code + task spec + prior score/reasoning to whichever
+  agent's turn it is
+     ▼
+  Agent A  ──►  Sandbox Orchestrator (test this turn's change)  ──►  score +
+  evidence
+     ▼                                                                      │
+  Debate Orchestrator ◄─────────────────────────────────────────────────────┘
+     │  passes updated state + A's score/reasoning to Agent B
+     ▼
+  Agent B  ──►  Sandbox Orchestrator  ──►  score + evidence
+     ▼
+  Debate Orchestrator (checks: both agree? cap hit?) ──► repeat or finalise
+
+  Because it's strictly sequential (one agent writes at a time, baton-passed by
+  the Orchestrator), you no longer need the two separate worktrees from earlier
+  — a single working copy/branch is fine, since there's never concurrent access.
+  That's a genuine simplification over the parallel-proposal version.
+
+  The new criterion: "closest to what the user wants"
+
+  This is the part that needs the most care, because unlike tests/lint/security
+  (machine-checkable), "matches user intent" isn't something the Sandbox
+  Orchestrator can verify on its own. To keep this evidence-based (per your
+  earlier requirement — "with references and not blind weight"), I'd suggest:
+
+  - At task submission, capture the user's request as a structured brief — even
+    a short bullet list of what's being asked for (via Telegram, ideally through
+    simple prompts/buttons rather than free-form typing, per the earlier UX
+    point). This becomes the reference document.
+  - Each agent's turn must justify its score against that brief specifically
+    (e.g. "addresses requirement 2 and 3; requirement 1 still unhandled") rather
+    than a vague self-rating.
+  - "Agreement" = both agents, independently, on the same code state, confirm
+    all captured requirements are met — not just that they've stopped finding
+    objections to argue about.
+
+  Without this structured brief, "closest to what the user wants" has no fixed
+  reference point and both agents are just guessing at each other's
+  interpretation of a vague goal — which reintroduces the "blind weight" problem
+  you were trying to avoid in the first place.
+
+  Open question: what happens at the round cap without agreement
+
+  In this sequential model, there's always a "last state" — but it might be
+  mid-argument (Agent B just raised an objection Agent A hasn't addressed yet).
+  Reasonable default unless you'd prefer otherwise: if the cap is hit, roll back
+  to the highest-scoring turn in the whole sequence (not necessarily the very
+  last one), since the last turn isn't guaranteed to be the best one if the
+  debate was cut off mid-objection. The Summariser's write-up should flag it was
+  cap-terminated and note the unresolved objection, so the user isn't misled
+  into thinking it was a clean agreement.
+
+  Let me know if that rollback-to-best-turn approach is what you want, or if
+  you'd rather the very last turn always wins regardless of score. Also happy to
+  define the per-turn message schema next (what a "turn" payload needs: prior
+  code, prior critique, task brief, score history) if you want to get concrete
+  on that.
+
+✻ Brewed for 47s · done 9:24
+
+❯ let's say a final agreement could not be met and the debate cap has been      
+  reached, it will inform the telegram gateway on the final change and inform   
+  of it's concerns and user can decide on what to do. The agent with the final  
+  debate right should be more concerned on and decide what is the highest       
+  possibility the user wants and put it's concern to check with the other       
+  agent.                                                                        
+● That's a good refinement — it turns the cap-reached case from "the system
+  silently picks a winner" into "the system produces its best closing judgment,
+  sanity-checks it once, and hands the human both the code and the disagreement
+  to decide on." Let me reflect this into the flow.
+
+  Closing-turn behaviour when the cap is hit
+
+  ... normal alternating turns ...
+                      │
+          cap reached on this turn
+                      │
+                      ▼
+     Final-turn Agent: produce closing judgment
+     ("highest-probability interpretation of user intent")
+     + explicit list of remaining concerns (referencing task brief)
+                      │
+                      ▼
+     Other Agent: one bounded sanity check
+     (confirm / flag additional concern — not a new debate round)
+                      │
+                      ▼
+     Sandbox Orchestrator: validate closing code state still passes
+                      │
+                      ▼
+     Debate Orchestrator packages: final code + both agents' concerns
+                      │
+          ┌───────────┴───────────┐
+          ▼                       ▼
+    Repo Container          Summariser Agent
+    (diff artifact)         (text-only: reasoning + concerns, no code)
+          │                       │
+          ▼                       │
+    Review API                    │
+    (tokenised link)              │
+          └──────────► Debate Orchestrator (joins link + summary) ──► Telegram
+  Gateway
+                                                                              │
+                                                                              ▼
+                                                            User decides
+  (buttons: Accept / Reject / etc.)
+
+  A few things worth pinning down
+
+  Who gets "final debate right" needs to be deterministic, known in advance. The
+  Debate Orchestrator should explicitly tell whichever agent is taking the last
+  turn "this is the closing turn — give your best-guess judgment and list your
+  concerns," rather than the agent inferring this from context. That way the
+  closing behaviour is a designed branch, not something the agent has to guess
+  is happening.
+
+  The cross-check with the other agent must be bounded, not a new round —
+  otherwise you've just reopened the debate and the cap becomes meaningless. A
+  single confirm/flag response, not a full turn with its own revision rights,
+  keeps this closed-ended.
+
+  Concerns should stay reference-based, consistent with what you asked for
+  earlier — the closing agent's concern list should point at specific items from
+  the task brief it's unsure about ("requirement 2 — ambiguous on X, chose Y
+  interpretation"), not a vague "I'm not fully confident."
+
+  One thing to decide: when this reaches the user, is "Accept / Reject" still
+  sufficient, or do you want a third option like "needs revision" that feeds the
+  concern back in as a fresh, bounded debate rather than a full
+  reject-and-restart? Not something to force a decision on now — just flagging
+  it as a natural extension of what you've described, since the whole point of
+  surfacing concerns is that the human might want to resolve just that one open
+  question rather than accept-as-is or throw the whole thing away.
+
+  Let's continue — happy to define the final Telegram message structure (code
+  link + concerns + button options) next, or address the deterministic "who goes
+  last" question if you want to lock that down.
+
+✻ Crunched for 39s · done 9:29
+
+※ recap: Designing a Telegram-driven multi-agent coding system with human code review; now refining the Agent A/B debate loop and cap-reached escalation. Next: decide if the final message should offer an "Accept/Reject" or also a "needs revision" option. (disable recaps in /config)
+
+❯ That is a valid concern, the last debate right should be random and will be   
+  passed on to them and will increment. It does not matter if the debate if a   
+  single agent is always the last debater. I would agree with passing it to     
+  back to the other agent again for a final sanity, but not for improvement. It 
+  will be more of a clean up. User will ask for revision, it is not a accept/   
+  reject decision                                                               
+
+● Understood — a few corrections noted and folded in:
+
+  Turn order: randomised start, then strict alternation
+
+  Starting agent (A or B) is picked randomly per debate instance, then it simply
+  increments/alternates from there as before. No need to engineer fairness
+  across debates — if the same agent statistically ends up "last" more often
+  over time, that's fine, since the cap-reached path already routes through a
+  mutual check regardless of who's in that seat.
+
+  The post-cap sanity pass is clean-up only, not a revision right
+
+  Good constraint — this keeps the closing step bounded and prevents it becoming
+  a disguised extra debate round. Worth being explicit about this at the
+  implementation level later: the prompt/instruction given to the other agent at
+  this step should scope it strictly to cosmetic/consistency checks (naming,
+  formatting, obvious typos, redundant code) — not logic changes. Even so, I'd
+  still run the Sandbox Orchestrator once more after this clean-up pass as a
+  safety net — a "clean up" edit can still accidentally break something, and
+  you'd rather catch that before it reaches the user than after.
+
+  Review outcome is three-way, not binary
+
+  This generalises beyond just the cap-reached case: Accept / Reject / Request 
+  Revision, with Request Revision carrying the user's feedback rather than being
+  a dead end. That turns the whole pipeline into a loop rather than a straight
+  line:
+
+  Task brief ──► Debate (A/B alternating, random start) ──► cap reached or
+  agreement
+                                                                        │
+                                                      closing judgment +
+  clean-up pass
+                                                                        │
+                                                            Summary + Review
+  link
+                                                                        │
+                                                                        ▼
+                                                      User: Accept | Reject |
+  Request Revision
+                                                                        │
+                                                       Request Revision │
+  (feedback appended to task brief)
+                                                                        │
+                                                                        └──►
+  back to Debate (new bounded cycle)
+
+  One thing worth deciding when you get to it, not now: whether Request Revision
+  loops should have their own (likely smaller) round cap, so a revision cycle
+  can't itself run indefinitely if the user keeps requesting further tweaks —
+  same reasoning as the original cap, just scaled down since a revision is
+  usually a narrower fix than a fresh debate. Flagging it as a future decision
+  point rather than something to lock in immediately.
+
+  Let me know if you want to define the task-brief update format for a revision
+  request next (how user feedback gets merged into the original brief so agents
+  have full context, not just the delta), or move on to another part of the
+  system.
+
+✻ Cooked for 41s · done 9:38
+
+❯ I have not decided on whether it should have another debate, but for now I    
+  would like to make it in such user will suggest specific area to change and a 
+  single agent will do the change and send it back to the user with             
+  suggestions and concerns. User can accept, reject or another revision, but    
+  the same last agent will be doing it.                                         
+
+● Got it — this decouples the revision loop from the two-agent debate entirely.
+  Confirming the shape:
+
+  Review (Accept / Reject / Request Revision)
+                │
+     Request Revision + user's specific area/instruction
+                │
+                ▼
+     Debate Orchestrator (routes to the same agent that held
+     "final debate right" in the original debate — tracked as task state)
+                │
+                ▼
+     Single Agent applies the targeted change
+                │
+                ▼
+     Sandbox Orchestrator (validate the change, as always)
+                │
+                ▼
+     Repo Container (new diff) ──► Review API (new tokenised link)
+                │
+                ▼
+     Agent's own suggestions/concerns text (no debate to reconcile,
+     so no Summariser needed here — single voice, single output)
+                │
+                ▼
+     Debate Orchestrator joins link + agent's notes ──► Telegram Gateway ──►
+  User
+                │
+                ▼
+     User: Accept | Reject | Another Revision (loops back to the same agent)
+
+  A few things this implies, worth being explicit about:
+
+  Task state must persist "who was last" across the whole task lifecycle. The
+  Debate Orchestrator (or whatever holds task state — it's the natural owner
+  since it already tracked turns) needs to remember which agent closed the
+  original debate, so every subsequent revision request routes to that same
+  agent, not a fresh/random pick. This is a small but important bit of state to
+  carry forward.
+
+  Summariser is skipped for revisions, since there's only one voice now —
+  nothing to reconcile between two perspectives. The single agent produces its
+  own "here's what I changed, here's my remaining concerns" directly. This keeps
+  the loop lighter and faster, which fits the intent — a revision request is a
+  targeted ask, not a fresh design debate.
+
+  Trade-off worth naming (not a flaw, just a consequence of the design):
+  dropping the second agent means revisions no longer get the adversarial
+  cross-check that the original debate had. That seems intentional here — the
+  human is now the one supplying the "check" by reviewing each revision
+  themselves — but flagging it so it's a conscious choice rather than an
+  accidental gap.
+
+  Everything else stays consistent with what we've built: still tested in the
+  Sandbox Orchestrator before going out, still one diff/link per iteration,
+  still no accept/reject-only dead end.
+
+  Let me know when you're ready to define the revision-loop cap (if any) or the
+  task-brief format for how the user's "specific area to change" gets captured
+  and handed to the agent.
+
+✻ Baked for 38s · done 9:41
+
+❯ user can reject the change and add in more inputs, another round of debate    
+  can begin from there. User can request to take consideration from current     
+  change or restart the debate.                                                 
+
+● That adds a proper branch back into full debate, distinct from the
+  single-agent revision path. Updated review outcomes:
+
+  User decision on a change
+     ├── Accept ─────────────────────────────────► done, merge/finalise
+     │
+     ├── Request Revision ──► same last agent, targeted fix (as before)
+     │
+     └── Reject + new input ──► choose:
+                │
+                ├── Continue from current change ──► new debate,
+                │       base = current (rejected) code state,
+                │       brief = original + all accumulated feedback
+                │
+                └── Restart debate ──► new debate,
+                        base = original starting commit,
+                        brief = original + all accumulated feedback
+                                        │
+                                        ▼
+                      fresh Debate Orchestrator session:
+                      random starting agent, alternating turns,
+                      Sandbox validation each turn, cap + closing-judgment
+                      + clean-up pass, Summariser write-up — same pipeline as
+  the original debate
+
+  A few implications worth noting:
+
+  This reuses the full original pipeline, not a lighter path. Unlike Request
+  Revision (single agent, no Summariser), a Reject-triggered debate goes back
+  through everything — two agents, Sandbox Orchestrator per turn, the
+  cap/closing logic, and the Summariser producing the write-up — since it's a
+  genuine new debate, not a targeted patch.
+
+  The Repo Container needs to manage two different base states. "Continue from
+  current" keeps working from the most recent (rejected) code; "Restart" means
+  checking out the original base commit again and discarding the rejected state
+  entirely. This is a meaningful branch in how it prepares the working copy,
+  worth being explicit about when that container's behaviour gets defined.
+
+  Feedback should accumulate, not just replace. Since a task could go through
+  several reject → new-debate cycles, the task brief the agents and Summariser
+  work from should carry the full history of user feedback across iterations,
+  not just the latest note — otherwise agents risk re-litigating a point the
+  user already clarified two cycles ago.
+
+  One open question: does a bare Reject with no additional input mean the task
+  is simply abandoned (no further action), or should the system always prompt
+  for feedback before accepting a Reject? Reasonable assumption unless you say
+  otherwise: no feedback = task ends there, nothing further happens
+  automatically — a Reject only continues into a new debate if the user actually
+  gives it something to work with.
+
+  Let's continue whenever you're ready — happy to define the task-brief
+  accumulation format next, or move to how "Continue vs Restart" gets presented
+  to the user (buttons, same non-CLI principle as before).
+
+✻ Crunched for 35s · done 9:43
+
+❯ if a summariser is not required then a single agent will do the job. when an  
+  actual reject occur, wipe all as if nothing happened. The debate process will 
+  be stored in memory for a day until a reset happens. Do note that user will   
+  restart all sessions every day and the user can decide when to reset it       
+  during the day.                                                               
+
+● Confirmed and integrated. A few implications worth spelling out:
+
+  Confirmed: no Summariser in single-agent paths
+
+  Already the intended design for Request Revision — the acting agent writes its
+  own notes directly. No change needed there, just noting it's locked in.
+
+  "Actual reject" = full teardown, not just "no further action"
+
+  This is a bit more than what I'd assumed — every component holding state for
+  that task needs to clean up, not just stop:
+
+  ┌─────────────────┬───────────────────────────────────────────────────────┐
+  │    Component    │                    What gets wiped                    │
+  ├─────────────────┼───────────────────────────────────────────────────────┤
+  │ Repo Container  │ Discard the working branch/worktree entirely — no     │
+  │                 │ trace of the rejected code left checked out           │
+  ├─────────────────┼───────────────────────────────────────────────────────┤
+  │ Debate          │ Clear in-memory task state — turn history, scores,    │
+  │ Orchestrator    │ accumulated feedback brief                            │
+  ├─────────────────┼───────────────────────────────────────────────────────┤
+  │ Review API      │ Immediately invalidate the tokenised link (don't wait │
+  │                 │  for its normal TTL)                                  │
+  ├─────────────────┼───────────────────────────────────────────────────────┤
+  │ Sandbox         │ Already self-cleaning per run (ephemeral containers   │
+  │ Orchestrator    │ destroyed after each test), so nothing extra lingers  │
+  │                 │ here                                                  │
+  └─────────────────┴───────────────────────────────────────────────────────┘
+
+  This is a distinct, immediate trigger — separate from the day-long memory
+  retention below, which is more of a background safety net than the primary
+  cleanup path.
+
+  Two different expiry mechanisms, not one
+
+  1. Explicit reject → instant, task-specific wipe (above).
+  2. Day-long retention + reset → a broader, time-based safety net for
+     everything that hasn't been explicitly rejected/accepted (in-progress or
+     forgotten debates), cleared either automatically after ~24h or whenever the
+     user triggers a reset.
+
+  Where this "memory" should live
+
+  This is a good concrete answer to the "database not yet considered" point from
+  right at the start of this conversation. A TTL-based in-memory store (e.g.
+  Redis) is a natural fit — it already needs to expire the review-link tokens on
+  a timer, and now it also needs to hold per-task debate state (turn history,
+  brief, scores) with the same kind of expiry + manual-clear behaviour. These
+  two could reasonably share the same store rather than needing separate
+  infrastructure.
+
+  Worth noting as a design consequence, not a concern: since nothing here
+  persists beyond a day (or beyond an explicit reject), you're not accumulating
+  a long-term audit trail of debates by default. Given some of these repos never
+  leave the host, that's arguably a good privacy/footprint property — but worth
+  confirming it's intentional, since it also means there's no historical record
+  to look back on later if you ever want to review "why did the agents decide X
+  last week."
+
+  One thing to clarify
+
+  "User can decide when to reset it during the day" — is that reset always
+  global (wipes every active session/repo at once, matching "restart all
+  sessions every day"), or would you also want the ability to reset a single
+  task/repo's debate memory without touching the others? Reasonable assumption
+  unless you say otherwise: global reset is the main control, and per-task
+  auto-expiry (the ~24h TTL) is what handles individual stale sessions in
+  between.
+
+✻ Worked for 45s · done 9:46
+
+❯ it is a global reset, and it is intentional. New session will re-read what is 
+  required and perform a new task. Generate me the list of dockers that should  
+  be made and summarise what each docker do. Draw a high level diagram to       
+  visualise how each docker communicate.                                        
+
+● Docker containers to build
+
+  #: 1
+  Container: Telegram Gateway
+  What it does: Only interface to Telegram. Translates bot messages ↔ internal
+  queue messages. Renders buttons (Accept/Reject/Request Revision, mode
+  choices) — no free-typed commands. Also where the user's global reset is
+  triggered.
+  ────────────────────────────────────────
+  #: 2
+  Container: RabbitMQ
+  What it does: Internal message broker. Carries all traffic between Telegram
+  Gateway, Debate Orchestrator, Agent A/B, Summariser, and Sandbox
+  Orchestrator.
+  ────────────────────────────────────────
+  #: 3
+  Container: Debate Orchestrator
+  What it does: Deterministic coordinator, not an LLM. Runs the turn order
+  (random start, alternating), applies the round cap, detects agreement, runs
+  the closing-judgment/clean-up step, tracks task state in memory, handles
+  reject/continue/restart branching, and joins the final result + summary
+  before sending to Telegram Gateway.
+  ────────────────────────────────────────
+  #: 4
+  Container: Agent A
+  What it does: LLM agent, one side of the code debate. Also handles
+  single-agent
+  revision loops when it was the last debater.
+  ────────────────────────────────────────
+  #: 5
+  Container: Agent B
+  What it does: LLM agent, other side of the code debate. Same revision-handling
+
+  role when applicable.
+  ────────────────────────────────────────
+  #: 6
+  Container: Summariser Agent
+  What it does: LLM agent, text-only. Writes the human-readable
+  reasoning/weightage summary from a two-agent debate. Not used for
+  single-agent revisions.
+  ────────────────────────────────────────
+  #: 7
+  Container: Sandbox Orchestrator
+  What it does: Spins up disposable, ephemeral test containers (CI-style: build
+  from patched code, run, discard) for every debate turn and every revision.
+  Feeds objective evidence (tests, lint, security scan) back to the Debate
+  Orchestrator. Has no git access and is never internet-facing.
+  ────────────────────────────────────────
+  #: 8
+  Container: Repo/Git Container
+  What it does: Owns all git credentials and all git operations — pulls (only
+  when user allows), pushes, manages working copies/branches, prepares diff
+  artifacts, and wipes working state on an actual reject. Never exposed to the
+  internet.
+  ────────────────────────────────────────
+  #: 9
+  Container: Review API
+  What it does: Thin, purpose-built gateway. Mints the tokenised link + bearer
+  token, serves the diff to the frontend, accepts Accept/Reject/Revision
+  decisions, enforces TTL and invalidates on decision or reject. The only
+  container that talks to the public frontend.
+  ────────────────────────────────────────
+  #: 10
+  Container: Reverse Proxy / Ingress
+  What it does: The single container actually exposed to the internet.
+  Terminates
+  TLS, routes only to Review API endpoints. Nothing else in the stack is
+  reachable externally.
+  ────────────────────────────────────────
+  #: 11
+  Container: Redis (or similar TTL store)
+  What it does: Holds token/session TTLs and in-memory debate/task state (turn
+  history, accumulated feedback brief). Supports the day-long auto-expiry and
+  the user-triggered global reset.
+
+  Not a container, but part of the same design: the isolated Docker bridge 
+  network these all sit on, plus ephemeral sandbox containers (dynamically
+  created/destroyed per test run by #7 — not a standing service), and the
+  Netlify-hosted frontend, which is external and only ever talks to the Reverse
+  Proxy.
+
+  High-level communication diagram
+
+                                     Internet
+                                         │
+                                ┌────────┴────────┐
+                                │  Netlify Frontend │  (external, static)
+                                └────────┬────────┘
+                                         │ HTTPS (token + bearer)
+                                ┌────────┴────────┐
+                                │  Reverse Proxy   │  ◄── only internet-facing
+  container
+                                └────────┬────────┘
+                                         │
+   ─────────────────────── isolated docker bridge network
+  ───────────────────────
+                                         │
+                                ┌────────┴────────┐
+                                │   Review API     │───┐
+                                └────────┬────────┘   │ token/session TTL
+                                         │             ▼
+                                ┌────────┴────────┐  ┌─────────┐
+                                │  Repo/Git        │  │  Redis  │
+                                │  Container       │  └────┬────┘
+                                └────────┬────────┘       │ task state / TTL
+                                         │                 │
+                                ┌────────┴────────┐        │
+                  Telegram ◄──► │  Telegram        │        │
+                  (bot msgs)    │  Gateway         │        │
+                                └────────┬────────┘        │
+                                         │                 │
+                                ┌────────┴────────┐        │
+                                │    RabbitMQ      │◄───────┘
+                                └───┬────┬────┬───┘
+                                    │    │    │
+                       ┌────────────┘    │    └────────────┐
+                       ▼                 ▼                 ▼
+             ┌──────────────┐  ┌──────────────────┐ ┌──────────────┐
+             │ Debate        │  │ Sandbox           │ │ Summariser   │
+             │ Orchestrator  │◄─┤ Orchestrator      │ │ Agent        │
+             └───┬───────┬───┘  └────────┬──────────┘ └──────────────┘
+                 │       │               │
+                 ▼       ▼               ▼
+            ┌────────┐ ┌────────┐  ┌─────────────────┐
+            │Agent A │ │Agent B │  │Ephemeral sandbox │
+            └────────┘ └────────┘  │containers (spawned│
+                                    │per test run, then │
+                                    │destroyed)          │
+                                    └────────────────────┘
+
+  Everything below the Reverse Proxy line stays inside the isolated bridge
+  network; the Reverse Proxy is the only door in, and it only leads to the
+  Review API. Repo/Git Container is the only holder of git credentials; Sandbox
+  Orchestrator is the only thing that executes untrusted code, and it never
+  touches git or the internet.
+
+  Let me know if you'd like this broken down further — e.g. per-container
+  network policy (who's allowed to talk to whom, explicitly denying the rest),
+  or the docker-compose service list mapped 1:1 to this diagram.
+
+✻ Crunched for 51s · done 9:50
+
+※ recap: We designed a Telegram-driven AI coding assistant architecture with dual-agent debate, human review, and sandboxed testing. Docker container list and communication diagram are done. Next: define network policy or docker-compose service mapping if you want to continue. (disable recaps in /config)
+
+❯ write the above into a single md file on V-Project-Multimedia-Application     
+  root                                                                          
+
+● Written to AI_AGENT_ARCHITECTURE.md at the repo root.
+
+  If you want, I can extend this file later with the earlier discussion points
+  we didn't include here (debate rounds, rubric criteria, revision/reject flow,
+  memory/reset policy) as a follow-up section — just let me know when you're
+  ready to formalise that part too.
+
+✻ Churned for 31s · done 9:56
+
+❯ /rename AI_chatbot_implementation 
+  ⎿  Session renamed to: AI_chatbot_implementation

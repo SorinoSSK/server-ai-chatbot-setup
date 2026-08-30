@@ -1,0 +1,4 @@
+pika==1.4.4
+requests==2.32.3
+concurrent-log-handler==0.9.29
+redis==5.2.1
