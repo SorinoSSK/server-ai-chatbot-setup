@@ -27,9 +27,7 @@ from .message_handler import process_message
 
 logger = logging.getLogger(__name__)
 
-# Publish and consume each use their own dedicated connection, confined to their own
-# thread (publish: caller's thread, consume: _consumer_thread), since a pika
-# BlockingConnection must not be shared or used concurrently across threads.
+# Publish and consume each use their own dedicated connection, confined to their own thread (publish: caller's thread, consume: _consumer_thread), since a pika BlockingConnection must not be shared or used concurrently across threads.
 _lock_publish = threading.RLock()
 _lock_consume = threading.RLock()
 
@@ -42,17 +40,31 @@ _channel_consume = None
 _consumer_thread = None
 _consumer_running = False
 
+# Tracks failed attempts per message body, so a deterministically-failing message is eventually dropped instead of being requeued forever.
+# In-memory only - only ever touched from the single consumer thread (pika callbacks run sequentially), no lock needed.
+_message_attempts: dict[bytes, int] = {}
+
 # =============================================================================
 
 def _build_rabbitmq_parameters() -> pika.ConnectionParameters:
+    """
+    Builds the connection parameters shared by both the publish and consume RabbitMQ connections.
+
+    Args:
+        None
+
+    Returns:
+        pika.ConnectionParameters:
+            Parameters built from the application's RabbitMQ configuration.
+    """
     credentials = pika.PlainCredentials(settings.Q_USER, settings.Q_PASSWORD)
     return pika.ConnectionParameters(
         host=settings.Q_HOST,
         port=settings.Q_PORT,
         virtual_host=settings.Q_VHOST,
         credentials=credentials,
-        heartbeat=600,
-        blocked_connection_timeout=300
+        heartbeat=settings.Q_HEARTBEAT,
+        blocked_connection_timeout=settings.Q_BLOCKED_CONNECTION_TIMEOUT
     )
 
 def initialise_rabbitmq_publish_connection() -> None:
@@ -66,10 +78,8 @@ def initialise_rabbitmq_publish_connection() -> None:
         None
 
     Raises:
-        RuntimeError:
-            If the rabbitMQ connection cannot be established after all retry attempts.
-        OperationalError:
-            If rabbitMQ returns a connection error.
+        pika.exceptions.AMQPConnectionError:
+            If the connection cannot be established.
     """
     global _connection_publish, _channel_publish
     with _lock_publish:
@@ -96,10 +106,8 @@ def initialise_rabbitmq_consume_connection() -> None:
         None
 
     Raises:
-        RuntimeError:
-            If the rabbitMQ connection cannot be established after all retry attempts.
-        OperationalError:
-            If rabbitMQ returns a connection error.
+        pika.exceptions.AMQPConnectionError:
+            If the connection cannot be established.
     """
     global _connection_consume, _channel_consume
     with _lock_consume:
@@ -117,7 +125,7 @@ def initialise_rabbitmq_consume_connection() -> None:
 
 def initialise_rabbitmq_connection() -> None:
     """
-    Initialises both the publish and consume rabbitMQ connections.
+    Initialises both the publish and consume RabbitMQ connections.
 
     Args:
         None
@@ -126,17 +134,15 @@ def initialise_rabbitmq_connection() -> None:
         None
 
     Raises:
-        RuntimeError:
-            If either rabbitMQ connection cannot be established after all retry attempts.
-        OperationalError:
-            If rabbitMQ returns a connection error.
+        pika.exceptions.AMQPConnectionError:
+            If either connection cannot be established.
     """
     initialise_rabbitmq_publish_connection()
     initialise_rabbitmq_consume_connection()
 
 def close_rabbitmq_connection() -> None:
     """
-    Closes both the publish and consume rabbitMQ connections and channels if they exist.
+    Closes both the publish and consume RabbitMQ connections and channels if they exist.
 
     Args:
         None
@@ -166,14 +172,17 @@ def close_rabbitmq_connection() -> None:
 
 def get_rabbitmq_publish_channel() -> pika.adapters.blocking_connection.BlockingChannel:
     """
-    Retrieves an opened channel for publishing messages to rabbitMQ
+    Retrieves an opened channel for publishing messages to RabbitMQ, initialising it if needed.
 
     Args:
         None
 
     Returns:
-        - pika.adapters.blocking_connection.BlockingChannel:
-            Channel associated with the RabbitMQ publish connection, used for publishing messages.
+        pika.adapters.blocking_connection.BlockingChannel
+
+    Raises:
+        pika.exceptions.AMQPConnectionError:
+            If the connection needs to be (re)initialised and cannot be established.
     """
     global _connection_publish, _channel_publish
 
@@ -185,14 +194,17 @@ def get_rabbitmq_publish_channel() -> pika.adapters.blocking_connection.Blocking
 
 def get_rabbitmq_consume_channel() -> pika.adapters.blocking_connection.BlockingChannel:
     """
-    Retrieves an opened channel for consuming messages from rabbitMQ
+    Retrieves an opened channel for consuming messages from RabbitMQ, initialising it if needed.
 
     Args:
         None
 
     Returns:
-        - pika.adapters.blocking_connection.BlockingChannel:
-            Channel associated with the RabbitMQ consume connection, used for consuming messages.
+        pika.adapters.blocking_connection.BlockingChannel
+
+    Raises:
+        pika.exceptions.AMQPConnectionError:
+            If the connection needs to be (re)initialised and cannot be established.
     """
     global _connection_consume, _channel_consume
 
@@ -204,29 +216,47 @@ def get_rabbitmq_consume_channel() -> pika.adapters.blocking_connection.Blocking
 
 def queue_push_task(payload: dict) -> bool:
     """
-    Push a task into a RabbitMQ queue.
+    Push a task into a RabbitMQ queue, retrying on connection failure up to Q_PUSH_MAX_ATTEMPTS times.
 
     Args:
-        - payload (dict)
+        payload (dict)
 
     Returns:
-        - bool:
-            True if the message was successfully published to RabbitMQ; otherwise, False.
+        bool:
+            True if published successfully; otherwise False once attempts are exhausted.
+
+    Notes:
+        - UnroutableError is not retried (misconfigured queue/binding). Connection-level failures are.
     """
-    try:
-        channel = get_rabbitmq_publish_channel()
-        channel.queue_declare(queue=settings.Q_CHANNEL_OUT, durable=True)
-        channel.basic_publish(
-            exchange="",
-            routing_key=settings.Q_CHANNEL_OUT,
-            body=json.dumps(payload),
-            properties=pika.BasicProperties(
-                delivery_mode=pika.DeliveryMode.Persistent
+    for attempt in range(1, settings.Q_PUSH_MAX_ATTEMPTS + 1):
+        try:
+            channel = get_rabbitmq_publish_channel()
+            channel.queue_declare(queue=settings.Q_CHANNEL_OUT, durable=True)
+            channel.basic_publish(
+                exchange="",
+                routing_key=settings.Q_CHANNEL_OUT,
+                body=json.dumps(payload),
+                properties=pika.BasicProperties(
+                    delivery_mode=pika.DeliveryMode.Persistent
+                )
             )
-        )
-        return True
-    except pika.exceptions.UnroutableError:
-        return False
+            logger.info(f"Pushed task to RabbitMQ queue={settings.Q_CHANNEL_OUT} (task_id={payload.get('task_id')}).")
+            return True
+        except pika.exceptions.UnroutableError:
+            logger.error("RabbitMQ rejected task as unroutable. Not retrying.")
+            return False
+        except (
+            pika.exceptions.AMQPConnectionError,
+            pika.exceptions.StreamLostError,
+            pika.exceptions.ChannelWrongStateError,
+            pika.exceptions.ChannelClosed,
+        ):
+            logger.warning(f"RabbitMQ push attempt {attempt}/{settings.Q_PUSH_MAX_ATTEMPTS} failed.")
+            if attempt < settings.Q_PUSH_MAX_ATTEMPTS:
+                time.sleep(settings.Q_PUSH_RETRY_DELAY)
+
+    logger.error(f"Failed to push task to RabbitMQ after {settings.Q_PUSH_MAX_ATTEMPTS} attempts.")
+    return False
 
 def queue_pull_task() -> dict | None:
     """
@@ -236,8 +266,18 @@ def queue_pull_task() -> dict | None:
         None
 
     Returns:
-        - dict | None:
-            Returns message received from queue; otherwise None.
+        dict | None:
+            The message received; otherwise None.
+
+    Raises:
+        pika.exceptions.AMQPConnectionError:
+            If the connection needs to be (re)initialised and cannot be established.
+
+        json.JSONDecodeError:
+            If the message body is not valid JSON.
+
+        UnicodeDecodeError:
+            If the message body cannot be decoded.
     """
     channel = get_rabbitmq_consume_channel()
     channel.queue_declare(queue=settings.Q_CHANNEL_IN, durable=True)
@@ -254,25 +294,17 @@ def queue_consume_task():
     """
     Consumes messages from RabbitMQ in a loop, reconnecting automatically on connection failures.
 
+    Runs until _consumer_running is cleared (see stop_queue_consumer()).
+
     Args:
         None
 
     Returns:
-        None:
-           Runs indefinitely while the consumer flag is enabled and does not return a meaningful value.
+        None
 
-    Raises:
-        pika.exceptions.AMQPConnectionError:
-            Propagated internally to trigger reconnection handling.
-        pika.exceptions.StreamLostError:
-            Propagated internally to trigger reconnection handling.
-        pika.exceptions.ChannelWrongStateError:
-            Propagated internally to trigger reconnection handling.
     Notes:
-        - Declares the queue before consuming.
-        - Acks processed messages; nacks failed ones with requeue enabled.
-        - Reconnects automatically on connection/stream/channel failures.
-        - Controlled by the global _consumer_running flag.
+        - An undecodable message body is dropped (not requeued) - retrying cannot fix it.
+        - Other processing failures are requeued and retried up to Q_CONSUME_MAX_ATTEMPTS times (tracked per body in _message_attempts), then dropped.
     """
     global _consumer_running
     while True:
@@ -287,11 +319,26 @@ def queue_consume_task():
             def callback(ch, method, properties, body):
                 try:
                     payload = body.decode()
+                except UnicodeDecodeError:
+                    logger.error("Received RabbitMQ message with an undecodable body. Dropping (not requeued).")
+                    ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
+                    return
+
+                try:
                     process_message(payload)
                     ch.basic_ack(delivery_tag=method.delivery_tag)
+                    _message_attempts.pop(body, None)
                 except Exception:
-                    logger.exception("Failed to process incoming RabbitMQ message.")
-                    ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
+                    attempts = _message_attempts.get(body, 0) + 1
+                    _message_attempts[body] = attempts
+
+                    if attempts >= settings.Q_CONSUME_MAX_ATTEMPTS:
+                        logger.exception(f"Giving up on message after {attempts} attempts. Dropping (not requeued).")
+                        _message_attempts.pop(body, None)
+                        ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
+                    else:
+                        logger.exception(f"Failed to process incoming RabbitMQ message (attempt {attempts}/{settings.Q_CONSUME_MAX_ATTEMPTS}). Requeuing...")
+                        ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
 
             channel.basic_consume(
                 queue=settings.Q_CHANNEL_IN,
@@ -306,10 +353,10 @@ def queue_consume_task():
             pika.exceptions.ChannelWrongStateError,
         ):
             logger.warning("RabbitMQ consumer disconnected. Reconnecting...")
-            time.sleep(5)
+            time.sleep(settings.Q_CONSUME_RETRY_DELAY)
         except Exception:
             logger.exception("Unexpected RabbitMQ consumer error detected.")
-            time.sleep(5)
+            time.sleep(settings.Q_CONSUME_RETRY_DELAY)
 
 def start_queue_consumer():
     """
@@ -319,16 +366,7 @@ def start_queue_consumer():
         None
 
     Returns:
-        None:
-            This function initializes and starts the consumer thread when the consumer is not already active.
-
-    Raises:
         None
-
-    Notes:
-        - Tracks thread state via `_consumer_thread` and `_consumer_running`.
-        - Spawns a daemon thread running `queue_consume_task`.
-        - No-op if already running.
     """
 
     global _consumer_thread
@@ -352,15 +390,9 @@ def stop_queue_consumer():
         None
 
     Returns:
-        None:
-            Updates the consumer state to indicate that the queue consumer should stop processing.
-
-    Raises:
         None
 
     Notes:
-        - Sets `_consumer_running` to False.
-        - Schedules a thread-safe `stop_consuming()` if a channel is blocked in `start_consuming()`.
         - Does not wait for the consumer thread to actually terminate.
     """
     global _consumer_running
@@ -371,3 +403,5 @@ def stop_queue_consumer():
                 _connection_consume.add_callback_threadsafe(_channel_consume.stop_consuming)
             except Exception:
                 logger.exception("Failed to schedule RabbitMQ consumer stop.")
+
+# =============================================================================

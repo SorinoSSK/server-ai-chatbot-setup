@@ -1,15 +1,16 @@
 # =============================================================================
-# File        : logging.py
-# Description : Configures application logging, including console output, file rotation,
-#               retention policy, and log formatting.
-#
+# File        : logging_setup.py
+# Description : Configures application logging, including console output, file rotation, retention policy, and log formatting.
 # Author      : SorinoSSK
 # Created On  : 2026-08-29
 #
+# Features    :
+#   - Console and daily/size-based rotating file logging, with retention management.
+#
 # Notes       :
-#   - Centralized logging configuration for the application.
-#   - Supports daily log rotation and log retention management.
-#   - To be initialised during application entry points on startup.*
+#   - Centralised logging configuration for the application.
+#   - Intended to be initialised once during application entry points on startup.
+#   - Renamed from logging.py to avoid shadowing the standard library's logging module (see telegram_gateway/NON_COMPLIANCE_REPORT.md CCR-009).
 # =============================================================================
 # I M P O R T   H E A D E R
 
@@ -24,46 +25,15 @@ def setup_logging() -> logging.Logger:
     """
     Configures the root logger with console output and a daily/size-based rotating file handler.
 
-    Features:
-        - Console logging for real-time visibility.
-        - Configurable minimum logging level.
-        - Daily log file rotation at midnight.
-        - Size-based log rotation when the configured file size limit is reached.
-        - Automatic cleanup of expired log files based on the retention period.
-        - Prevention of duplicate handlers during application reloads.
-
-    Configuration:
-        LOG_DIR:
-            Directory where log files are stored.
-
-        LOG_FILE:
-            Path to the active log file.
-
-        LOG_LEVEL:
-            Minimum severity level to log (e.g. DEBUG, INFO, WARNING, ERROR, CRITICAL).
-
-        LOG_MAX_SIZE_MB:
-            Maximum size of a log file in megabyte before rotation occurs.
-
-        LOG_RETENTION_DAYS:
-            Number of days to retain historical log files.
-
     Args:
         None
 
     Returns:
         logging.Logger:
-            The initialized logger instance associated with the current module.
-
-    Raises:
-        OSError:
-            If the log directory cannot be created or the log file cannot be written.
-
-        PermissionError:
-            If the application does not have sufficient permissions to create or write log files.
+            The configured root logger.
 
     Notes:
-        Clears existing root logger handlers first to prevent duplicate log entries; call once at startup.
+        - Clears existing handlers first to avoid duplicates; call once at startup.
     """
     settings.LOG_DIR.mkdir(parents=True, exist_ok=True)
 
