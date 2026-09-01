@@ -45,7 +45,7 @@ def initialise_redis_connection() -> None:
 
     Raises:
         redis.exceptions.RedisError:
-            If the Redis connection cannot be established.
+            If the connection cannot be established.
     """
     global _client
     with _lock:
@@ -74,8 +74,12 @@ def get_redis_client() -> redis.Redis:
         None
 
     Returns:
-        - redis.Redis:
-            The shared Redis client instance.
+        redis.Redis:
+            The shared Redis client.
+
+    Raises:
+        redis.exceptions.RedisError:
+            If the connection needs to be (re)initialised and cannot be established.
     """
     global _client
     with _lock:
@@ -106,24 +110,22 @@ def redis_write(key: str, value: str, ttl_seconds: int | None = None, nx: bool =
     Writes a key-value pair to Redis, optionally with a TTL.
 
     Args:
-        - key (str)
+        key (str)
 
-        - value (str)
+        value (str)
 
-        - ttl_seconds (int | None, optional):
-            Seconds until the key expires. No expiry if None. Defaults to None.
+        ttl_seconds (int | None, optional):
+            Seconds until expiry. No expiry if None. Defaults to None.
 
-        - nx (bool, optional):
+        nx (bool, optional):
             Only write if the key does not already exist. Defaults to False.
 
     Returns:
-        - bool:
-            True if the write succeeded; otherwise False (including a
-            no-op skip caused by nx=True and an existing key).
+        bool:
+            True if written; otherwise False (including a no-op skip from nx=True).
 
     Notes:
-        - Accepts str only - callers are responsible for serialising (e.g. json.dumps) complex values first.
-        - Catches any exception, not just redis.exceptions.RedisError, so unknown/unexpected failures still return False instead of propagating.
+        - Accepts str only - callers must serialise complex values first (e.g. json.dumps).
     """
     try:
         client = get_redis_client()
@@ -137,14 +139,11 @@ def redis_read(key: str) -> str | None:
     Reads a value from Redis.
 
     Args:
-        - key (str)
+        key (str)
 
     Returns:
-        - str | None:
-            The stored value if found; otherwise None (including a missing key or a failure).
-
-    Notes:
-        - Catches any exception, so unknown/unexpected failures return None instead of propagating.
+        str | None:
+            The stored value if found; otherwise None (including on failure).
     """
     try:
         client = get_redis_client()
@@ -158,17 +157,14 @@ def redis_delete(key: str) -> bool:
     Deletes a key from Redis, retrying on a failed delete (e.g. a connection issue).
 
     Args:
-        - key (str)
+        key (str)
 
     Returns:
-        - bool:
+        bool:
             True if a key was deleted; otherwise False (including a missing key or exhausted retries).
 
     Notes:
-        - Only retries a raised exception (e.g. disconnection) - a missing key is not a
-          failure, client.delete() returns 0 for it without raising, so no retry is needed there.
-        - Retries up to settings.REDIS_TASK_MAX_ATTEMPTS times, waiting
-          settings.REDIS_TASK_RETRY_DELAY seconds between attempts.
+        - Retries only a raised exception - a missing key returns 0 without raising, not a failure.
     """
     for attempt in range(1, settings.REDIS_TASK_MAX_ATTEMPTS + 1):
         try:
@@ -187,23 +183,14 @@ def get_task_mapping(task_id: str) -> dict | None:
     Retrieves the chat_id/user_id mapping stored for a task_id.
 
     Args:
-        - task_id (str)
+        task_id (str)
 
     Returns:
-        - dict | None:
+        dict | None:
             {"chat_id": int, "user_id": int} if found and valid; otherwise None.
 
     Notes:
-        - Talks to the Redis client directly rather than via redis_read(), so three
-          distinct outcomes can be told apart and logged differently:
-            - failed to read (a raised exception, e.g. a connection issue) - retried
-              up to settings.REDIS_TASK_MAX_ATTEMPTS, waiting settings.REDIS_TASK_RETRY_DELAY
-              seconds between attempts.
-            - no exception, but the key does not exist (expired TTL, unknown task_id) -
-              an expected outcome, not a fault, and not retried.
-            - the stored value is not valid JSON - a corruption case, also not retried,
-              since retrying does not change what is already stored.
-        - Still returns None in all three cases - callers only need "found or not," not why.
+        - Distinguishes (via logging only) a read failure (retried), a missing key (expired/unknown, not retried), and corrupt JSON (not retried) - all return None.
     """
     value = None
 
@@ -235,11 +222,11 @@ def delete_task_mapping(task_id: str) -> bool:
     Deletes the chat_id/user_id mapping stored for a task_id.
 
     Args:
-        - task_id (str)
+        task_id (str)
 
     Returns:
-        - bool:
-            True if a mapping was deleted; otherwise False (including if it was already gone).
+        bool:
+            True if the mapping was deleted; otherwise False.
     """
     return redis_delete(f"task:{task_id}")
 
@@ -252,31 +239,27 @@ def create_task_mapping(
     Generates a task_id and maps it to the given chat_id/user_id pair in Redis.
 
     Args:
-        - chat_id (int)
+        chat_id (int)
 
-        - user_id (int)
+        user_id (int)
 
-        - ttl_seconds (int | None, optional):
-            Seconds until the mapping expires. No expiry if None. Defaults to settings.REDIS_TASK_MAPPING_TTL_SECONDS.
+        ttl_seconds (int | None, optional):
+            Defaults to settings.REDIS_TASK_MAPPING_TTL_SECONDS.
 
     Returns:
-        - str | None:
-            The generated task_id if the mapping was stored successfully; otherwise None.
+        str | None:
+            The generated task_id if stored successfully; otherwise None.
 
     Notes:
-        - Stored as task:<task_id> -> json {"chat_id": chat_id, "user_id": user_id}.
-        - This is the only place chat_id/user_id are persisted - queue payloads should carry task_id only, keeping agents identity-blind.
-        - Writes with nx=True so an existing task_id is never overwritten - a collision regenerates a new task_id instead of failing outright.
-        - Retries up to settings.REDIS_TASK_MAX_ATTEMPTS times, waiting
-          settings.REDIS_TASK_RETRY_DELAY seconds between attempts.
-        - Default TTL means an orphaned mapping (e.g. RabbitMQ down when the push was attempted) is
-          not stuck in Redis forever - it expires on its own after settings.REDIS_TASK_MAPPING_TTL_SECONDS.
+        - Stored as task:<task_id> -> json {"chat_id", "user_id"} - the only place identity is persisted.
+        - Writes with nx=True; a collision regenerates a new task_id rather than overwriting.
     """
     value = json.dumps({"chat_id": chat_id, "user_id": user_id})
 
     for attempt in range(1, settings.REDIS_TASK_MAX_ATTEMPTS + 1):
         task_id = uuid.uuid4().hex
         if redis_write(f"task:{task_id}", value, ttl_seconds, nx=True):
+            logger.info(f"Created task mapping task_id={task_id} for chat_id={chat_id}.")
             return task_id
         elif attempt < settings.REDIS_TASK_MAX_ATTEMPTS:
             time.sleep(settings.REDIS_TASK_RETRY_DELAY)
@@ -289,15 +272,14 @@ def get_chat_draft(chat_id: int) -> dict | None:
     Retrieves the pending draft (media awaiting an instruction) stored for a chat_id.
 
     Args:
-        - chat_id (int)
+        chat_id (int)
 
     Returns:
-        - dict | None:
-            {"media_type": str, "media_url": str, "text": str, "has_caption": bool}
-            if found and valid; otherwise None.
+        dict | None:
+            {"media_type", "media_url", "text", "has_caption"} if found and valid; otherwise None.
 
     Notes:
-        - Same read/retry/corruption handling as get_task_mapping() - see there for details.
+        - Same read/retry/corruption handling as get_task_mapping().
     """
     value = None
 
@@ -328,49 +310,69 @@ def delete_chat_draft(chat_id: int) -> bool:
     Deletes the pending draft stored for a chat_id.
 
     Args:
-        - chat_id (int)
+        chat_id (int)
 
     Returns:
-        - bool:
-            True if a draft was deleted; otherwise False (including if it was already gone).
+        bool:
+            True if the draft was deleted; otherwise False.
     """
     return redis_delete(f"draft:{chat_id}")
+
+def get_all_chat_draft_ids() -> list[int]:
+    """
+    Retrieves the chat_id of every currently pending draft in Redis.
+
+    Args:
+        None
+
+    Returns:
+        list[int]:
+            chat_ids with a draft:<chat_id> key present; empty list on failure.
+
+    Notes:
+        - Used on startup to sweep up drafts whose in-memory keep-alive timer did not
+          survive an application restart (see utils_telegram/utilities/image_draft_handler.py).
+        - Uses SCAN (not KEYS) so it doesn't block Redis on a large keyspace.
+    """
+    try:
+        client = get_redis_client()
+        chat_ids = []
+        for key in client.scan_iter(match="draft:*"):
+            try:
+                chat_ids.append(int(key.split(":", 1)[1]))
+            except (IndexError, ValueError):
+                logger.error(f"Skipped malformed draft key while sweeping Redis: {key}")
+
+        return chat_ids
+    except Exception:
+        logger.exception("Failed to sweep Redis for pending drafts.")
+        return []
 
 def create_chat_draft(chat_id: int, media_type: str, media_url: str, text: str, has_caption: bool) -> bool:
     """
     Stores a pending draft (media awaiting an instruction) for a chat_id.
 
     Args:
-        - chat_id (int)
+        chat_id (int)
 
-        - media_type (str):
+        media_type (str):
             "image" | "video" | "file".
 
-        - media_url (str)
+        media_url (str)
 
-        - text (str):
-            The caption, if the media was sent with one; otherwise "".
+        text (str):
+            The caption, if any; otherwise "".
 
-        - has_caption (bool)
+        has_caption (bool)
 
     Returns:
-        - bool:
-            True if the draft was stored successfully; otherwise False.
+        bool:
+            True if stored successfully; otherwise False.
 
     Notes:
-        - Stored as draft:<chat_id> -> json {"media_type", "media_url", "text", "has_caption"}.
-        - Writes with nx=True - only one pending draft is allowed per chat_id at a time.
-          Callers are expected to check get_chat_draft() first; this only refuses to
-          overwrite an existing draft, it does not report which case occurred.
-        - Unlike create_task_mapping(), this is a single attempt with no retry loop - the
-          key is deterministic (not a randomly generated task_id), so retrying a failure
-          here would just fail again if a draft already legitimately exists for this
-          chat_id. A dropped write here simply means the user's media goes unacknowledged,
-          which is easily recovered by resending - a lower-stakes failure than a task mapping.
-        - TTL is settings.DRAFT_MAPPING_TTL_SECONDS, as a Redis-side backstop slightly
-          beyond the draft timer's hard close (see utils_telegram/draft_timer.py) so a
-          draft is never left in Redis indefinitely if the in-memory timer thread is lost
-          (e.g. an application restart).
+        - Stored as draft:<chat_id> -> json {media_type, media_url, text, has_caption}.
+        - Writes with nx=True; only one pending draft allowed per chat_id at a time.
+        - TTL is a Redis-side backstop slightly beyond the draft timer's hard close (see utils_telegram/utilities/image_draft_handler.py), in case the in-memory timer is lost.
     """
     value = json.dumps({
         "media_type": media_type,
@@ -378,6 +380,12 @@ def create_chat_draft(chat_id: int, media_type: str, media_url: str, text: str, 
         "text": text or "",
         "has_caption": has_caption
     })
-    return redis_write(f"draft:{chat_id}", value, ttl_seconds=settings.DRAFT_MAPPING_TTL_SECONDS, nx=True)
+    created = redis_write(f"draft:{chat_id}", value, ttl_seconds=settings.DRAFT_MAPPING_TTL_SECONDS, nx=True)
+    if created:
+        logger.info(f"Created {media_type} draft for chat_id={chat_id}.")
+    else:
+        logger.warning(f"Did not create {media_type} draft for chat_id={chat_id} - a draft may already be pending, or the write failed.")
+
+    return created
 
 # =============================================================================

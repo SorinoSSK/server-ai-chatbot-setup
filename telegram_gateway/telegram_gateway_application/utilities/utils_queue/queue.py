@@ -71,10 +71,8 @@ def initialise_rabbitmq_publish_connection() -> None:
         None
 
     Raises:
-        RuntimeError:
-            If the rabbitMQ connection cannot be established after all retry attempts.
-        OperationalError:
-            If rabbitMQ returns a connection error.
+        pika.exceptions.AMQPConnectionError:
+            If the connection cannot be established.
     """
     global _connection_publish, _channel_publish
     with _lock_publish:
@@ -101,10 +99,8 @@ def initialise_rabbitmq_consume_connection() -> None:
         None
 
     Raises:
-        RuntimeError:
-            If the rabbitMQ connection cannot be established after all retry attempts.
-        OperationalError:
-            If rabbitMQ returns a connection error.
+        pika.exceptions.AMQPConnectionError:
+            If the connection cannot be established.
     """
     global _connection_consume, _channel_consume
     with _lock_consume:
@@ -122,7 +118,7 @@ def initialise_rabbitmq_consume_connection() -> None:
 
 def initialise_rabbitmq_connection() -> None:
     """
-    Initialises both the publish and consume rabbitMQ connections.
+    Initialises both the publish and consume RabbitMQ connections.
 
     Args:
         None
@@ -131,17 +127,15 @@ def initialise_rabbitmq_connection() -> None:
         None
 
     Raises:
-        RuntimeError:
-            If either rabbitMQ connection cannot be established after all retry attempts.
-        OperationalError:
-            If rabbitMQ returns a connection error.
+        pika.exceptions.AMQPConnectionError:
+            If either connection cannot be established.
     """
     initialise_rabbitmq_publish_connection()
     initialise_rabbitmq_consume_connection()
 
 def close_rabbitmq_connection() -> None:
     """
-    Closes both the publish and consume rabbitMQ connections and channels if they exist.
+    Closes both the publish and consume RabbitMQ connections and channels if they exist.
 
     Args:
         None
@@ -171,14 +165,17 @@ def close_rabbitmq_connection() -> None:
 
 def get_rabbitmq_publish_channel() -> pika.adapters.blocking_connection.BlockingChannel:
     """
-    Retrieves an opened channel for publishing messages to rabbitMQ
+    Retrieves an opened channel for publishing messages to RabbitMQ, initialising it if needed.
 
     Args:
         None
 
     Returns:
-        - pika.adapters.blocking_connection.BlockingChannel:
-            Channel associated with the RabbitMQ publish connection, used for publishing messages.
+        pika.adapters.blocking_connection.BlockingChannel
+
+    Raises:
+        pika.exceptions.AMQPConnectionError:
+            If the connection needs to be (re)initialised and cannot be established.
     """
     global _connection_publish, _channel_publish
 
@@ -190,14 +187,17 @@ def get_rabbitmq_publish_channel() -> pika.adapters.blocking_connection.Blocking
 
 def get_rabbitmq_consume_channel() -> pika.adapters.blocking_connection.BlockingChannel:
     """
-    Retrieves an opened channel for consuming messages from rabbitMQ
+    Retrieves an opened channel for consuming messages from RabbitMQ, initialising it if needed.
 
     Args:
         None
 
     Returns:
-        - pika.adapters.blocking_connection.BlockingChannel:
-            Channel associated with the RabbitMQ consume connection, used for consuming messages.
+        pika.adapters.blocking_connection.BlockingChannel
+
+    Raises:
+        pika.exceptions.AMQPConnectionError:
+            If the connection needs to be (re)initialised and cannot be established.
     """
     global _connection_consume, _channel_consume
 
@@ -212,20 +212,14 @@ def queue_push_task(payload: dict) -> bool:
     Push a task into a RabbitMQ queue, retrying on connection failure up to Q_PUSH_MAX_ATTEMPTS times.
 
     Args:
-        - payload (dict)
+        payload (dict)
 
     Returns:
-        - bool:
-            True if the message was successfully published to RabbitMQ; otherwise, False once all attempts are exhausted.
+        bool:
+            True if published successfully; otherwise False once attempts are exhausted.
 
     Notes:
-        - UnroutableError is not retried - the queue/binding itself is misconfigured, so retrying would not help.
-        - AMQPConnectionError/StreamLostError/ChannelWrongStateError/ChannelClosed are retried, with
-          Q_PUSH_RETRY_DELAY seconds between attempts - these are the failure types expected if RabbitMQ
-          itself is down/restarting, or the broker force-closed the channel.
-        - Any other exception is intentionally left uncaught here, rather than added to the retry set -
-          see poll_updates()'s outer except Exception, which logs the full traceback instead of folding
-          an unexpected bug into the same retry-and-give-up path as a genuine outage.
+        - UnroutableError is not retried (misconfigured queue/binding). Connection-level failures are.
     """
     for attempt in range(1, settings.Q_PUSH_MAX_ATTEMPTS + 1):
         try:
@@ -239,6 +233,7 @@ def queue_push_task(payload: dict) -> bool:
                     delivery_mode=pika.DeliveryMode.Persistent
                 )
             )
+            logger.info(f"Pushed task to RabbitMQ queue={settings.Q_CHANNEL_OUT} (task_id={payload.get('task_id')}).")
             return True
         except pika.exceptions.UnroutableError:
             logger.error("RabbitMQ rejected task as unroutable. Not retrying.")
@@ -264,8 +259,18 @@ def queue_pull_task() -> dict | None:
         None
 
     Returns:
-        - dict | None:
-            Returns message received from queue; otherwise None.
+        dict | None:
+            The message received; otherwise None.
+
+    Raises:
+        pika.exceptions.AMQPConnectionError:
+            If the connection needs to be (re)initialised and cannot be established.
+
+        json.JSONDecodeError:
+            If the message body is not valid JSON.
+
+        UnicodeDecodeError:
+            If the message body cannot be decoded.
     """
     channel = get_rabbitmq_consume_channel()
     channel.queue_declare(queue=settings.Q_CHANNEL_IN, durable=True)
@@ -282,31 +287,17 @@ def queue_consume_task():
     """
     Consumes messages from RabbitMQ in a loop, reconnecting automatically on connection failures.
 
+    Runs until _consumer_running is cleared (see stop_queue_consumer()).
+
     Args:
         None
 
     Returns:
-        None:
-           Runs indefinitely while the consumer flag is enabled and does not return a meaningful value.
+        None
 
-    Raises:
-        pika.exceptions.AMQPConnectionError:
-            Propagated internally to trigger reconnection handling.
-        pika.exceptions.StreamLostError:
-            Propagated internally to trigger reconnection handling.
-        pika.exceptions.ChannelWrongStateError:
-            Propagated internally to trigger reconnection handling.
     Notes:
-        - Declares the queue before consuming.
-        - Acks processed messages.
-        - An undecodable message body is dropped immediately (not requeued) - the bytes
-          never change on redelivery, so retrying cannot fix it.
-        - Any other processing failure is requeued and retried up to Q_CONSUME_MAX_ATTEMPTS
-          times (tracked per message body in _message_attempts), then dropped - see
-          message_handler.py's process_message() for failures it deliberately does not
-          raise (and so never reach this retry logic in the first place).
-        - Reconnects automatically on connection/stream/channel failures.
-        - Controlled by the global _consumer_running flag.
+        - An undecodable message body is dropped (not requeued) - retrying cannot fix it.
+        - Other processing failures are requeued and retried up to Q_CONSUME_MAX_ATTEMPTS times (tracked per body in _message_attempts), then dropped.
     """
     global _consumer_running
     while True:
@@ -368,16 +359,7 @@ def start_queue_consumer():
         None
 
     Returns:
-        None:
-            This function initializes and starts the consumer thread when the consumer is not already active.
-
-    Raises:
         None
-
-    Notes:
-        - Tracks thread state via `_consumer_thread` and `_consumer_running`.
-        - Spawns a daemon thread running `queue_consume_task`.
-        - No-op if already running.
     """
 
     global _consumer_thread
@@ -401,15 +383,9 @@ def stop_queue_consumer():
         None
 
     Returns:
-        None:
-            Updates the consumer state to indicate that the queue consumer should stop processing.
-
-    Raises:
         None
 
     Notes:
-        - Sets `_consumer_running` to False.
-        - Schedules a thread-safe `stop_consuming()` if a channel is blocked in `start_consuming()`.
         - Does not wait for the consumer thread to actually terminate.
     """
     global _consumer_running

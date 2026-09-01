@@ -93,14 +93,44 @@ Redis-backed draft (one per `chat_id` at a time) until a text update finalises i
   user changed their mind) is not decided by the gateway - it always attaches
   the draft's media to whatever text finalises it; that judgement call is left to the backend.
 
-**Timeout**, per draft, measured from creation (see `utils_telegram/draft_timer.py`):
-- `DRAFT_CLOSE_SECONDS - DRAFT_WARNING_LEAD_SECONDS - DRAFT_TYPING_LEAD_SECONDS`
-  (52 min by default): a "typing..." indicator starts.
-- `DRAFT_CLOSE_SECONDS - DRAFT_WARNING_LEAD_SECONDS` (53 min by default):
-  typing stops, a warning is sent asking the user to resend when ready.
-- `DRAFT_CLOSE_SECONDS` (55 min by default): the draft is silently cleared -
-  no further message, the warning already covered it. Kept comfortably under
-  Telegram's 1-hour file link guarantee.
+**Timeout**, per draft, is a repeating keep-alive cycle rather than a single
+countdown (see `utils_telegram/utilities/image_draft_handler.py`). Each cycle
+is `DRAFT_CYCLE_SECONDS` long (5 min by default) and has two "typing..."
+windows, one immediately before each of the two messages a cycle can send:
+- `DRAFT_CYCLE_SECONDS - DRAFT_CYCLE_NOTICE_LEAD_SECONDS - DRAFT_TYPING_LEAD_SECONDS`
+  into the cycle (1 min by default): a "typing..." indicator starts.
+- `DRAFT_CYCLE_SECONDS - DRAFT_CYCLE_NOTICE_LEAD_SECONDS` into the cycle
+  (2 min by default): typing stops, a notice is sent asking if the user
+  needs more time, with a "Give me a little while more" button attached.
+- `DRAFT_CYCLE_SECONDS - DRAFT_TYPING_LEAD_SECONDS` into the cycle (4 min by
+  default): if the button still hasn't been pressed, "typing..." starts again.
+- `DRAFT_CYCLE_SECONDS` into the cycle (5 min by default): typing stops. If
+  the button wasn't pressed by now (and the draft wasn't finalised), the
+  cycle simply ends and the **next** scheduled cycle begins - sending its own
+  notice at its own 2 min mark, and so on - **unless** this was the final
+  cycle, in which case the draft is cleared and the user is told the bot
+  will get to it later.
+
+The number of cycles is fixed by `DRAFT_CLOSE_SECONDS / DRAFT_CYCLE_SECONDS`
+(11 cycles at the defaults above, i.e. 55 min total - kept comfortably under
+Telegram's 1-hour file link guarantee) and runs its course regardless of
+whether the button is ever pressed. Pressing the button at any point up to a
+cycle's end (including during the second "typing..." window) sends a short
+acknowledgement and **skips ahead** to the next scheduled cycle immediately,
+instead of waiting out the rest of the current one - it does not add extra
+cycles beyond the fixed total. The final cycle's notice has no button
+instead, since there's no further cycle to skip ahead to - if it still
+isn't finalised by the end of that cycle, the draft is cleared the same way.
+
+The keep-alive cycle above is **in-memory only** - it does not survive an
+application restart, though the Redis-backed draft record itself does (it has
+its own TTL, `DRAFT_MAPPING_TTL_SECONDS`, slightly beyond `DRAFT_CLOSE_SECONDS`,
+as a backstop). Since the loop's progress isn't persisted, a restart would
+otherwise leave a draft silently pending with no further notices and no close
+message, for up to that TTL. To avoid this, `close_orphaned_drafts()` sweeps
+Redis for any leftover drafts on startup, before polling resumes, and closes
+each one out immediately (draft deleted, close message sent) rather than
+attempting to resume it part-way through a cycle.
 
 ### Response Queue Message Payloads
 
@@ -194,8 +224,28 @@ or causing the send to fail.
 #### `text`
 Maps to Telegram's `sendMessage`.
 ```json
-{"task_id": "...", "type": "text", "text": "..."}
+{
+  "task_id": "...",
+  "type": "text",
+  "text": "...",
+  "buttons": [
+    [
+      {"text": "Accept", "purpose": "task_review", "payload": {"decision": "accept"}},
+      {"text": "Reject", "purpose": "task_review", "payload": {"decision": "reject"}}
+    ]
+  ]
+}
 ```
+- `buttons`: optional. Rows of inline keyboard buttons, each
+  `{"text": "...", "purpose": "...", "payload": {...}}`.
+  - `purpose`: caller-defined tag, read back when the press is validated so
+    the gateway knows how to route it.
+  - `payload`: optional caller-defined context retrieved alongside the press.
+  - Each button is registered with a bot-issued `callback_data` token (see
+    `utils_telegram/utilities/button_prompt_handler.py`) - the agent never
+    supplies `callback_data` directly.
+  - A button that fails to register, or a keyboard that fails Telegram's
+    size limits, is dropped; the message still sends as plain text.
 
 #### `completed`
 Terminal marker - no further payloads are expected for this `task_id`.
@@ -221,3 +271,16 @@ exhausted).
     message (Telegram `parse_mode` `HTML`, `message` is HTML-escaped
     before being embedded).
 - Same cleanup as `completed`, plus a user-facing notification.
+
+## TODO
+- **Collect poll answers.** The gateway can currently only send polls
+  (`send_poll()`/`type: "poll"`) - it has no wiring to receive results.
+  To support this:
+  - Add `poll_answer` (and/or `poll`) to `TELEGRAM_ALLOWED_UPDATES`.
+  - Add a handler in `gateway_inbound.py` for the `poll_answer` update type.
+  - Decide how a `poll_answer` correlates back to a `chat_id`/task, similar
+    to how `utils_telegram/utilities/button_prompt_handler.py` correlates
+    callback_query presses via a registered token.
+  - Note: anonymous polls (`is_anonymous: true`, the current default in
+    `send_poll()`) never expose the real voter's identity to the bot -
+    `is_anonymous` must be `false` for a poll to support per-user answers.

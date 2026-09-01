@@ -10,7 +10,6 @@
 #
 # Notes       :
 #   - In-memory only - not persisted, resets on application restart.
-#   - Self-contained - not yet wired into process_message() or any existing inbound/outbound flow.
 #
 # =============================================================================
 # I M P O R T   H E A D E R
@@ -19,8 +18,8 @@ import random
 import logging
 import threading
 
-from ...config import settings
-from .gateway_outbound import send_typing_action
+from ....config import settings
+from ..gateway_outbound import send_typing_action
 
 # =============================================================================
 # G L O B A L   V A R I A B L E
@@ -37,7 +36,7 @@ def _stop(task_id: str) -> None:
     Removes task_id from the active registry and signals its loop to stop, if present.
 
     Args:
-        - task_id (str)
+        task_id (str)
 
     Returns:
         None
@@ -47,34 +46,27 @@ def _stop(task_id: str) -> None:
 
     if stop_event is not None:
         stop_event.set()
+        logger.info(f"Stopped typing indicator for task_id={task_id}.")
 
 def _typing_loop(task_id: str, chat_id: int, stop_event: threading.Event, on_giveup) -> None:
     """
     Background loop sustaining the typing indicator for a single task, until stopped or self-terminated.
 
     Args:
-        - task_id (str)
+        task_id (str)
 
-        - chat_id (int)
+        chat_id (int)
 
-        - stop_event (threading.Event)
+        stop_event (threading.Event)
 
-        - on_giveup (Callable[[str, str], None] | None):
-            Called with (task_id, reason) if this loop self-terminates rather than being stopped via stop_typing().
+        on_giveup (Callable[[str, str], None] | None):
+            Called with (task_id, reason) on self-termination.
 
     Returns:
         None
 
     Notes:
-        - Interval is randomised every ping between TELEGRAM_TYPING_INTERVAL_MIN/MAX for organic pacing.
-        - Ping count is capped at a value randomised once per session between
-          TELEGRAM_TYPING_MAX_PINGS_MIN/MAX - mimics a person not indicating "typing" forever on a
-          long response, and doubles as ghost-task protection if nothing else ever stops it.
-        - A failed send_typing_action() call is not logged or otherwise acted on - it is not
-          important enough to interrupt the loop over, and any cleanup this might imply belongs
-          to whichever subsystem actually owns that state, not to this function.
-        - Uses stop_event.wait() instead of time.sleep() so a stop takes effect immediately, not
-          after the current interval finishes.
+        - Interval is randomised each ping; ping count is capped (randomised once per session) as ghost-task protection in case nothing else stops the loop.
     """
     max_pings = random.randint(settings.TELEGRAM_TYPING_MAX_PINGS_MIN, settings.TELEGRAM_TYPING_MAX_PINGS_MAX)
     pings_sent = 0
@@ -98,19 +90,15 @@ def start_typing(task_id: str, chat_id: int, on_giveup=None) -> None:
     Starts the typing indicator loop for a task, if one is not already running.
 
     Args:
-        - task_id (str)
+        task_id (str)
 
-        - chat_id (int)
+        chat_id (int)
 
-        - on_giveup (Callable[[str, str], None] | None, optional):
-            Called with (task_id, reason) if the loop self-terminates rather than being stopped
-            explicitly via stop_typing(). Defaults to None.
+        on_giveup (Callable[[str, str], None] | None, optional):
+            See _typing_loop(). Defaults to None.
 
     Returns:
         None
-
-    Notes:
-        - No-op if a typing loop is already active for this task_id.
     """
     with _lock:
         if task_id in _active_typing:
@@ -124,13 +112,14 @@ def start_typing(task_id: str, chat_id: int, on_giveup=None) -> None:
         args=(task_id, chat_id, stop_event, on_giveup),
         daemon=True
     ).start()
+    logger.info(f"Started typing indicator for task_id={task_id} (chat_id={chat_id}).")
 
 def stop_typing(task_id: str) -> None:
     """
     Stops the typing indicator loop for a task, if one is active.
 
     Args:
-        - task_id (str)
+        task_id (str)
 
     Returns:
         None

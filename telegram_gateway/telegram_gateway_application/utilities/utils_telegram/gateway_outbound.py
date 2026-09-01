@@ -5,11 +5,10 @@
 # Created On  : 2026-08-29
 #
 # Features    :
-#   - Sends a text message back to a Telegram chat via the sendMessage endpoint.
-#   - Sends a "typing..." chat action via the sendChatAction endpoint.
-#   - Sends a poll to a Telegram chat via the sendPoll endpoint.
-#   - Sends a file to a Telegram chat via the sendDocument endpoint.
-#   - Sends a photo, video, or album to a Telegram chat via sendPhoto/sendVideo/sendMediaGroup.
+#   - Sends text, typing action, polls, and photo/video/document/album to a Telegram chat.
+#
+# Notes       :
+#   - send_message/send_poll/send_document/send_photo/send_video/send_media_group all retry up to TELEGRAM_SEND_MAX_ATTEMPTS times (TELEGRAM_SEND_RETRY_DELAY apart) on connection failures/timeouts only; other failures are not retried.
 #
 # =============================================================================
 # I M P O R T   H E A D E R
@@ -27,31 +26,28 @@ logger = logging.getLogger(__name__)
 
 # =============================================================================
 
-def send_message(chat_id: int | str, text: str, parse_mode: str | None = None) -> bool:
+def send_message(chat_id: int | str, text: str, parse_mode: str | None = None, reply_markup: dict | None = None) -> bool:
     """
     Send a text message back to a Telegram chat via the Bot API.
 
     Args:
-        - chat_id (int | str):
-            Identifier of the Telegram chat to send the message to.
+        chat_id (int | str)
 
-        - text (str):
-            Message content to send.
+        text (str)
 
-        - parse_mode (str | None, optional):
-            Telegram formatting mode (e.g. "HTML") to enable tags like <b> in text. Defaults to None (plain text).
+        parse_mode (str | None, optional):
+            e.g. "HTML" to enable tags like <b>. Defaults to None.
+
+        reply_markup (dict | None, optional):
+            Raw reply_markup (e.g. inline keyboard).
+            See utils_telegram/utilities/button_prompt_handler.py for building/validating one.
 
     Returns:
-        - bool:
-            True if the message was sent successfully; otherwise False.
+        bool:
+            True if sent successfully; otherwise False.
 
     Notes:
-        - Callers are responsible for escaping any untrusted text embedded alongside
-          intentional tags when parse_mode is set - unescaped <, >, or & in untrusted
-          content can break the formatting or the request entirely.
-        - Retries up to settings.TELEGRAM_SEND_MAX_ATTEMPTS times, waiting settings.TELEGRAM_SEND_RETRY_DELAY
-          seconds between attempts - but only for connection failures/timeouts. Any other failure (e.g. an
-          authorisation error) is not retried, since retrying would not change the outcome.
+        - Callers must escape untrusted text embedded alongside tags when parse_mode is set.
     """
     api_url = f"{settings.TELEGRAM_API_BASE_URL}/bot{settings.TELEGRAM_BOT_TOKEN}/sendMessage"
 
@@ -61,6 +57,8 @@ def send_message(chat_id: int | str, text: str, parse_mode: str | None = None) -
     }
     if parse_mode:
         payload["parse_mode"] = parse_mode
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
 
     for attempt in range(1, settings.TELEGRAM_SEND_MAX_ATTEMPTS + 1):
         try:
@@ -70,6 +68,7 @@ def send_message(chat_id: int | str, text: str, parse_mode: str | None = None) -
                 timeout=settings.TELEGRAM_CLIENT_TIMEOUT
             )
             response.raise_for_status()
+            logger.info(f"Sent message to chat_id={chat_id}.")
             return True
         except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
             if attempt < settings.TELEGRAM_SEND_MAX_ATTEMPTS:
@@ -87,15 +86,14 @@ def send_typing_action(chat_id: int | str) -> bool:
     Send a "typing..." chat action to a Telegram chat via the Bot API.
 
     Args:
-        - chat_id (int | str):
-            Identifier of the Telegram chat to send the action to.
+        chat_id (int | str)
 
     Returns:
-        - bool:
-            True if the action was sent successfully; otherwise False.
+        bool:
+            True if sent successfully; otherwise False.
 
     Notes:
-        - Telegram clears the indicator client-side after 5 seconds - see utils_telegram/typing_indicator.py for repeated calls.
+        - Telegram clears the indicator client-side after 5 seconds - see utilities/typing_indicator.py.
     """
     api_url = f"{settings.TELEGRAM_API_BASE_URL}/bot{settings.TELEGRAM_BOT_TOKEN}/sendChatAction"
 
@@ -109,6 +107,7 @@ def send_typing_action(chat_id: int | str) -> bool:
             timeout=settings.TELEGRAM_CLIENT_TIMEOUT
         )
         response.raise_for_status()
+        logger.debug(f"Sent typing action to chat_id={chat_id}.")
         return True
     except requests.exceptions.RequestException:
         logger.exception("Failed to send typing action to Telegram.")
@@ -119,30 +118,22 @@ def send_poll(chat_id: int | str, question: str, options: list, is_anonymous: bo
     Send a poll to a Telegram chat via the Bot API.
 
     Args:
-        - chat_id (int | str):
-            Identifier of the Telegram chat to send the poll to.
+        chat_id (int | str)
 
-        - question (str)
+        question (str)
 
-        - options (list):
-            Plain option strings - converted to Telegram's required InputPollOption shape internally.
+        options (list):
+            Plain strings - converted to Telegram's InputPollOption shape internally.
 
-        - is_anonymous (bool, optional):
+        is_anonymous (bool, optional):
             Defaults to True.
 
-        - allows_multiple_answers (bool, optional):
+        allows_multiple_answers (bool, optional):
             Defaults to False.
 
     Returns:
-        - bool:
-            True if the poll was sent successfully; otherwise False.
-
-    Notes:
-        - Telegram requires options as an Array of InputPollOption (each {"text": "..."}),
-          not plain strings - this function does that conversion.
-        - Retries up to settings.TELEGRAM_SEND_MAX_ATTEMPTS times, waiting settings.TELEGRAM_SEND_RETRY_DELAY
-          seconds between attempts - but only for connection failures/timeouts. Any other failure (e.g. an
-          authorisation error) is not retried, since retrying would not change the outcome.
+        bool:
+            True if sent successfully; otherwise False.
     """
     api_url = f"{settings.TELEGRAM_API_BASE_URL}/bot{settings.TELEGRAM_BOT_TOKEN}/sendPoll"
 
@@ -162,6 +153,7 @@ def send_poll(chat_id: int | str, question: str, options: list, is_anonymous: bo
                 timeout=settings.TELEGRAM_CLIENT_TIMEOUT
             )
             response.raise_for_status()
+            logger.info(f"Sent poll to chat_id={chat_id}.")
             return True
         except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
             if attempt < settings.TELEGRAM_SEND_MAX_ATTEMPTS:
@@ -179,26 +171,20 @@ def send_document(chat_id: int | str, url: str, caption: str | None = None) -> b
     Send a file to a Telegram chat via the Bot API, from a URL.
 
     Args:
-        - chat_id (int | str):
-            Identifier of the Telegram chat to send the file to.
+        chat_id (int | str)
 
-        - url (str):
+        url (str):
             Publicly reachable URL Telegram will fetch the file from.
 
-        - caption (str | None, optional):
+        caption (str | None, optional):
             Defaults to None.
 
     Returns:
-        - bool:
-            True if the file was sent successfully; otherwise False.
+        bool:
+            True if sent successfully; otherwise False.
 
     Notes:
-        - Telegram only supports sending a document by URL for .pdf and .zip files - any
-          other file type sent this way will be rejected by Telegram; a direct multipart
-          upload would be required instead, which this function does not implement.
-        - Retries up to settings.TELEGRAM_SEND_MAX_ATTEMPTS times, waiting settings.TELEGRAM_SEND_RETRY_DELAY
-          seconds between attempts - but only for connection failures/timeouts. Any other failure (e.g. an
-          authorisation error) is not retried, since retrying would not change the outcome.
+        - Telegram only supports sending a document by URL for .pdf and .zip files - other types are rejected (a multipart upload is not implemented).
     """
     api_url = f"{settings.TELEGRAM_API_BASE_URL}/bot{settings.TELEGRAM_BOT_TOKEN}/sendDocument"
 
@@ -217,6 +203,7 @@ def send_document(chat_id: int | str, url: str, caption: str | None = None) -> b
                 timeout=settings.TELEGRAM_CLIENT_TIMEOUT
             )
             response.raise_for_status()
+            logger.info(f"Sent document to chat_id={chat_id}.")
             return True
         except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
             if attempt < settings.TELEGRAM_SEND_MAX_ATTEMPTS:
@@ -234,23 +221,17 @@ def send_photo(chat_id: int | str, url: str, caption: str | None = None) -> bool
     Send a photo to a Telegram chat via the Bot API, from a URL.
 
     Args:
-        - chat_id (int | str):
-            Identifier of the Telegram chat to send the photo to.
+        chat_id (int | str)
 
-        - url (str):
+        url (str):
             Publicly reachable URL Telegram will fetch the photo from.
 
-        - caption (str | None, optional):
+        caption (str | None, optional):
             Defaults to None.
 
     Returns:
-        - bool:
-            True if the photo was sent successfully; otherwise False.
-
-    Notes:
-        - Retries up to settings.TELEGRAM_SEND_MAX_ATTEMPTS times, waiting settings.TELEGRAM_SEND_RETRY_DELAY
-          seconds between attempts - but only for connection failures/timeouts. Any other failure (e.g. an
-          authorisation error) is not retried, since retrying would not change the outcome.
+        bool:
+            True if sent successfully; otherwise False.
     """
     api_url = f"{settings.TELEGRAM_API_BASE_URL}/bot{settings.TELEGRAM_BOT_TOKEN}/sendPhoto"
 
@@ -269,6 +250,7 @@ def send_photo(chat_id: int | str, url: str, caption: str | None = None) -> bool
                 timeout=settings.TELEGRAM_CLIENT_TIMEOUT
             )
             response.raise_for_status()
+            logger.info(f"Sent photo to chat_id={chat_id}.")
             return True
         except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
             if attempt < settings.TELEGRAM_SEND_MAX_ATTEMPTS:
@@ -286,23 +268,17 @@ def send_video(chat_id: int | str, url: str, caption: str | None = None) -> bool
     Send a video to a Telegram chat via the Bot API, from a URL.
 
     Args:
-        - chat_id (int | str):
-            Identifier of the Telegram chat to send the video to.
+        chat_id (int | str)
 
-        - url (str):
+        url (str):
             Publicly reachable URL Telegram will fetch the video from.
 
-        - caption (str | None, optional):
+        caption (str | None, optional):
             Defaults to None.
 
     Returns:
-        - bool:
-            True if the video was sent successfully; otherwise False.
-
-    Notes:
-        - Retries up to settings.TELEGRAM_SEND_MAX_ATTEMPTS times, waiting settings.TELEGRAM_SEND_RETRY_DELAY
-          seconds between attempts - but only for connection failures/timeouts. Any other failure (e.g. an
-          authorisation error) is not retried, since retrying would not change the outcome.
+        bool:
+            True if sent successfully; otherwise False.
     """
     api_url = f"{settings.TELEGRAM_API_BASE_URL}/bot{settings.TELEGRAM_BOT_TOKEN}/sendVideo"
 
@@ -321,6 +297,7 @@ def send_video(chat_id: int | str, url: str, caption: str | None = None) -> bool
                 timeout=settings.TELEGRAM_CLIENT_TIMEOUT
             )
             response.raise_for_status()
+            logger.info(f"Sent video to chat_id={chat_id}.")
             return True
         except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
             if attempt < settings.TELEGRAM_SEND_MAX_ATTEMPTS:
@@ -338,21 +315,17 @@ def send_media_group(chat_id: int | str, items: list) -> bool:
     Send an album (2-10 items) to a Telegram chat via the Bot API.
 
     Args:
-        - chat_id (int | str):
-            Identifier of the Telegram chat to send the album to.
+        chat_id (int | str)
 
-        - items (list):
+        items (list):
             2-10 dicts, each {"type": "photo" | "video", "url": "..."}.
 
     Returns:
-        - bool:
-            True if the album was sent successfully; otherwise False.
+        bool:
+            True if sent successfully; otherwise False.
 
     Notes:
         - No caption support - sendMediaGroup captions are set per item, not accepted here.
-        - Retries up to settings.TELEGRAM_SEND_MAX_ATTEMPTS times, waiting settings.TELEGRAM_SEND_RETRY_DELAY
-          seconds between attempts - but only for connection failures/timeouts. Any other failure (e.g. an
-          authorisation error) is not retried, since retrying would not change the outcome.
     """
     api_url = f"{settings.TELEGRAM_API_BASE_URL}/bot{settings.TELEGRAM_BOT_TOKEN}/sendMediaGroup"
 
@@ -369,6 +342,7 @@ def send_media_group(chat_id: int | str, items: list) -> bool:
                 timeout=settings.TELEGRAM_CLIENT_TIMEOUT
             )
             response.raise_for_status()
+            logger.info(f"Sent album ({len(items)} items) to chat_id={chat_id}.")
             return True
         except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
             if attempt < settings.TELEGRAM_SEND_MAX_ATTEMPTS:

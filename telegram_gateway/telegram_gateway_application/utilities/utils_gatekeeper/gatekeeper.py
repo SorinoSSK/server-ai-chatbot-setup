@@ -9,11 +9,6 @@
 #
 # Notes       :
 #   - In-memory only - not persisted, resets on application restart.
-#   - Eviction only considers the oldest window of entries, and within that
-#     window prefers the lowest access count - new entries get a genuine
-#     grace period instead of being the global minimum on arrival.
-#   - Access counts are capped so a single chat_id cannot spam its way into
-#     permanent, unevictable protection.
 #
 # =============================================================================
 # I M P O R T   H E A D E R
@@ -40,11 +35,7 @@ def _evict() -> None:
         None
 
     Notes:
-        - _access_counts is ordered oldest -> most recent (move_to_end on every repeat access).
-        - Window size is settings.TELEGRAM_UNAUTHORISED_EVICTION_WINDOW_PERCENT of the cache - only
-          the oldest entries in that window are eviction candidates, so a fresh entry is protected
-          until it ages into the window, rather than being the global minimum on arrival.
-        - min() returns the first match on ties, so ties naturally resolve to the oldest candidate.
+        - Window size is TELEGRAM_UNAUTHORISED_EVICTION_WINDOW_PERCENT of the cache, so a fresh entry gets a grace period instead of being the global minimum on arrival.
     """
     window_size = max(1, len(_access_counts) * settings.TELEGRAM_UNAUTHORISED_EVICTION_WINDOW_PERCENT // 100)
     candidates = list(_access_counts)[:window_size]
@@ -57,17 +48,11 @@ def track_unauthorised_access(chat_id: int) -> int | None:
     Tracks an unauthorised chat_id's access count, evicting from the cache once full.
 
     Args:
-        - chat_id (int)
+        chat_id (int)
 
     Returns:
-        - int | None:
-            chat_id if this is its first tracked access; otherwise None.
-
-    Notes:
-        - Every call counts as an access and moves chat_id to most-recently-used.
-        - Cache size is capped at settings.TELEGRAM_UNAUTHORISED_CACHE_SIZE.
-        - Access count is capped at settings.TELEGRAM_UNAUTHORISED_ACCESS_COUNT_CAP.
-        - See _evict() for eviction order.
+        int | None:
+            chat_id if first tracked access; otherwise None.
     """
     is_first_access = chat_id not in _access_counts
 

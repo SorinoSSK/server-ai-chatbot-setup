@@ -44,8 +44,8 @@ class ShutdownSignal(threading.Event):
             None
 
         Returns:
-            - bool:
-                True if shutdown has been signalled (i.e. set() has been called); otherwise False.
+            bool:
+                True if signalled; otherwise False.
         """
         return self.is_set()
 
@@ -54,11 +54,11 @@ class ShutdownSignal(threading.Event):
         Signal handler compatible with signal.signal() - signals shutdown when invoked.
 
         Args:
-            - signum (int):
-                Signal number received (e.g. signal.SIGINT, signal.SIGTERM).
+            signum (int):
+                Signal number received.
 
-            - frame (types.FrameType | None):
-                Current stack frame, as passed by the signal module. Unused.
+            frame:
+                Unused, passed by the signal module.
 
         Returns:
             None

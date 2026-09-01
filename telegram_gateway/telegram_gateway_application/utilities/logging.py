@@ -24,46 +24,15 @@ def setup_logging() -> logging.Logger:
     """
     Configures the root logger with console output and a daily/size-based rotating file handler.
 
-    Features:
-        - Console logging for real-time visibility.
-        - Configurable minimum logging level.
-        - Daily log file rotation at midnight.
-        - Size-based log rotation when the configured file size limit is reached.
-        - Automatic cleanup of expired log files based on the retention period.
-        - Prevention of duplicate handlers during application reloads.
-
-    Configuration:
-        LOG_DIR:
-            Directory where log files are stored.
-
-        LOG_FILE:
-            Path to the active log file.
-
-        LOG_LEVEL:
-            Minimum severity level to log (e.g. DEBUG, INFO, WARNING, ERROR, CRITICAL).
-
-        LOG_MAX_SIZE_MB:
-            Maximum size of a log file in megabyte before rotation occurs.
-
-        LOG_RETENTION_DAYS:
-            Number of days to retain historical log files.
-
     Args:
         None
 
     Returns:
         logging.Logger:
-            The initialized logger instance associated with the current module.
-
-    Raises:
-        OSError:
-            If the log directory cannot be created or the log file cannot be written.
-
-        PermissionError:
-            If the application does not have sufficient permissions to create or write log files.
+            The configured root logger.
 
     Notes:
-        Clears existing root logger handlers first to prevent duplicate log entries; call once at startup.
+        - Clears existing handlers first to avoid duplicates; call once at startup.
     """
     settings.LOG_DIR.mkdir(parents=True, exist_ok=True)
 

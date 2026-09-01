@@ -11,45 +11,12 @@
 #
 # Notes       :
 #   - Uses Telegram's getUpdates long polling method, not webhooks.
-#   - Updates missing a chat_id or user_id are logged as a warning and
-#     skipped entirely - checked before the whitelist check.
-#   - Updates from chats not in settings.TELEGRAM_ALLOWED_CHAT_IDS are
-#     ignored. Note: Telegram's API has no server-side chat filter - every
-#     update is still fetched from Telegram regardless of chat, filtering
-#     only happens once it reaches this loop.
-#   - Unauthorised chat_ids get a single reply via track_unauthorised_access() -
-#     see utils_gatekeeper/gatekeeper.py for the cache/eviction behind this.
-#     First-time unauthorised access is logged as a warning; repeats stay at debug.
-#   - Media (photo/video/document) without an instruction is not queued as a task
-#     immediately - it is staged as a Redis-backed draft (see utils_redis/database.py's
-#     get/create/delete_chat_draft()) and only becomes a task once a text update
-#     finalises it. See _draft_timer.py for the warning/hard-close timer that runs
-#     while a draft is pending.
-#   - Only one pending draft is allowed per chat_id at a time - further media
-#     (single or part of an album) arriving while a draft is already pending is not
-#     stored; the user is reminded about the existing draft instead.
-#   - Album items (a media_group_id present on the message) are never staged as a
-#     draft - Telegram delivers each item as its own separate update, so the user is
-#     asked to resend them one at a time with individual instructions instead. The
-#     reply is deduped per media_group_id so a multi-item album does not receive one
-#     reply per item.
-#   - Accepted updates get a task_id via create_task_mapping() before being
-#     queued - chat_id/user_id live only in Redis, keyed by task_id. The queued
-#     payload is {task_id, text, image_url, video_url, file_url} - at most one of
-#     the three URL fields is ever non-empty, the other two are "".
-#   - If task mapping or the RabbitMQ push fails, the sender is notified
-#     directly (with a different message per failure) instead of queueing
-#     the update. queue_push_task() itself retries RabbitMQ connection
-#     failures - see queue.py - so a notification here implies retries
-#     were already exhausted.
-#   - start_typing() begins only after queue_push_task() succeeds - the typing
-#     indicator has no meaning until an agent is actually able to pick up the task.
-#   - offset only advances after an update is fully handled (including the
-#     failure-notification paths above), not on receipt - an unexpected
-#     exception mid-update leaves it unconfirmed, so Telegram redelivers it.
-#     Retried up to TELEGRAM_UPDATE_MAX_ATTEMPTS times (see _update_attempts),
-#     then given up on and skipped. Since offset is a single watermark, a
-#     retry-pending update halts the rest of its batch - see poll_updates().
+#   - Updates missing a chat_id/user_id, or from a chat not in TELEGRAM_ALLOWED_CHAT_IDS, are skipped (unauthorised chats get one reply - see utils_gatekeeper/gatekeeper.py).
+#   - Media without an instruction is staged as a Redis-backed draft (see utils_redis/database.py) until a text update finalises it, or it times out - see utilities/image_draft_handler.py.
+#   - Only one pending draft per chat_id at a time.
+#   - Album items (media_group_id) are never staged as a draft - the user is asked to resend one at a time; the reply is deduped per media_group_id.
+#   - Accepted updates get a task_id via create_task_mapping() before being queued - chat_id/user_id live only in Redis, keyed by task_id.
+#   - offset only advances once an update is fully handled - a failed update is retried up to TELEGRAM_UPDATE_MAX_ATTEMPTS times, halting its batch meanwhile.
 #
 # =============================================================================
 # I M P O R T   H E A D E R
@@ -65,8 +32,9 @@ from ..utils_gatekeeper.gatekeeper import track_unauthorised_access
 from ..utils_queue.queue import queue_push_task
 from ..utils_redis.database import create_task_mapping, get_chat_draft, create_chat_draft, delete_chat_draft
 from .gateway_outbound import send_message
-from .typing_indicator import start_typing
-from .draft_timer import start_draft_timer, stop_draft_timer
+from .utilities.typing_indicator import start_typing
+from .utilities.image_draft_handler import start_draft_timer, stop_draft_timer, continue_draft_timer
+from .utilities.button_prompt_handler import validate_bot_callback
 
 # =============================================================================
 # G L O B A L   V A R I A B L E
@@ -95,16 +63,14 @@ def _extract_chat_id(update: dict) -> int | None:
     Extract the chat ID from a Telegram Update object, regardless of event type.
 
     Args:
-        - update (dict):
-            A single Update object as returned by the getUpdates endpoint.
+        update (dict)
 
     Returns:
-        - int | None:
-            The chat ID the update belongs to, or None if the event type is
-            not one that carries a chat (e.g. inline_query).
+        int | None:
+            The chat ID, or None if the event type carries no chat.
 
     Notes:
-        - Covers message, edited_message, and callback_query only - see the README event-types doc; extend for other types.
+        - Covers message, edited_message, and callback_query only.
     """
     if "message" in update:
         return update["message"].get("chat", {}).get("id")
@@ -119,16 +85,14 @@ def _extract_user_id(update: dict) -> int | None:
     Extract the sender's user ID from a Telegram Update object, regardless of event type.
 
     Args:
-        - update (dict):
-            A single Update object as returned by the getUpdates endpoint.
+        update (dict)
 
     Returns:
-        - int | None:
-            The user ID that sent the update, or None if the event type is
-            not one that carries a sender.
+        int | None:
+            The sender's user ID, or None if the event type carries no sender.
 
     Notes:
-        - Covers message, edited_message, and callback_query only - see the README event-types doc; extend for other types.
+        - Covers message, edited_message, and callback_query only.
     """
     if "message" in update:
         return update["message"].get("from", {}).get("id")
@@ -143,19 +107,15 @@ def _extract_media(message: dict) -> dict | None:
     Extracts photo/video/document details from a Telegram message, if present.
 
     Args:
-        - message (dict):
+        message (dict):
             The "message" (or "edited_message") object of an Update.
 
     Returns:
-        - dict | None:
-            {"media_type": "image" | "video" | "file", "file_id": str,
-             "caption": str | None, "media_group_id": str | None}
-            or None if the message carries no photo/video/document.
+        dict | None:
+            {"media_type", "file_id", "caption", "media_group_id"} or None if no media.
 
     Notes:
-        - photo/video/document are mutually exclusive on a single Telegram message.
-        - Photos arrive as an array of resolutions - the last entry is the largest,
-          per Telegram's documented ordering (smallest -> largest).
+        - Photos arrive as an array of resolutions - the last entry is the largest.
     """
     if message.get("photo"):
         file_id = message["photo"][-1].get("file_id")
@@ -181,19 +141,14 @@ def _resolve_file_url(file_id: str) -> str | None:
     Resolves a Telegram file_id to a temporary, publicly-fetchable download URL via getFile.
 
     Args:
-        - file_id (str)
+        file_id (str)
 
     Returns:
-        - str | None:
+        str | None:
             The download URL if resolved successfully; otherwise None.
 
     Notes:
-        - The resulting URL embeds settings.TELEGRAM_BOT_TOKEN and is only guaranteed
-          valid by Telegram for at least 1 hour from this call - callers should not
-          resolve it far in advance of when it will actually be used, and should not log it.
-        - Retries up to settings.TELEGRAM_SEND_MAX_ATTEMPTS times, waiting settings.TELEGRAM_SEND_RETRY_DELAY
-          seconds between attempts - but only for connection failures/timeouts. Any other failure (e.g. an
-          authorisation error, or an invalid/expired file_id) is not retried, since retrying would not change the outcome.
+        - URL embeds the bot token and is only guaranteed valid for at least 1 hour - do not resolve it far in advance, and do not log it.
     """
     api_url = f"{settings.TELEGRAM_API_BASE_URL}/bot{settings.TELEGRAM_BOT_TOKEN}/getFile"
 
@@ -221,32 +176,40 @@ def _resolve_file_url(file_id: str) -> str | None:
             logger.exception(f"Failed to resolve file_id={file_id} via getFile. Not retrying.")
             return None
 
-def _should_reply_to_album(media_group_id: str) -> bool:
+def _prune_recent_media_groups() -> None:
     """
-    Determines whether an album reply should be sent for this media_group_id, deduping repeats.
+    Removes media_group_id entries from _recent_media_groups older than settings.MEDIA_GROUP_DEDUPE_SECONDS.
 
     Args:
-        - media_group_id (str)
+        None
 
     Returns:
-        - bool:
-            True if this is the first item seen for this media_group_id (a reply
-            should be sent); otherwise False.
-
-    Notes:
-        - Entries are pruned by age (settings.MEDIA_GROUP_DEDUPE_SECONDS) rather than an
-          explicit "album finished" signal, since Telegram gives no such signal - album
-          items simply arrive as a short burst of separate updates sharing one media_group_id.
+        None
     """
     now = time.monotonic()
     for group_id, seen_at in list(_recent_media_groups.items()):
         if now - seen_at > settings.MEDIA_GROUP_DEDUPE_SECONDS:
             _recent_media_groups.pop(group_id, None)
 
+def _should_reply_to_album(media_group_id: str) -> bool:
+    """
+    Determines whether an album reply should be sent for this media_group_id, deduping repeats.
+
+    Args:
+        media_group_id (str)
+
+    Returns:
+        bool:
+            True if this is the first item seen for this media_group_id; otherwise False.
+
+    Notes:
+        - Pruned by age (MEDIA_GROUP_DEDUPE_SECONDS), not an "album finished" signal - Telegram gives no such signal.
+        - Pruning itself happens in _handle_update().
+    """
     if media_group_id in _recent_media_groups:
         return False
 
-    _recent_media_groups[media_group_id] = now
+    _recent_media_groups[media_group_id] = time.monotonic()
     return True
 
 def _send_still_curious(chat_id: int, media_type: str) -> None:
@@ -254,9 +217,10 @@ def _send_still_curious(chat_id: int, media_type: str) -> None:
     Replies that a pending draft's media is still on file, ignoring newly arrived media.
 
     Args:
-        - chat_id (int)
-        - media_type (str):
-            "image" | "video" | "file" - the pending draft's media_type.
+        chat_id (int)
+
+        media_type (str):
+            "image" | "video" | "file" - used to word the reply message.
 
     Returns:
         None
@@ -272,19 +236,26 @@ def _push_task(chat_id: int, user_id: int, text: str, image_url: str = "", video
     Creates a task mapping and pushes the task payload to RabbitMQ, notifying the user on failure.
 
     Args:
-        - chat_id (int)
-        - user_id (int)
-        - text (str)
-        - image_url (str, optional)
-        - video_url (str, optional)
-        - file_url (str, optional)
+        chat_id (int)
+
+        user_id (int)
+
+        text (str)
+
+        image_url (str, optional):
+            Defaults to "".
+
+        video_url (str, optional):
+            Defaults to "".
+
+        file_url (str, optional):
+            Defaults to "".
 
     Returns:
         None
 
     Notes:
-        - At most one of image_url/video_url/file_url is expected to be non-empty -
-          all three are always present in the queued payload, empty ones as "".
+        - At most one of image_url/video_url/file_url is expected to be non-empty.
         - start_typing() begins only after queue_push_task() succeeds.
     """
     task_id = create_task_mapping(chat_id, user_id)
@@ -310,28 +281,52 @@ def _push_task(chat_id: int, user_id: int, text: str, image_url: str = "", video
         )
     else:
         start_typing(task_id, chat_id)
+        logger.info(f"Pushed task_id={task_id} for chat_id={chat_id} to the outbound queue.")
 
 def _handle_update(chat_id: int, user_id: int, update: dict) -> None:
     """
     Routes an accepted (authorised) update through the media/draft/finalisation flow.
 
     Args:
-        - chat_id (int)
-        - user_id (int)
-        - update (dict)
+        chat_id (int)
+
+        user_id (int)
+
+        update (dict)
 
     Returns:
         None
 
     Notes:
-        - See module Notes above for the overall draft flow this implements.
+        - See module Notes above for the overall draft flow.
+        - Prunes _recent_media_groups on every update, not just album items.
+        - callback_query updates are validated via validate_bot_callback() here, rather than falling through to the text branch (which would otherwise read them as empty-text).
+        - "draft_continue" (see utils_telegram/utilities/image_draft_handler.py) is the only callback purpose currently wired up; any other purpose is logged and otherwise ignored.
     """
+    _prune_recent_media_groups()
+
+    if "callback_query" in update:
+        callback_data = update["callback_query"].get("data") or ""
+        result = validate_bot_callback(callback_data, chat_id)
+        if result is None:
+            logger.warning(f"Ignored unrecognised callback_query from chat_id={chat_id}.")
+        elif result["purpose"] == "draft_continue":
+            if not continue_draft_timer(chat_id):
+                logger.warning(f"Received draft_continue callback for chat_id={chat_id} but no active draft timer.")
+        else:
+            logger.info(
+                f"Validated callback_query from chat_id={chat_id} for purpose={result['purpose']!r} "
+                f"- no handler wired up for this purpose yet."
+            )
+        return
+
     message = update.get("message") or update.get("edited_message") or {}
     media = _extract_media(message)
 
     if media and media["media_group_id"]:
         if _should_reply_to_album(media["media_group_id"]):
             existing_draft = get_chat_draft(chat_id)
+            logger.info(f"Prompted chat_id={chat_id} to resend album (media_group_id={media['media_group_id']}) items individually.")
             if existing_draft:
                 _send_still_curious(chat_id, existing_draft["media_type"])
             else:
@@ -345,6 +340,7 @@ def _handle_update(chat_id: int, user_id: int, update: dict) -> None:
     if media:
         existing_draft = get_chat_draft(chat_id)
         if existing_draft:
+            logger.info(f"New {media['media_type']} for chat_id={chat_id} ignored - {existing_draft['media_type']} draft already pending.")
             _send_still_curious(chat_id, existing_draft["media_type"])
             return
 
@@ -369,6 +365,7 @@ def _handle_update(chat_id: int, user_id: int, update: dict) -> None:
     if existing_draft:
         stop_draft_timer(chat_id)
         delete_chat_draft(chat_id)
+        logger.info(f"Finalising {existing_draft['media_type']} draft for chat_id={chat_id} into a task.")
 
         if existing_draft["has_caption"] and existing_draft["text"]:
             final_text = f"{existing_draft['text']} {text}".strip()
@@ -384,25 +381,17 @@ def poll_updates() -> None:
     """
     Long-polls Telegram's getUpdates endpoint for new updates, advancing the offset per handled update.
 
+    Runs until stop_polling() is called. Errors are caught internally to keep the loop alive.
+
     Args:
         None
 
     Returns:
-        None:
-            Runs until stop_polling() is called and does not return a meaningful value.
-
-    Raises:
-        None:
-            Request and unexpected errors are caught internally to keep the
-            polling loop alive.
+        None
 
     Notes:
-        - Requires settings.TELEGRAM_BOT_TOKEN to be set.
         - stop_polling() may take up to TELEGRAM_POLL_TIMEOUT + TELEGRAM_CLIENT_TIMEOUT to take effect if a request is in flight.
-        - Filters event types via allowed_updates; chat filtering is separate - see _extract_chat_id().
         - Requires Redis to be initialised - see create_task_mapping().
-        - An update that fails unexpectedly halts the rest of its batch (break) -
-          offset cannot skip past it while still retrying it. See _update_attempts.
     """
     api_url = f"{settings.TELEGRAM_API_BASE_URL}/bot{settings.TELEGRAM_BOT_TOKEN}/getUpdates"
     offset = None
@@ -485,9 +474,7 @@ def stop_polling() -> None:
         None
 
     Notes:
-        - Sets the stop event checked at the top of each poll_updates() iteration.
-        - Does not interrupt an in-flight request (see poll_updates() notes).
-        - Does not wait for the polling loop to actually terminate.
+        - Does not interrupt an in-flight request, nor wait for the loop to actually terminate.
     """
     _stop_polling_event.set()
 
