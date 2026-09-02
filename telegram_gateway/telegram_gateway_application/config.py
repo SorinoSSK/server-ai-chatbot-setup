@@ -39,7 +39,7 @@ class Settings:
         DEFAULT_TELEGRAM_POLL_TIMEOUT                           = 30
         DEFAULT_TELEGRAM_CLIENT_TIMEOUT                         = 10
         DEFAULT_TELEGRAM_ALLOWED_CHAT_IDS                       = ""
-        DEFAULT_TELEGRAM_ALLOWED_UPDATES                        = "message,callback_query"
+        DEFAULT_TELEGRAM_ALLOWED_UPDATES                        = "message,callback_query,poll_answer"
         DEFAULT_TELEGRAM_UNAUTHORISED_CACHE_SIZE                = 100
         DEFAULT_TELEGRAM_UNAUTHORISED_EVICTION_WINDOW_PERCENT   = 10
         DEFAULT_TELEGRAM_UNAUTHORISED_ACCESS_COUNT_CAP          = 1000
@@ -96,6 +96,30 @@ class Settings:
         self.DRAFT_TYPING_LEAD_SECONDS                          = get_env_int("DRAFT_TYPING_LEAD_SECONDS", DEFAULT_DRAFT_TYPING_LEAD_SECONDS)
         self.DRAFT_MAPPING_TTL_SECONDS                          = get_env_int("DRAFT_MAPPING_TTL_SECONDS", DEFAULT_DRAFT_MAPPING_TTL_SECONDS)
         self.MEDIA_GROUP_DEDUPE_SECONDS                         = get_env_int("MEDIA_GROUP_DEDUPE_SECONDS", DEFAULT_MEDIA_GROUP_DEDUPE_SECONDS)
+
+        # Poll Handling (poll -> poll_answer correlation - see utils_telegram/utilities/poll_response_handler.py)
+        # A poll is always sent non-anonymous (TELEGRAM_POLL_ANONYMOUS), so an answer
+        # can be attributed to its responder. Two phases per poll, governed by one
+        # in-memory timer:
+        #   - AWAITING FIRST ANSWER (POLL_TIMEOUT_SECONDS): closes with a chat
+        #     message if nobody answers in time. No queue push.
+        #   - DEBOUNCING (POLL_DEBOUNCE_INITIAL_SECONDS, shortened to
+        #     POLL_DEBOUNCE_SUBSEQUENT_SECONDS on every further answer): once
+        #     answered, compiles and pushes the latest answer once things go quiet -
+        #     capped overall by POLL_GLOBAL_CAP_SECONDS from poll creation, regardless
+        #     of how many times debouncing resets.
+        DEFAULT_TELEGRAM_POLL_ANONYMOUS                         = False
+        DEFAULT_POLL_TIMEOUT_SECONDS                            = 300  # 5 min hard cap while awaiting a first answer
+        DEFAULT_POLL_DEBOUNCE_INITIAL_SECONDS                   = 120  # 2 min debounce after the first answer
+        DEFAULT_POLL_DEBOUNCE_SUBSEQUENT_SECONDS                = 60   # 1 min debounce after every answer thereafter
+        DEFAULT_POLL_GLOBAL_CAP_SECONDS                         = 480  # 8 min hard ceiling from poll creation (Telegram's own open_period/close_date maxes at 600s)
+        DEFAULT_POLL_MAPPING_TTL_SECONDS                        = 600  # Redis-side backstop, slightly beyond the hard cap
+        self.TELEGRAM_POLL_ANONYMOUS                            = get_env_bool("TELEGRAM_POLL_ANONYMOUS", DEFAULT_TELEGRAM_POLL_ANONYMOUS)
+        self.POLL_TIMEOUT_SECONDS                               = get_env_int("POLL_TIMEOUT_SECONDS", DEFAULT_POLL_TIMEOUT_SECONDS)
+        self.POLL_DEBOUNCE_INITIAL_SECONDS                      = get_env_int("POLL_DEBOUNCE_INITIAL_SECONDS", DEFAULT_POLL_DEBOUNCE_INITIAL_SECONDS)
+        self.POLL_DEBOUNCE_SUBSEQUENT_SECONDS                   = get_env_int("POLL_DEBOUNCE_SUBSEQUENT_SECONDS", DEFAULT_POLL_DEBOUNCE_SUBSEQUENT_SECONDS)
+        self.POLL_GLOBAL_CAP_SECONDS                            = get_env_int("POLL_GLOBAL_CAP_SECONDS", DEFAULT_POLL_GLOBAL_CAP_SECONDS)
+        self.POLL_MAPPING_TTL_SECONDS                           = get_env_int("POLL_MAPPING_TTL_SECONDS", DEFAULT_POLL_MAPPING_TTL_SECONDS)
 
         # Whitelist of chat IDs allowed to interact with the bot. Not using
         self.TELEGRAM_ALLOWED_CHAT_IDS = {
@@ -176,6 +200,24 @@ def get_env_int(name: str, default: int, minimum: int = 1) -> int:
             return max(minimum, value)
         except ValueError:
             return default
+
+def get_env_bool(name: str, default: bool) -> bool:
+        """
+        Reads a boolean environment variable, falling back to default if unset.
+
+        Args:
+            name (str):
+                Environment variable name.
+
+            default (bool):
+                Fallback if unset.
+
+        Returns:
+            bool:
+                True only if the env var is set and equals "true" (case-insensitive); otherwise default.
+        """
+        value = os.getenv(name)
+        return default if value is None else value.strip().lower() == "true"
 
 # import settings for singleton
 settings = Settings()

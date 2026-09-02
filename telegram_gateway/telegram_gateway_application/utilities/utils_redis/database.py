@@ -5,7 +5,7 @@
 # Created On  : 2026-08-29
 #
 # Features    :
-#   - Manages a shared Redis connection used for session/task state storage.
+#   - Manages a shared Redis connection used for session/task/draft/poll state storage.
 #
 # Notes       :
 #   - Always use the helper functions in this file to read/write Redis state.
@@ -387,5 +387,159 @@ def create_chat_draft(chat_id: int, media_type: str, media_url: str, text: str, 
         logger.warning(f"Did not create {media_type} draft for chat_id={chat_id} - a draft may already be pending, or the write failed.")
 
     return created
+
+def create_poll_mapping(poll_id: str, chat_id: int, task_id: str, message_id: int) -> bool:
+    """
+    Stores the chat_id/task_id/message_id mapping for an open poll, ready to be resolved from a poll_answer update.
+
+    Args:
+        poll_id (str)
+
+        chat_id (int)
+
+        task_id (str)
+
+        message_id (int):
+            The poll message's message_id - required to close it later via stopPoll (which
+            takes chat_id + message_id, not poll_id).
+
+    Returns:
+        bool:
+            True if stored successfully; otherwise False.
+
+    Notes:
+        - Stored as poll:<poll_id> -> json {chat_id, task_id, message_id, user_id, option_ids}.
+        - user_id/option_ids start empty - unknown until a poll_answer update arrives - see update_poll_answer().
+        - Writes with nx=True. TTL is a Redis-side backstop beyond the poll's hard cap
+          (see utils_telegram/utilities/poll_response_handler.py) in case the in-memory timer is lost.
+    """
+    value = json.dumps({
+        "chat_id": chat_id,
+        "task_id": task_id,
+        "message_id": message_id,
+        "user_id": None,
+        "option_ids": []
+    })
+    created = redis_write(f"poll:{poll_id}", value, ttl_seconds=settings.POLL_MAPPING_TTL_SECONDS, nx=True)
+    if created:
+        logger.info(f"Created poll mapping poll_id={poll_id} for chat_id={chat_id} (task_id={task_id}).")
+    else:
+        logger.warning(f"Did not create poll mapping poll_id={poll_id} - it may already exist, or the write failed.")
+
+    return created
+
+def get_poll_mapping(poll_id: str) -> dict | None:
+    """
+    Retrieves the mapping stored for an open poll.
+
+    Args:
+        poll_id (str)
+
+    Returns:
+        dict | None:
+            {"chat_id", "task_id", "message_id", "user_id", "option_ids"} if found and valid; otherwise None.
+
+    Notes:
+        - Same read/retry/corruption handling as get_task_mapping().
+    """
+    value = None
+
+    for attempt in range(1, settings.REDIS_TASK_MAX_ATTEMPTS + 1):
+        try:
+            client = get_redis_client()
+            value = client.get(f"poll:{poll_id}")
+            break
+        except Exception:
+            if attempt < settings.REDIS_TASK_MAX_ATTEMPTS:
+                logger.warning(f"Failed to read poll mapping for poll_id={poll_id} (attempt {attempt}/{settings.REDIS_TASK_MAX_ATTEMPTS}). Retrying...")
+                time.sleep(settings.REDIS_TASK_RETRY_DELAY)
+            else:
+                logger.exception(f"Failed to read poll mapping for poll_id={poll_id} from Redis after {settings.REDIS_TASK_MAX_ATTEMPTS} attempts.")
+                return None
+
+    if value is None:
+        return None
+
+    try:
+        return json.loads(value)
+    except (json.JSONDecodeError, TypeError):
+        logger.error(f"Stored poll mapping for poll_id={poll_id} is not valid JSON: {value}")
+        return None
+
+def update_poll_answer(poll_id: str, user_id: int, option_ids: list) -> bool:
+    """
+    Updates the latest answer recorded against an open poll's mapping.
+
+    Args:
+        poll_id (str)
+
+        user_id (int):
+            The responder's id, per Telegram's poll_answer update.
+
+        option_ids (list):
+            The responder's currently selected option indices, per Telegram's poll_answer update.
+
+    Returns:
+        bool:
+            True if updated successfully; otherwise False (including an unknown poll_id).
+
+    Notes:
+        - Overwrites user_id/option_ids with the latest state - see poll_response_handler.py
+          for how repeated answers (debounced) are handled.
+        - Refreshes the TTL back to settings.POLL_MAPPING_TTL_SECONDS on every call, since
+          this record is the restart-recovery backstop for whatever the poll's actual latest
+          answer is - see close_orphaned_polls().
+    """
+    mapping = get_poll_mapping(poll_id)
+    if mapping is None:
+        logger.warning(f"Could not update poll answer for poll_id={poll_id} - no mapping found.")
+        return False
+
+    mapping["user_id"] = user_id
+    mapping["option_ids"] = option_ids
+    return redis_write(f"poll:{poll_id}", json.dumps(mapping), ttl_seconds=settings.POLL_MAPPING_TTL_SECONDS)
+
+def delete_poll_mapping(poll_id: str) -> bool:
+    """
+    Deletes the mapping stored for an open poll.
+
+    Args:
+        poll_id (str)
+
+    Returns:
+        bool:
+            True if the mapping was deleted; otherwise False.
+    """
+    return redis_delete(f"poll:{poll_id}")
+
+def get_all_poll_ids() -> list[str]:
+    """
+    Retrieves the poll_id of every currently open poll mapping in Redis.
+
+    Args:
+        None
+
+    Returns:
+        list[str]:
+            poll_ids with a poll:<poll_id> key present; empty list on failure.
+
+    Notes:
+        - Used on startup to sweep up polls whose in-memory timer did not survive an
+          application restart (see utils_telegram/utilities/poll_response_handler.py).
+        - Uses SCAN (not KEYS) so it doesn't block Redis on a large keyspace.
+    """
+    try:
+        client = get_redis_client()
+        poll_ids = []
+        for key in client.scan_iter(match="poll:*"):
+            try:
+                poll_ids.append(key.split(":", 1)[1])
+            except IndexError:
+                logger.error(f"Skipped malformed poll key while sweeping Redis: {key}")
+
+        return poll_ids
+    except Exception:
+        logger.exception("Failed to sweep Redis for open polls.")
+        return []
 
 # =============================================================================

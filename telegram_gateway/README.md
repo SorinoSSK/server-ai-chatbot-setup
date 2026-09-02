@@ -17,10 +17,121 @@ telegram_gateway/telegram_gateway_application
 ```
 - Python 3.12 (`python:3.12.4-slim` base image)
 - Runs as a Docker container on the project's isolated bridge network (`chatbot-app-network`)
-- Depends on RabbitMQ for internal messaging (not yet implemented)
-- Depends on the Telegram Bot API via a bot token (not yet implemented)
+- Depends on RabbitMQ for internal messaging (see `utils_queue/queue.py`)
+- Depends on Redis for task/draft/poll state (see `utils_redis/database.py`)
+- Depends on the Telegram Bot API via a bot token (see `utils_telegram/`)
 
-Under development.
+### Startup
+`main.py` is the entry point:
+1. Ensures `DATA_DIR` exists and configures logging (`setup_logging()`).
+2. Registers `SIGINT`/`SIGTERM` handlers against a shared `ShutdownSignal`.
+3. Calls `initialise_application()` (`utilities/initialise.py`), which:
+   - Opens the RabbitMQ publish and consume connections, then starts the
+     RabbitMQ consumer on its own background thread.
+   - Opens the Redis connection.
+   - Sweeps Redis for any draft (`close_orphaned_drafts()`) or poll
+     (`close_orphaned_polls()`) left behind by a previous run - each is
+     closed out immediately, since their in-memory timers don't survive a restart.
+   - Starts the Telegram long-polling loop (`poll_updates()`) on its own background thread.
+4. The main thread then blocks on `_shutdown_event.wait()` - from this point
+   on, the application runs entirely on background threads.
+
+### Runtime - two long-running loops
+
+**RabbitMQ consumer loop** (`utils_queue/queue.py::queue_consume_task()`) -
+one iteration per message:
+- Consumes from `Q_CHANNEL_IN` via `basic_consume`.
+- Decodes the message body and passes it to `process_message()`
+  (`utils_queue/message_handler.py`), which dispatches by `type`
+  (poll/image/video/album/file/text/completed/error) to the matching Telegram send call.
+- Acks on success. On failure, nacks with requeue up to
+  `Q_CONSUME_MAX_ATTEMPTS`, then drops. Reconnects automatically on a
+  connection-level failure.
+
+**Telegram long-polling loop** (`utils_telegram/gateway_inbound.py::poll_updates()`) -
+one iteration per `getUpdates` call:
+- Calls `getUpdates` with the current `offset` and `TELEGRAM_ALLOWED_UPDATES`,
+  holding the connection open for up to `TELEGRAM_POLL_TIMEOUT` seconds.
+- For each update returned:
+  - A `poll_answer` update is routed straight to `handle_poll_answer()` - it
+    carries no `chat_id`, so it's resolved via its own `poll:<poll_id>`
+    Redis mapping instead of the usual authorisation check.
+  - Any other update has its `chat_id`/`user_id` extracted; a `chat_id`
+    outside `TELEGRAM_ALLOWED_CHAT_IDS` gets tracked and, on first offence, one warning reply.
+  - An authorised update is routed to `_handle_update()` - callback_query
+    validation, media/draft staging, or a finalised task pushed to `Q_CHANNEL_OUT`.
+- `offset` only advances once an update is fully handled - a failing update
+  is retried up to `TELEGRAM_UPDATE_MAX_ATTEMPTS` times, blocking the rest
+  of that batch meanwhile.
+
+Beyond these two loops, several short-lived per-task/per-chat background
+threads are spawned dynamically as needed (not part of startup) - the typing
+indicator (`typing_indicator.py`), the draft keep-alive cycle
+(`image_draft_handler.py`), and the poll answer-collection timer
+(`poll_response_handler.py`) - each exits on its own once its job is done.
+
+### Shutdown
+On `SIGINT`/`SIGTERM`, the signal handler sets the shared `ShutdownSignal`,
+waking the blocked main thread, which calls `terminate_application()`:
+1. `stop_polling()` - signals the Telegram long-polling loop to exit (may
+   take up to `TELEGRAM_POLL_TIMEOUT + TELEGRAM_CLIENT_TIMEOUT` if a request is already in flight).
+2. `stop_queue_consumer()` - signals the RabbitMQ consumer to stop.
+3. `close_rabbitmq_connection()` - closes both RabbitMQ channels/connections.
+4. `close_redis_connection()` - closes the Redis client.
+
+Dynamically spawned per-task threads are daemon threads and are not
+explicitly joined - they die with the process rather than being waited on.
+
+### Diagram
+
+```mermaid
+flowchart TD
+    Start(["Process start (main.py)"]) --> Setup["Ensure DATA_DIR + setup_logging()"]
+    Setup --> Signals["Register SIGINT/SIGTERM -> ShutdownSignal"]
+    Signals --> Init["initialise_application()"]
+
+    subgraph INIT["Startup (initialise.py)"]
+        Init --> RMQ["initialise_rabbitmq_connection()"]
+        RMQ --> Consumer["start_queue_consumer() - spawn thread"]
+        Consumer --> RedisInit["initialise_redis_connection()"]
+        RedisInit --> Drafts["close_orphaned_drafts()"]
+        Drafts --> Polls["close_orphaned_polls()"]
+        Polls --> LongPoll["spawn poll_updates() thread"]
+    end
+
+    LongPoll --> Block(["Main thread blocks on shutdown_event.wait()"])
+
+    Consumer -.-> QLoop
+    LongPoll -.-> TLoop
+
+    subgraph QLoop["RabbitMQ consumer loop (per message)"]
+        Q1["basic_consume Q_CHANNEL_IN"] --> Q2["process_message() dispatches by type"]
+        Q2 --> Q3{"Handled OK?"}
+        Q3 -- yes --> Q4["ack"]
+        Q3 -- no --> Q5["nack + requeue, up to Q_CONSUME_MAX_ATTEMPTS"]
+        Q4 --> Q1
+        Q5 --> Q1
+    end
+
+    subgraph TLoop["Telegram long-poll loop (per getUpdates call)"]
+        T1["getUpdates(offset, timeout=TELEGRAM_POLL_TIMEOUT)"] --> T2{"poll_answer update?"}
+        T2 -- yes --> T3["resolve via poll:&lt;poll_id&gt; mapping"]
+        T2 -- no --> T4{"chat_id authorised?"}
+        T4 -- no --> T5["track/deny + one warning reply"]
+        T4 -- yes --> T6["_handle_update(): text/media/draft/callback_query"]
+        T3 --> T7["advance offset"]
+        T5 --> T7
+        T6 --> T7
+        T7 --> T1
+    end
+
+    Block -- "SIGINT/SIGTERM" --> Term["terminate_application()"]
+    Term --> S1["stop_polling()"]
+    S1 --> S2["stop_queue_consumer()"]
+    S2 --> S3["close_rabbitmq_connection()"]
+    S3 --> S4["close_redis_connection()"]
+    S4 --> Exit(["Process exit"])
+```
 
 ## Getting Started (Development)
 The Telegram Gateway container is intended to be managed by the project's
@@ -60,10 +171,19 @@ Under development.
 ### Task Queue Payload (gateway -> backend)
 
 Every task the gateway pushes to RabbitMQ (`Q_CHANNEL_OUT`) shares one shape,
-regardless of whether it originated from plain text or from a finalised draft:
+regardless of whether it originated from plain text, a finalised draft, or a
+poll answer:
 
 ```json
-{"task_id": "...", "text": "...", "image_url": "...", "video_url": "...", "file_url": "..."}
+{
+  "task_id": "...",
+  "text": "...",
+  "image_url": "...",
+  "video_url": "...",
+  "file_url": "...",
+  "user_id": "...",
+  "poll_answer": [0, 2]
+}
 ```
 
 - `text`: always present, `""` if the update carried no text.
@@ -71,6 +191,15 @@ regardless of whether it originated from plain text or from a finalised draft:
   other two are always `""`. Resolved from Telegram's `getFile` endpoint, so
   the URL embeds the bot token and is only guaranteed valid by Telegram for
   at least 1 hour - the backend should download promptly rather than persist the URL.
+- `user_id`: `null` on a plain text/media task. Populated only on a poll
+  answer push - see AI_AGENT_ARCHITECTURE.md for the container it's intended
+  for (the Debate Orchestrator). Not intended to reach the LLM agents - the
+  gateway itself stays identity-blind about this the same as everywhere else
+  (see Response Queue Message Payloads below); it's on whichever downstream
+  container consumes this queue to keep it from propagating further.
+- `poll_answer`: `null`/absent on a plain text/media task. Populated only on a
+  poll answer push, with the responder's selected option indices (Telegram's
+  `option_ids`, indices into the original poll's `options`).
 
 #### Pending drafts (media without an instruction yet)
 
@@ -132,6 +261,45 @@ Redis for any leftover drafts on startup, before polling resumes, and closes
 each one out immediately (draft deleted, close message sent) rather than
 attempting to resume it part-way through a cycle.
 
+#### Poll answers
+
+A poll (`type: "poll"`, see below) is always sent non-anonymous
+(`TELEGRAM_POLL_ANONYMOUS`, not caller-configurable) so an answer can be
+attributed to its responder. See `utils_telegram/utilities/poll_response_handler.py`.
+
+Unrelated chat messages **do not** interact with an open poll at all - the
+bot is expected to answer them independently while the poll keeps running in
+the background. There is no "one poll per chat" restriction enforced by the
+gateway.
+
+Each poll goes through two phases, governed by one timer:
+
+- **Awaiting first answer** (`POLL_TIMEOUT_SECONDS`, 5 min by default): if
+  nobody answers in time, the poll is closed with a chat message and
+  **nothing is pushed** to the queue.
+- **Debouncing**, once answered (`POLL_DEBOUNCE_INITIAL_SECONDS`, 2 min by
+  default, shortened to `POLL_DEBOUNCE_SUBSEQUENT_SECONDS`, 1 min, on every
+  further answer): waits for the responder to stop changing their answer
+  before compiling and pushing the latest one - capped overall by
+  `POLL_GLOBAL_CAP_SECONDS` (8 min by default, comfortably under Telegram's
+  own 10 min native poll auto-close ceiling) from poll creation, regardless
+  of how many times debouncing resets. No chat message is sent on this path -
+  an answer was already collected, so there's nothing to apologise for.
+
+Whether a closure pushes an answer to the queue depends solely on whether the
+poll was ever answered, not on why it's closing - a natural debounce expiry,
+the global cap being reached mid-debounce, and a startup orphan-sweep closure
+(see below) all resolve identically.
+
+The timer above is **in-memory only** - it does not survive an application
+restart, though the Redis-backed poll record does (its own TTL,
+`POLL_MAPPING_TTL_SECONDS`, slightly beyond `POLL_GLOBAL_CAP_SECONDS`,
+refreshed on every answer so it always reflects the latest one). To avoid a
+poll sitting open indefinitely with an uncollected answer, `close_orphaned_polls()`
+sweeps Redis for any leftover poll on startup, before polling resumes, and
+closes each one out immediately - pushing whatever answer it already has,
+same as any other closure path.
+
 ### Response Queue Message Payloads
 
 Messages consumed by the gateway from the response queue (agent -> gateway)
@@ -155,13 +323,15 @@ Maps to Telegram's `sendPoll`.
   "type": "poll",
   "question": "...",
   "options": ["...", "..."],
-  "is_anonymous": true,
   "allows_multiple_answers": false
 }
 ```
 - `question`: 1-300 characters. If missing, the whole poll is dropped and logged.
 - `options`: 1-12 items, each 1-100 characters. Null/empty entries are
   filtered out; the poll is sent with whatever remains.
+- `is_anonymous` is not accepted here - always `TELEGRAM_POLL_ANONYMOUS`
+  (`false` by default), not caller-configurable. See "Poll answers" above for
+  how an answer is collected and pushed back.
 
 #### `image`
 Maps to Telegram's `sendPhoto`.
@@ -271,16 +441,3 @@ exhausted).
     message (Telegram `parse_mode` `HTML`, `message` is HTML-escaped
     before being embedded).
 - Same cleanup as `completed`, plus a user-facing notification.
-
-## TODO
-- **Collect poll answers.** The gateway can currently only send polls
-  (`send_poll()`/`type: "poll"`) - it has no wiring to receive results.
-  To support this:
-  - Add `poll_answer` (and/or `poll`) to `TELEGRAM_ALLOWED_UPDATES`.
-  - Add a handler in `gateway_inbound.py` for the `poll_answer` update type.
-  - Decide how a `poll_answer` correlates back to a `chat_id`/task, similar
-    to how `utils_telegram/utilities/button_prompt_handler.py` correlates
-    callback_query presses via a registered token.
-  - Note: anonymous polls (`is_anonymous: true`, the current default in
-    `send_poll()`) never expose the real voter's identity to the bot -
-    `is_anonymous` must be `false` for a poll to support per-user answers.

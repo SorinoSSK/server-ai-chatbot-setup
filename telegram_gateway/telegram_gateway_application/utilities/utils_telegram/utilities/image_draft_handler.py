@@ -64,22 +64,44 @@ _CONTINUE_BUTTON_TEXT = "Give me a little while more"
 
 # Sent partway through a regular cycle, with the continue button attached.
 _CYCLE_NOTICE_MESSAGES = [
-    "{bot_name} has been waiting for a while - are you still there? Hello?",
-    "{bot_name} is still here, quietly waiting for you.",
-    "Psst - {bot_name} hasn't forgotten about you. Still around?",
+    "{bot_name} is still here... just quietly waiting with her headphones on.",
+    "Hey... {bot_name} hasn't heard from you in a while. You still there?",
+    "{bot_name} is starting to wonder if you got distracted by something shiny.",
+    "Psst... {bot_name} is still waiting. The playlist hasn't ended yet.",
+    "{bot_name} is still here, just staring at the sky and waiting for your reply.",
+    "Hey, you disappeared. {bot_name} is beginning to think the Wi-Fi ate you.",
+    "{bot_name} hasn't gone anywhere. Take your time... I'll wait.",
+    "Still there? {bot_name} was just about to put on another song.",
+    "{bot_name} is waiting patiently... though she might start debugging something while she waits.",
+    "Um... hello? {bot_name} is still here. Don't leave me hanging like this.",
 ]
 
 # Sent partway through the final cycle - no button, since there's no more time to give.
 _FINAL_NOTICE_MESSAGES = [
-    "{bot_name} really can't wait much longer now - please send your instructions soon.",
-    "One last moment from {bot_name} - after this, this one gets set aside.",
+    "{bot_name} should probably get back to her work soon. Are you still coming?",
+    "Hey, I need to get back to something I was working on soon. Anything you want me to do first?",
+    "{bot_name} has a little project waiting for her. If you need anything, now's probably a good time.",
+    "I've got something I need to take care of soon... so tell me if there's anything you still need.",
+    "{bot_name} should get back to her laptop before the evening gets away from her. Anything else?",
+    "My playlist is almost done and I still have some work to finish. Anything you need before I go?",
+    "{bot_name} has been waiting, but there's something else calling for her attention now.",
+    "I probably shouldn't keep putting this off... I've got something I need to finish. Anything for me?",
+    "Okay, I need to get back to my little project soon. Say something if you still need me.",
+    "{bot_name} has something waiting for her, so she won't be able to stay much longer. Need anything before I go?",
 ]
 
 # Sent when the continue button is pressed.
 _ACCEPT_MESSAGES = [
-    "Ok, {bot_name} will wait for your interesting story.",
-    "Alright, {bot_name} isn't going anywhere just yet.",
-    "Sure thing - {bot_name} will hang on a little longer.",
+    "Okay, I'll wait here. Just don't disappear for too long, okay?",
+    "No rush. {bot_name} will be right here when you're ready.",
+    "Got it. {bot_name} will stay right here and wait for you.",
+    "Alright... I'll wait. I have my music to keep me company anyway.",
+    "Take your time. {bot_name} isn't in a hurry.",
+    "Okay. I'll leave the playlist running while I wait.",
+    "Sure. {bot_name} will be here when you get back.",
+    "Alright, I'll wait patiently. No need to rush.",
+    "Mm, okay. Take your time — I'll be here.",
+    "Got it. {bot_name} will wait quietly until you’re ready.",
 ]
 
 # =============================================================================

@@ -8,6 +8,7 @@
 #   - Dispatches incoming queue messages by type - poll/image/video/album/file/text/completed/error.
 #     See README.md for the payload shape per type.
 #   - text messages may carry inline keyboard buttons - see utils_telegram/utilities/button_prompt_handler.py.
+#   - poll messages start their answer-collection timer on send - see utils_telegram/utilities/poll_response_handler.py.
 #
 # Notes       :
 #   - Owns its own JSON parsing so a malformed payload is logged and dropped rather
@@ -22,10 +23,11 @@ import json
 import logging
 
 from ...config import settings
-from ..utils_redis.database import get_task_mapping, delete_task_mapping
+from ..utils_redis.database import get_task_mapping, delete_task_mapping, create_poll_mapping
 from ..utils_telegram.gateway_outbound import send_message, send_poll, send_photo, send_video, send_media_group, send_document
 from ..utils_telegram.utilities.button_prompt_handler import register_bot_button, send_message_with_buttons
 from ..utils_telegram.utilities.typing_indicator import stop_typing
+from ..utils_telegram.utilities.poll_response_handler import start_poll_timer
 
 # =============================================================================
 # G L O B A L   V A R I A B L E
@@ -34,18 +36,18 @@ logger = logging.getLogger(__name__)
 
 # =============================================================================
 
-def _handle_poll(chat_id: int, question: str, options: list, is_anonymous: bool, allows_multiple_answers: bool) -> None:
+def _handle_poll(task_id: str, chat_id: int, question: str, options: list, allows_multiple_answers: bool) -> None:
     """
-    Handle a poll response payload - sends it via Telegram's sendPoll endpoint.
+    Handle a poll response payload - sends it via Telegram's sendPoll endpoint and starts its answer-collection timer.
 
     Args:
+        task_id (str)
+
         chat_id (int)
 
         question (str)
 
         options (list)
-
-        is_anonymous (bool)
 
         allows_multiple_answers (bool)
 
@@ -54,12 +56,25 @@ def _handle_poll(chat_id: int, question: str, options: list, is_anonymous: bool,
 
     Notes:
         - Skipped (and logged) if question is missing. Null/invalid options are filtered out.
+        - is_anonymous is not caller-configurable - see send_poll().
+        - On a successful send, registers a poll:<poll_id> Redis mapping and starts its
+          AWAITING FIRST ANSWER / DEBOUNCING timer (see utils_telegram/utilities/poll_response_handler.py) -
+          without this, an incoming poll_answer update has nothing to correlate back to.
     """
     if not question:
         logger.error(f"Poll payload for chat_id={chat_id} is missing a question. Message dropped.")
+        return
+
+    valid_options = [option for option in (options or []) if option]
+    result = send_poll(chat_id, question, valid_options, allows_multiple_answers)
+    if result is None:
+        return
+
+    poll_id = result["poll_id"]
+    if create_poll_mapping(poll_id, chat_id, task_id, result["message_id"]):
+        start_poll_timer(poll_id, chat_id)
     else:
-        valid_options = [option for option in (options or []) if option]
-        send_poll(chat_id, question, valid_options, is_anonymous, allows_multiple_answers)
+        logger.error(f"Failed to create poll mapping for poll_id={poll_id} (task_id={task_id}). Answers to this poll will not be collected.")
 
 def _send_media_with_caption(send_func, chat_id: int, url: str, message: str) -> None:
     """
@@ -392,10 +407,10 @@ def process_message(payload: str) -> None:
             message_type = data.get("type")
             if message_type == "poll":
                 _handle_poll(
+                    task_id,
                     chat_id,
                     data.get("question"),
                     data.get("options"),
-                    data.get("is_anonymous"),
                     data.get("allows_multiple_answers")
                 )
             elif message_type == "image":

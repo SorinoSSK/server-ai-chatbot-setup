@@ -5,13 +5,16 @@
 # Created On  : 2026-08-29
 #
 # Features    :
-#   - Long-polls the Telegram Bot API for new updates (messages, button presses, etc.)
+#   - Long-polls the Telegram Bot API for new updates (messages, button presses, poll answers, etc.)
 #   - Resolves incoming photo/video/document to a fetchable URL and stages it as a
 #     pending draft until an instruction (text) arrives, or the draft times out.
 #
 # Notes       :
 #   - Uses Telegram's getUpdates long polling method, not webhooks.
 #   - Updates missing a chat_id/user_id, or from a chat not in TELEGRAM_ALLOWED_CHAT_IDS, are skipped (unauthorised chats get one reply - see utils_gatekeeper/gatekeeper.py).
+#   - poll_answer updates carry no chat_id of their own and are routed separately -
+#     see _handle_poll_answer() - correlating instead via the poll's own Redis mapping
+#     (see utils_telegram/utilities/poll_response_handler.py).
 #   - Media without an instruction is staged as a Redis-backed draft (see utils_redis/database.py) until a text update finalises it, or it times out - see utilities/image_draft_handler.py.
 #   - Only one pending draft per chat_id at a time.
 #   - Album items (media_group_id) are never staged as a draft - the user is asked to resend one at a time; the reply is deduped per media_group_id.
@@ -35,6 +38,7 @@ from .gateway_outbound import send_message
 from .utilities.typing_indicator import start_typing
 from .utilities.image_draft_handler import start_draft_timer, stop_draft_timer, continue_draft_timer
 from .utilities.button_prompt_handler import validate_bot_callback
+from .utilities.poll_response_handler import handle_poll_answer
 
 # =============================================================================
 # G L O B A L   V A R I A B L E
@@ -283,6 +287,35 @@ def _push_task(chat_id: int, user_id: int, text: str, image_url: str = "", video
         start_typing(task_id, chat_id)
         logger.info(f"Pushed task_id={task_id} for chat_id={chat_id} to the outbound queue.")
 
+def _handle_poll_answer(poll_answer: dict) -> None:
+    """
+    Routes a poll_answer update to poll_response_handler.py's debounce loop.
+
+    Args:
+        poll_answer (dict):
+            Telegram's PollAnswer object - {"poll_id", "user", "option_ids", ...}.
+
+    Returns:
+        None
+
+    Notes:
+        - Carries no chat_id of its own - correlates back to one via the poll_id
+          mapping created when the poll was sent (see message_handler.py::_handle_poll()).
+          No separate TELEGRAM_ALLOWED_CHAT_IDS check is needed here, since that
+          mapping only ever exists for a poll the gateway itself sent to an
+          already-authorised chat.
+        - A poll_id with no active timer (unknown, already closed, or expired) is
+          logged and ignored, rather than treated as an error.
+    """
+    poll_id = poll_answer.get("poll_id")
+    user_id = (poll_answer.get("user") or {}).get("id")
+    option_ids = poll_answer.get("option_ids") or []
+
+    if not poll_id or user_id is None:
+        logger.warning(f"Ignored invalid poll_answer update: {poll_answer}")
+    elif not handle_poll_answer(poll_id, user_id, option_ids):
+        logger.warning(f"Received poll_answer for unknown/already-closed poll_id={poll_id}.")
+
 def _handle_update(chat_id: int, user_id: int, update: dict) -> None:
     """
     Routes an accepted (authorised) update through the media/draft/finalisation flow.
@@ -419,26 +452,30 @@ def poll_updates() -> None:
                 update_id = update["update_id"]
 
                 try:
-                    chat_id = _extract_chat_id(update)
-                    user_id = _extract_user_id(update)
-
-                    if chat_id is None or user_id is None:
-                        logger.warning(f"Ignored invalid update - missing chat_id or user_id: {update}")
-                    elif chat_id not in settings.TELEGRAM_ALLOWED_CHAT_IDS:
-                        if track_unauthorised_access(chat_id):
-                            logger.warning(f"First unauthorised access from chat_id={chat_id}: {update}")
-                            send_message(
-                                chat_id,
-                                f"Hello, I'm {settings.TELEGRAM_BOT_NAME}! I'd love to get to know you, but I only "
-                                f"talk to family for now. Could you ask my brother to let you in?\n"
-                                f"Just share this chatroom ID with him: <code>{chat_id}</code>",
-                                parse_mode="HTML"
-                            )
-                        else:
-                            logger.debug(f"Ignored update from unauthorised chat_id={chat_id}: {update}")
+                    if "poll_answer" in update:
+                        # Carries no chat_id of its own - see _handle_poll_answer() Notes.
+                        _handle_poll_answer(update["poll_answer"])
                     else:
-                        logger.info(f"Received Telegram update: {update}")
-                        _handle_update(chat_id, user_id, update)
+                        chat_id = _extract_chat_id(update)
+                        user_id = _extract_user_id(update)
+
+                        if chat_id is None or user_id is None:
+                            logger.warning(f"Ignored invalid update - missing chat_id or user_id: {update}")
+                        elif chat_id not in settings.TELEGRAM_ALLOWED_CHAT_IDS:
+                            if track_unauthorised_access(chat_id):
+                                logger.warning(f"First unauthorised access from chat_id={chat_id}: {update}")
+                                send_message(
+                                    chat_id,
+                                    f"Hello, I'm {settings.TELEGRAM_BOT_NAME}! I'd love to get to know you, but I only "
+                                    f"talk to family for now. Could you ask my brother to let you in?\n"
+                                    f"Just share this chatroom ID with him: <code>{chat_id}</code>",
+                                    parse_mode="HTML"
+                                )
+                            else:
+                                logger.debug(f"Ignored update from unauthorised chat_id={chat_id}: {update}")
+                        else:
+                            logger.info(f"Received Telegram update: {update}")
+                            _handle_update(chat_id, user_id, update)
 
                     # Only confirmed to Telegram once fully handled - see offset Notes above.
                     offset = update_id + 1

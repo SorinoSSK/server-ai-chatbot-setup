@@ -5,10 +5,10 @@
 # Created On  : 2026-08-29
 #
 # Features    :
-#   - Sends text, typing action, polls, and photo/video/document/album to a Telegram chat.
+#   - Sends text, typing action, polls (and closes them), and photo/video/document/album to a Telegram chat.
 #
 # Notes       :
-#   - send_message/send_poll/send_document/send_photo/send_video/send_media_group all retry up to TELEGRAM_SEND_MAX_ATTEMPTS times (TELEGRAM_SEND_RETRY_DELAY apart) on connection failures/timeouts only; other failures are not retried.
+#   - send_message/send_poll/stop_poll/send_document/send_photo/send_video/send_media_group all retry up to TELEGRAM_SEND_MAX_ATTEMPTS times (TELEGRAM_SEND_RETRY_DELAY apart) on connection failures/timeouts only; other failures are not retried.
 #
 # =============================================================================
 # I M P O R T   H E A D E R
@@ -113,7 +113,7 @@ def send_typing_action(chat_id: int | str) -> bool:
         logger.exception("Failed to send typing action to Telegram.")
         return False
 
-def send_poll(chat_id: int | str, question: str, options: list, is_anonymous: bool = True, allows_multiple_answers: bool = False) -> bool:
+def send_poll(chat_id: int | str, question: str, options: list, allows_multiple_answers: bool = False) -> dict | None:
     """
     Send a poll to a Telegram chat via the Bot API.
 
@@ -125,15 +125,20 @@ def send_poll(chat_id: int | str, question: str, options: list, is_anonymous: bo
         options (list):
             Plain strings - converted to Telegram's InputPollOption shape internally.
 
-        is_anonymous (bool, optional):
-            Defaults to True.
-
         allows_multiple_answers (bool, optional):
             Defaults to False.
 
     Returns:
-        bool:
-            True if sent successfully; otherwise False.
+        dict | None:
+            {"poll_id": str, "message_id": int} if sent successfully; otherwise None.
+
+    Notes:
+        - is_anonymous is not caller-configurable - always settings.TELEGRAM_POLL_ANONYMOUS,
+          since correlating an answer back to a responder (see utils_telegram/utilities/poll_response_handler.py)
+          requires a non-anonymous poll.
+        - No open_period/close_date is set - Telegram caps these at 600s and they can't be
+          adjusted once sent, which doesn't fit the debounced/extendable closing handled
+          by poll_response_handler.py. The poll is closed explicitly via stop_poll() instead.
     """
     api_url = f"{settings.TELEGRAM_API_BASE_URL}/bot{settings.TELEGRAM_BOT_TOKEN}/sendPoll"
 
@@ -141,7 +146,7 @@ def send_poll(chat_id: int | str, question: str, options: list, is_anonymous: bo
         "chat_id": chat_id,
         "question": question,
         "options": [{"text": option} for option in options],
-        "is_anonymous": is_anonymous,
+        "is_anonymous": settings.TELEGRAM_POLL_ANONYMOUS,
         "allows_multiple_answers": allows_multiple_answers
     }
 
@@ -153,17 +158,71 @@ def send_poll(chat_id: int | str, question: str, options: list, is_anonymous: bo
                 timeout=settings.TELEGRAM_CLIENT_TIMEOUT
             )
             response.raise_for_status()
-            logger.info(f"Sent poll to chat_id={chat_id}.")
-            return True
+            result = response.json().get("result", {})
+            poll_id = result.get("poll", {}).get("id")
+            message_id = result.get("message_id")
+            if not poll_id or message_id is None:
+                logger.error(f"sendPoll response for chat_id={chat_id} is missing poll.id or message_id.")
+                return None
+
+            logger.info(f"Sent poll to chat_id={chat_id} (poll_id={poll_id}).")
+            return {"poll_id": poll_id, "message_id": message_id}
         except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
             if attempt < settings.TELEGRAM_SEND_MAX_ATTEMPTS:
                 logger.warning(f"Failed to send poll to Telegram (attempt {attempt}/{settings.TELEGRAM_SEND_MAX_ATTEMPTS}). Retrying...")
                 time.sleep(settings.TELEGRAM_SEND_RETRY_DELAY)
             else:
                 logger.exception(f"Failed to send poll to Telegram after {settings.TELEGRAM_SEND_MAX_ATTEMPTS} attempts.")
-                return False
+                return None
         except requests.exceptions.RequestException:
             logger.exception("Failed to send poll to Telegram. Not retrying.")
+            return None
+
+def stop_poll(chat_id: int | str, message_id: int) -> bool:
+    """
+    Closes an open poll via Telegram's stopPoll endpoint.
+
+    Args:
+        chat_id (int | str)
+
+        message_id (int):
+            The message_id of the poll, as returned by send_poll().
+
+    Returns:
+        bool:
+            True if closed successfully; otherwise False.
+
+    Notes:
+        - stopPoll closes by chat_id + message_id, not poll_id.
+        - Also returns False (logged, not retried) if the poll was already closed -
+          callers that treat closing as best-effort cleanup should not fail hard on this.
+    """
+    api_url = f"{settings.TELEGRAM_API_BASE_URL}/bot{settings.TELEGRAM_BOT_TOKEN}/stopPoll"
+
+    payload = {
+        "chat_id": chat_id,
+        "message_id": message_id
+    }
+
+    for attempt in range(1, settings.TELEGRAM_SEND_MAX_ATTEMPTS + 1):
+        try:
+            response = requests.post(
+                api_url,
+                json=payload,
+                timeout=settings.TELEGRAM_CLIENT_TIMEOUT
+            )
+            response.raise_for_status()
+            logger.info(f"Stopped poll for chat_id={chat_id} (message_id={message_id}).")
+            return True
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
+            if attempt < settings.TELEGRAM_SEND_MAX_ATTEMPTS:
+                logger.warning(f"Failed to stop poll on Telegram (attempt {attempt}/{settings.TELEGRAM_SEND_MAX_ATTEMPTS}). Retrying...")
+                time.sleep(settings.TELEGRAM_SEND_RETRY_DELAY)
+            else:
+                logger.exception(f"Failed to stop poll on Telegram after {settings.TELEGRAM_SEND_MAX_ATTEMPTS} attempts.")
+                return False
+        except requests.exceptions.RequestException:
+            logger.exception(f"Failed to stop poll on Telegram for chat_id={chat_id} - already closed, or another error. Not retrying.")
             return False
 
 def send_document(chat_id: int | str, url: str, caption: str | None = None) -> bool:
