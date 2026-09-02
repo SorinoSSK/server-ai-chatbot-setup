@@ -9,6 +9,13 @@
 #
 # Notes       :
 #   - send_message/send_poll/stop_poll/send_document/send_photo/send_video/send_media_group all retry up to TELEGRAM_SEND_MAX_ATTEMPTS times (TELEGRAM_SEND_RETRY_DELAY apart) on connection failures/timeouts only; other failures are not retried.
+#   - On a rejected (non-retried) request, send_message/send_poll/send_photo/send_video/send_document/send_media_group
+#     return a {"error": True, "status_code", "reason"} dict instead of False/None (except a 401, which is Tier 2 - see
+#     below) - callers use this to report a Tier 1 delivery_failed event (see utils_queue/error_handling.py) so the
+#     backend can retry the same task differently. stop_poll/send_typing_action don't - see their own docstrings.
+#   - A connection-exhausted failure, or any 401, is reported to utils_queue/error_handling.py as a Tier 2 signal
+#     (record_send_failure()) regardless of which function it came from - a successful send re-arms it
+#     (record_send_success()).
 #
 # =============================================================================
 # I M P O R T   H E A D E R
@@ -18,6 +25,7 @@ import logging
 import requests
 
 from ...config import settings
+from ..utils_queue.error_handling import record_send_success, record_send_failure
 
 # =============================================================================
 # G L O B A L   V A R I A B L E
@@ -26,7 +34,30 @@ logger = logging.getLogger(__name__)
 
 # =============================================================================
 
-def send_message(chat_id: int | str, text: str, parse_mode: str | None = None, reply_markup: dict | None = None) -> bool:
+def _classify_rejection(exc: requests.exceptions.RequestException) -> tuple[int | None, str]:
+    """
+    Extracts an HTTP status code and Telegram's own error description from a rejected (non-retried) request.
+
+    Args:
+        exc (requests.exceptions.RequestException)
+
+    Returns:
+        tuple[int | None, str]:
+            (status_code, reason). status_code is None if no response was ever received at all.
+            reason falls back to str(exc) if Telegram's response body isn't parseable JSON.
+    """
+    response = getattr(exc, "response", None)
+    if response is None:
+        return None, str(exc)
+
+    try:
+        reason = response.json().get("description") or str(exc)
+    except ValueError:
+        reason = str(exc)
+
+    return response.status_code, reason
+
+def send_message(chat_id: int | str, text: str, parse_mode: str | None = None, reply_markup: dict | None = None) -> bool | dict:
     """
     Send a text message back to a Telegram chat via the Bot API.
 
@@ -43,8 +74,10 @@ def send_message(chat_id: int | str, text: str, parse_mode: str | None = None, r
             See utils_telegram/utilities/button_prompt_handler.py for building/validating one.
 
     Returns:
-        bool:
-            True if sent successfully; otherwise False.
+        bool | dict:
+            True if sent successfully. {"error": True, "status_code", "reason"} if Telegram rejected
+            the request (Tier 1 - see module Notes). False if unreachable or unauthorized (Tier 2 -
+            already recorded internally, nothing further for the caller to report).
 
     Notes:
         - Callers must escape untrusted text embedded alongside tags when parse_mode is set.
@@ -69,6 +102,7 @@ def send_message(chat_id: int | str, text: str, parse_mode: str | None = None, r
             )
             response.raise_for_status()
             logger.info(f"Sent message to chat_id={chat_id}.")
+            record_send_success()
             return True
         except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
             if attempt < settings.TELEGRAM_SEND_MAX_ATTEMPTS:
@@ -76,10 +110,16 @@ def send_message(chat_id: int | str, text: str, parse_mode: str | None = None, r
                 time.sleep(settings.TELEGRAM_SEND_RETRY_DELAY)
             else:
                 logger.exception(f"Failed to send message to Telegram after {settings.TELEGRAM_SEND_MAX_ATTEMPTS} attempts.")
+                record_send_failure("unreachable")
                 return False
-        except requests.exceptions.RequestException:
+        except requests.exceptions.RequestException as exc:
+            status_code, reason = _classify_rejection(exc)
+            if status_code == 401:
+                logger.exception("Failed to send message to Telegram - unauthorized. Not retrying.")
+                record_send_failure("unauthorized", status_code)
+                return False
             logger.exception("Failed to send message to Telegram. Not retrying.")
-            return False
+            return {"error": True, "status_code": status_code, "reason": reason}
 
 def send_typing_action(chat_id: int | str) -> bool:
     """
@@ -94,6 +134,9 @@ def send_typing_action(chat_id: int | str) -> bool:
 
     Notes:
         - Telegram clears the indicator client-side after 5 seconds - see utilities/typing_indicator.py.
+        - Not Tier 1-eligible - ephemeral, non-critical, not worth reporting per-task. Still feeds Tier 2
+          (record_send_success()/record_send_failure()) on a connection failure or 401, since either is
+          still evidence towards a systemic issue regardless of which endpoint hit it.
     """
     api_url = f"{settings.TELEGRAM_API_BASE_URL}/bot{settings.TELEGRAM_BOT_TOKEN}/sendChatAction"
 
@@ -108,8 +151,14 @@ def send_typing_action(chat_id: int | str) -> bool:
         )
         response.raise_for_status()
         logger.debug(f"Sent typing action to chat_id={chat_id}.")
+        record_send_success()
         return True
-    except requests.exceptions.RequestException:
+    except requests.exceptions.RequestException as exc:
+        status_code, _ = _classify_rejection(exc)
+        if status_code is None:
+            record_send_failure("unreachable")
+        elif status_code == 401:
+            record_send_failure("unauthorized", status_code)
         logger.exception("Failed to send typing action to Telegram.")
         return False
 
@@ -130,7 +179,9 @@ def send_poll(chat_id: int | str, question: str, options: list, allows_multiple_
 
     Returns:
         dict | None:
-            {"poll_id": str, "message_id": int} if sent successfully; otherwise None.
+            {"poll_id": str, "message_id": int} if sent successfully.
+            {"error": True, "status_code", "reason"} if Telegram rejected the request (Tier 1 - see gateway_outbound.py module Notes).
+            None if unreachable or unauthorized (Tier 2 - already recorded internally).
 
     Notes:
         - is_anonymous is not caller-configurable - always settings.TELEGRAM_POLL_ANONYMOUS,
@@ -166,6 +217,7 @@ def send_poll(chat_id: int | str, question: str, options: list, allows_multiple_
                 return None
 
             logger.info(f"Sent poll to chat_id={chat_id} (poll_id={poll_id}).")
+            record_send_success()
             return {"poll_id": poll_id, "message_id": message_id}
         except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
             if attempt < settings.TELEGRAM_SEND_MAX_ATTEMPTS:
@@ -173,10 +225,16 @@ def send_poll(chat_id: int | str, question: str, options: list, allows_multiple_
                 time.sleep(settings.TELEGRAM_SEND_RETRY_DELAY)
             else:
                 logger.exception(f"Failed to send poll to Telegram after {settings.TELEGRAM_SEND_MAX_ATTEMPTS} attempts.")
+                record_send_failure("unreachable")
                 return None
-        except requests.exceptions.RequestException:
+        except requests.exceptions.RequestException as exc:
+            status_code, reason = _classify_rejection(exc)
+            if status_code == 401:
+                logger.exception("Failed to send poll to Telegram - unauthorized. Not retrying.")
+                record_send_failure("unauthorized", status_code)
+                return None
             logger.exception("Failed to send poll to Telegram. Not retrying.")
-            return None
+            return {"error": True, "status_code": status_code, "reason": reason}
 
 def stop_poll(chat_id: int | str, message_id: int) -> bool:
     """
@@ -196,6 +254,8 @@ def stop_poll(chat_id: int | str, message_id: int) -> bool:
         - stopPoll closes by chat_id + message_id, not poll_id.
         - Also returns False (logged, not retried) if the poll was already closed -
           callers that treat closing as best-effort cleanup should not fail hard on this.
+        - Not Tier 1-eligible - closing is best-effort cleanup, not a delivery. Still feeds
+          Tier 2 on a connection failure or 401 (see gateway_outbound.py module Notes).
     """
     api_url = f"{settings.TELEGRAM_API_BASE_URL}/bot{settings.TELEGRAM_BOT_TOKEN}/stopPoll"
 
@@ -213,6 +273,7 @@ def stop_poll(chat_id: int | str, message_id: int) -> bool:
             )
             response.raise_for_status()
             logger.info(f"Stopped poll for chat_id={chat_id} (message_id={message_id}).")
+            record_send_success()
             return True
         except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
             if attempt < settings.TELEGRAM_SEND_MAX_ATTEMPTS:
@@ -220,8 +281,12 @@ def stop_poll(chat_id: int | str, message_id: int) -> bool:
                 time.sleep(settings.TELEGRAM_SEND_RETRY_DELAY)
             else:
                 logger.exception(f"Failed to stop poll on Telegram after {settings.TELEGRAM_SEND_MAX_ATTEMPTS} attempts.")
+                record_send_failure("unreachable")
                 return False
-        except requests.exceptions.RequestException:
+        except requests.exceptions.RequestException as exc:
+            status_code, _ = _classify_rejection(exc)
+            if status_code == 401:
+                record_send_failure("unauthorized", status_code)
             logger.exception(f"Failed to stop poll on Telegram for chat_id={chat_id} - already closed, or another error. Not retrying.")
             return False
 
@@ -239,8 +304,10 @@ def send_document(chat_id: int | str, url: str, caption: str | None = None) -> b
             Defaults to None.
 
     Returns:
-        bool:
-            True if sent successfully; otherwise False.
+        bool | dict:
+            True if sent successfully. {"error": True, "status_code", "reason"} if Telegram rejected
+            the request (Tier 1 - see module Notes). False if unreachable or unauthorized (Tier 2 -
+            already recorded internally).
 
     Notes:
         - Telegram only supports sending a document by URL for .pdf and .zip files - other types are rejected (a multipart upload is not implemented).
@@ -263,6 +330,7 @@ def send_document(chat_id: int | str, url: str, caption: str | None = None) -> b
             )
             response.raise_for_status()
             logger.info(f"Sent document to chat_id={chat_id}.")
+            record_send_success()
             return True
         except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
             if attempt < settings.TELEGRAM_SEND_MAX_ATTEMPTS:
@@ -270,10 +338,16 @@ def send_document(chat_id: int | str, url: str, caption: str | None = None) -> b
                 time.sleep(settings.TELEGRAM_SEND_RETRY_DELAY)
             else:
                 logger.exception(f"Failed to send document to Telegram after {settings.TELEGRAM_SEND_MAX_ATTEMPTS} attempts.")
+                record_send_failure("unreachable")
                 return False
-        except requests.exceptions.RequestException:
+        except requests.exceptions.RequestException as exc:
+            status_code, reason = _classify_rejection(exc)
+            if status_code == 401:
+                logger.exception("Failed to send document to Telegram - unauthorized. Not retrying.")
+                record_send_failure("unauthorized", status_code)
+                return False
             logger.exception("Failed to send document to Telegram. Not retrying.")
-            return False
+            return {"error": True, "status_code": status_code, "reason": reason}
 
 def send_photo(chat_id: int | str, url: str, caption: str | None = None) -> bool:
     """
@@ -289,8 +363,10 @@ def send_photo(chat_id: int | str, url: str, caption: str | None = None) -> bool
             Defaults to None.
 
     Returns:
-        bool:
-            True if sent successfully; otherwise False.
+        bool | dict:
+            True if sent successfully. {"error": True, "status_code", "reason"} if Telegram rejected
+            the request (Tier 1 - see module Notes). False if unreachable or unauthorized (Tier 2 -
+            already recorded internally).
     """
     api_url = f"{settings.TELEGRAM_API_BASE_URL}/bot{settings.TELEGRAM_BOT_TOKEN}/sendPhoto"
 
@@ -310,6 +386,7 @@ def send_photo(chat_id: int | str, url: str, caption: str | None = None) -> bool
             )
             response.raise_for_status()
             logger.info(f"Sent photo to chat_id={chat_id}.")
+            record_send_success()
             return True
         except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
             if attempt < settings.TELEGRAM_SEND_MAX_ATTEMPTS:
@@ -317,10 +394,16 @@ def send_photo(chat_id: int | str, url: str, caption: str | None = None) -> bool
                 time.sleep(settings.TELEGRAM_SEND_RETRY_DELAY)
             else:
                 logger.exception(f"Failed to send photo to Telegram after {settings.TELEGRAM_SEND_MAX_ATTEMPTS} attempts.")
+                record_send_failure("unreachable")
                 return False
-        except requests.exceptions.RequestException:
+        except requests.exceptions.RequestException as exc:
+            status_code, reason = _classify_rejection(exc)
+            if status_code == 401:
+                logger.exception("Failed to send photo to Telegram - unauthorized. Not retrying.")
+                record_send_failure("unauthorized", status_code)
+                return False
             logger.exception("Failed to send photo to Telegram. Not retrying.")
-            return False
+            return {"error": True, "status_code": status_code, "reason": reason}
 
 def send_video(chat_id: int | str, url: str, caption: str | None = None) -> bool:
     """
@@ -336,8 +419,10 @@ def send_video(chat_id: int | str, url: str, caption: str | None = None) -> bool
             Defaults to None.
 
     Returns:
-        bool:
-            True if sent successfully; otherwise False.
+        bool | dict:
+            True if sent successfully. {"error": True, "status_code", "reason"} if Telegram rejected
+            the request (Tier 1 - see module Notes). False if unreachable or unauthorized (Tier 2 -
+            already recorded internally).
     """
     api_url = f"{settings.TELEGRAM_API_BASE_URL}/bot{settings.TELEGRAM_BOT_TOKEN}/sendVideo"
 
@@ -357,6 +442,7 @@ def send_video(chat_id: int | str, url: str, caption: str | None = None) -> bool
             )
             response.raise_for_status()
             logger.info(f"Sent video to chat_id={chat_id}.")
+            record_send_success()
             return True
         except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
             if attempt < settings.TELEGRAM_SEND_MAX_ATTEMPTS:
@@ -364,10 +450,16 @@ def send_video(chat_id: int | str, url: str, caption: str | None = None) -> bool
                 time.sleep(settings.TELEGRAM_SEND_RETRY_DELAY)
             else:
                 logger.exception(f"Failed to send video to Telegram after {settings.TELEGRAM_SEND_MAX_ATTEMPTS} attempts.")
+                record_send_failure("unreachable")
                 return False
-        except requests.exceptions.RequestException:
+        except requests.exceptions.RequestException as exc:
+            status_code, reason = _classify_rejection(exc)
+            if status_code == 401:
+                logger.exception("Failed to send video to Telegram - unauthorized. Not retrying.")
+                record_send_failure("unauthorized", status_code)
+                return False
             logger.exception("Failed to send video to Telegram. Not retrying.")
-            return False
+            return {"error": True, "status_code": status_code, "reason": reason}
 
 def send_media_group(chat_id: int | str, items: list) -> bool:
     """
@@ -380,8 +472,10 @@ def send_media_group(chat_id: int | str, items: list) -> bool:
             2-10 dicts, each {"type": "photo" | "video", "url": "..."}.
 
     Returns:
-        bool:
-            True if sent successfully; otherwise False.
+        bool | dict:
+            True if sent successfully. {"error": True, "status_code", "reason"} if Telegram rejected
+            the request (Tier 1 - see module Notes). False if unreachable or unauthorized (Tier 2 -
+            already recorded internally).
 
     Notes:
         - No caption support - sendMediaGroup captions are set per item, not accepted here.
@@ -402,6 +496,7 @@ def send_media_group(chat_id: int | str, items: list) -> bool:
             )
             response.raise_for_status()
             logger.info(f"Sent album ({len(items)} items) to chat_id={chat_id}.")
+            record_send_success()
             return True
         except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
             if attempt < settings.TELEGRAM_SEND_MAX_ATTEMPTS:
@@ -409,9 +504,15 @@ def send_media_group(chat_id: int | str, items: list) -> bool:
                 time.sleep(settings.TELEGRAM_SEND_RETRY_DELAY)
             else:
                 logger.exception(f"Failed to send album to Telegram after {settings.TELEGRAM_SEND_MAX_ATTEMPTS} attempts.")
+                record_send_failure("unreachable")
                 return False
-        except requests.exceptions.RequestException:
+        except requests.exceptions.RequestException as exc:
+            status_code, reason = _classify_rejection(exc)
+            if status_code == 401:
+                logger.exception("Failed to send album to Telegram - unauthorized. Not retrying.")
+                record_send_failure("unauthorized", status_code)
+                return False
             logger.exception("Failed to send album to Telegram. Not retrying.")
-            return False
+            return {"error": True, "status_code": status_code, "reason": reason}
 
 # =============================================================================

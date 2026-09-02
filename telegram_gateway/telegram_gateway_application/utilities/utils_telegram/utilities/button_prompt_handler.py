@@ -142,7 +142,7 @@ def validate_inline_buttons(rows: list[list[dict]]) -> dict | None:
 
     return {"inline_keyboard": rows}
 
-def send_message_with_buttons(chat_id: int | str, text: str, rows: list[list[dict]], parse_mode: str | None = None) -> bool:
+def send_message_with_buttons(chat_id: int | str, text: str, rows: list[list[dict]], parse_mode: str | None = None) -> bool | dict:
     """
     Sends a text message with an inline keyboard attached, validating both against Telegram's limits.
 
@@ -158,20 +158,26 @@ def send_message_with_buttons(chat_id: int | str, text: str, rows: list[list[dic
             See send_message(). Defaults to None.
 
     Returns:
-        bool:
-            True if sent successfully; otherwise False.
+        bool | dict:
+            True if sent successfully. {"error": True, "status_code", "reason"} if either local
+            validation failed, or Telegram rejected the request (Tier 1 - see
+            utils_telegram/gateway_outbound.py module Notes; status_code is None for a local
+            validation failure, since no request was ever sent). False if unreachable or
+            unauthorized (Tier 2 - already recorded internally by send_message()).
 
     Notes:
         - Fails closed (no send) if text exceeds TELEGRAM_MESSAGE_MAX_LENGTH or the keyboard fails validation - unlike caption overflow elsewhere, text is not split into a follow-up, since the buttons must stay attached to this one message.
     """
     if len(text) > settings.TELEGRAM_MESSAGE_MAX_LENGTH:
-        logger.error(f"Refused to send message to chat_id={chat_id} - text is {len(text)} characters, exceeds the {settings.TELEGRAM_MESSAGE_MAX_LENGTH} character limit.")
-        return False
+        reason = f"text is {len(text)} characters, exceeds the {settings.TELEGRAM_MESSAGE_MAX_LENGTH} character limit"
+        logger.error(f"Refused to send message to chat_id={chat_id} - {reason}.")
+        return {"error": True, "status_code": None, "reason": reason}
 
     keyboard = validate_inline_buttons(rows)
     if keyboard is None:
-        logger.error(f"Refused to send message to chat_id={chat_id} - inline keyboard failed validation.")
-        return False
+        reason = "inline keyboard failed validation"
+        logger.error(f"Refused to send message to chat_id={chat_id} - {reason}.")
+        return {"error": True, "status_code": None, "reason": reason}
 
     return send_message(chat_id, text, parse_mode=parse_mode, reply_markup=keyboard)
 

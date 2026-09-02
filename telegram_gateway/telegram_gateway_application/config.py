@@ -121,6 +121,14 @@ class Settings:
         self.POLL_GLOBAL_CAP_SECONDS                            = get_env_int("POLL_GLOBAL_CAP_SECONDS", DEFAULT_POLL_GLOBAL_CAP_SECONDS)
         self.POLL_MAPPING_TTL_SECONDS                           = get_env_int("POLL_MAPPING_TTL_SECONDS", DEFAULT_POLL_MAPPING_TTL_SECONDS)
 
+        # Error Handling (Tier 1/Tier 2 delivery failures - see utils_queue/error_handling.py)
+        # Tier 2's "unreachable" alert only fires once this many consecutive
+        # connection-level send failures (across all sends) have accumulated - a
+        # single blip is expected noise, not a systemic signal. A 401 ("unauthorized")
+        # bypasses this and fires immediately regardless.
+        DEFAULT_GATEWAY_ALERT_FAILURE_THRESHOLD                 = 5
+        self.GATEWAY_ALERT_FAILURE_THRESHOLD                    = get_env_int("GATEWAY_ALERT_FAILURE_THRESHOLD", DEFAULT_GATEWAY_ALERT_FAILURE_THRESHOLD)
+
         # Whitelist of chat IDs allowed to interact with the bot. Not using
         self.TELEGRAM_ALLOWED_CHAT_IDS = {
             int(chat_id.strip())

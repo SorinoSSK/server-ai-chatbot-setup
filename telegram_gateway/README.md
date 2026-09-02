@@ -300,6 +300,78 @@ sweeps Redis for any leftover poll on startup, before polling resumes, and
 closes each one out immediately - pushing whatever answer it already has,
 same as any other closure path.
 
+### Delivery Failure Events (gateway -> backend)
+
+When a Telegram send fails, the gateway does not simply stay silent about
+it - it pushes one of two event types onto `Q_CHANNEL_OUT`, depending on
+whether the failure is specific to one task or systemic (see
+`utils_queue/error_handling.py`). Both share the type discriminator
+convention of the other gateway -> backend payloads above.
+
+#### `delivery_failed` (Tier 1 - per-task, actionable)
+
+A specific send was rejected by Telegram (e.g. an invalid `parse_mode`, a
+malformed poll), or failed local validation before ever reaching Telegram
+(e.g. an oversized message, an invalid inline keyboard). Reported per
+`task_id`, since the backend/orchestrator can react by retrying that same
+task differently - a different content type, a shorter message, and so on.
+
+```json
+{
+  "task_id": "...",
+  "type": "delivery_failed",
+  "tier": 1,
+  "attempted_type": "image | video | album | file | text | poll",
+  "status_code": 400,
+  "reason": "..."
+}
+```
+- `attempted_type`: which send was attempted - `image` / `video` / `album` /
+  `file` / `text` / `poll`.
+- `status_code`: Telegram's HTTP status code, if the request reached
+  Telegram; `null` if caught by local validation before any request was sent.
+- `reason`: Telegram's own error description, or the local validation
+  failure message.
+- Never raised for a connection-level failure (unreachable/timeout) or a
+  401 - those carry no "wrong tool" signal for this specific task and are
+  reported as `gateway_alert` instead.
+
+#### `gateway_alert` (Tier 2 - systemic, not tied to any task)
+
+Telegram is unreachable altogether (connection/timeout exhausted after
+`TELEGRAM_SEND_MAX_ATTEMPTS` retries), or the bot token itself is invalid
+(`401`). No per-task retry or different tool fixes either - human
+intervention is the only useful response.
+
+```json
+{
+  "task_id": null,
+  "type": "gateway_alert",
+  "tier": 2,
+  "reason": "unreachable | unauthorized",
+  "status_code": 401
+}
+```
+- `task_id`: always `null` - this isn't about any single task.
+- `reason`: `unauthorized` (a 401 was returned) or `unreachable` (connection
+  failed/timed out across every retry).
+- `status_code`: Telegram's HTTP status code if one was returned (e.g. `401`
+  for `unauthorized`); `null` for `unreachable`.
+- `unauthorized` fires immediately, bypassing the threshold below - no
+  number of retries makes an invalid bot token valid.
+- `unreachable` only fires once `GATEWAY_ALERT_FAILURE_THRESHOLD` (5 by
+  default) consecutive send failures have accumulated across *all* sends -
+  a single blip is expected noise, not a systemic signal.
+- Either way, fires **once per incident**: a successful send afterwards
+  re-arms it, so an ongoing outage doesn't spam one alert per failed message.
+- Always logged at `CRITICAL` first, regardless of whether the push to
+  `Q_CHANNEL_OUT` itself succeeds - so the alert stays visible via
+  infra/log-based monitoring even if RabbitMQ is part of what's broken.
+
+**Out of scope:** disk/hardware-level failures (a true application-layer
+gap) are not detected or reported here - they rely on infrastructure-level
+restart policies/monitoring instead.
+
 ### Response Queue Message Payloads
 
 Messages consumed by the gateway from the response queue (agent -> gateway)
