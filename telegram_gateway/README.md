@@ -339,26 +339,30 @@ task differently - a different content type, a shorter message, and so on.
 #### `gateway_alert` (Tier 2 - systemic, not tied to any task)
 
 Telegram is unreachable altogether (connection/timeout exhausted after
-`TELEGRAM_SEND_MAX_ATTEMPTS` retries), or the bot token itself is invalid
-(`401`). No per-task retry or different tool fixes either - human
-intervention is the only useful response.
+`TELEGRAM_SEND_MAX_ATTEMPTS` retries), or the bot token itself is
+invalid/revoked (`401`/`404`). No per-task retry or different tool fixes
+either - human intervention is the only useful response.
 
 ```json
 {
   "task_id": null,
   "type": "gateway_alert",
   "tier": 2,
-  "reason": "unreachable | unauthorized",
+  "reason": "unreachable | unauthorized | not_found",
   "status_code": 401
 }
 ```
 - `task_id`: always `null` - this isn't about any single task.
-- `reason`: `unauthorized` (a 401 was returned) or `unreachable` (connection
-  failed/timed out across every retry).
-- `status_code`: Telegram's HTTP status code if one was returned (e.g. `401`
-  for `unauthorized`); `null` for `unreachable`.
-- `unauthorized` fires immediately, bypassing the threshold below - no
-  number of retries makes an invalid bot token valid.
+- `reason`: `unauthorized` (a 401 was returned), `not_found` (a 404 was
+  returned - see below), or `unreachable` (connection failed/timed out
+  across every retry).
+- `status_code`: Telegram's HTTP status code if one was returned (`401`/`404`);
+  `null` for `unreachable`.
+- `unauthorized`/`not_found` fire immediately, bypassing the threshold below.
+  Every endpoint the gateway calls is a fixed, hardcoded path, so a 404 here
+  can't mean "wrong URL" - like a 401, it means the token doesn't resolve to
+  a real bot (deleted/revoked/malformed). Both are permanent config issues,
+  not blips, so retries won't fix either.
 - `unreachable` only fires once `GATEWAY_ALERT_FAILURE_THRESHOLD` (5 by
   default) consecutive send failures have accumulated across *all* sends -
   a single blip is expected noise, not a systemic signal.

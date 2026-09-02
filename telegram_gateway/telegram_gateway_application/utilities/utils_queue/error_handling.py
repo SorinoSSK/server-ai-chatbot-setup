@@ -12,8 +12,8 @@
 #     since the backend/orchestrator can react by retrying that same task differently
 #     (e.g. a different content type, a shorter message).
 #   - Tier 2 - record_send_success()/record_send_failure(): Telegram is unreachable
-#     altogether, or the bot token itself is invalid (401) - not tied to any one task,
-#     since no per-task retry/tool-swap fixes either. Tracks a rolling
+#     altogether, or the bot token itself is invalid/revoked (401/404) - not tied to
+#     any one task, since no per-task retry/tool-swap fixes either. Tracks a rolling
 #     consecutive-failure count and fires a gateway_alert once per incident, re-arming
 #     only once a send succeeds again.
 #
@@ -114,18 +114,20 @@ def record_send_failure(reason: str, status_code: int | None = None) -> None:
 
     Args:
         reason (str):
-            "unauthorized" | "unreachable".
+            "unauthorized" | "not_found" | "unreachable".
 
         status_code (int | None, optional):
-            Telegram's HTTP status code, if any (e.g. 401 for "unauthorized").
-            Defaults to None.
+            Telegram's HTTP status code, if any (e.g. 401 for "unauthorized",
+            404 for "not_found"). Defaults to None.
 
     Returns:
         None
 
     Notes:
-        - reason="unauthorized" fires immediately, bypassing the threshold - no
-          number of retries makes an invalid bot token valid.
+        - reason="unauthorized"/"not_found" both fire immediately, bypassing the
+          threshold - every endpoint the gateway hits is a fixed, hardcoded path, so
+          either one is a permanent config issue (bad/revoked token), not a blip -
+          no number of retries fixes it.
         - reason="unreachable" (connection/timeout exhaustion) only fires once
           GATEWAY_ALERT_FAILURE_THRESHOLD consecutive failures have accumulated
           across all sends - a single blip is expected noise, not a systemic signal.
@@ -134,7 +136,7 @@ def record_send_failure(reason: str, status_code: int | None = None) -> None:
     """
     global _consecutive_failures, _alert_armed
 
-    if reason == "unauthorized":
+    if reason in ("unauthorized", "not_found"):
         with _lock:
             should_fire = _alert_armed
             _alert_armed = False
@@ -154,7 +156,7 @@ def _push_tier2_gateway_alert(reason: str, status_code: int | None) -> bool:
 
     Args:
         reason (str):
-            "unauthorized" | "unreachable".
+            "unauthorized" | "not_found" | "unreachable".
 
         status_code (int | None)
 
@@ -170,7 +172,7 @@ def _push_tier2_gateway_alert(reason: str, status_code: int | None) -> bool:
           this stays visible via infra/log-based monitoring even if RabbitMQ itself
           is part of what's currently broken.
     """
-    logger.critical(f"Gateway alert: Telegram delivery is {reason} (status_code={status_code}). Human intervention likely required.")
+    logger.critical(f"Gateway alert: Telegram delivery failed - reason={reason}, status_code={status_code}. Human intervention likely required.")
 
     from .queue import queue_push_task
 
