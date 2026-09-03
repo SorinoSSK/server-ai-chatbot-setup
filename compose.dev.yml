@@ -17,6 +17,8 @@ services:
     depends_on:
       rabbitmq:
         condition: service_healthy
+      redis:
+        condition: service_healthy
     networks:
       - "chatbot-app-network"
     restart: unless-stopped
@@ -43,10 +45,14 @@ services:
   redis:
     image: "redis:7.4-alpine"
     container_name: "${CHATBOT_REDIS_CONTAINER_NAME}"
-    environment:
-      REDIS_USERNAME: "${CHATBOT_REDIS_USERNAME}"
-      REDIS_PASSWORD: "${CHATBOT_REDIS_PASSWORD}"
-    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "always"]
+    command:
+      [
+        "redis-server",
+        "--appendonly", "yes",
+        "--appendfsync", "always",
+        "--requirepass", "${CHATBOT_REDIS_PASSWORD}",
+        "--user", "${CHATBOT_REDIS_USERNAME}", "on", ">${CHATBOT_REDIS_PASSWORD}", "~*", "&*", "+@all"
+      ]
     # ports:
     #   - "${CHATBOT_REDIS_PORT}:6379"
     volumes:
@@ -54,7 +60,7 @@ services:
     networks:
       - "chatbot-app-network"
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD", "redis-cli", "--user", "${CHATBOT_REDIS_USERNAME}", "-a", "${CHATBOT_REDIS_PASSWORD}", "--no-auth-warning", "ping"]
       interval: "10s"
       timeout: "5s"
       retries: 5
