@@ -1,5 +1,5 @@
 # =============================================================================
-# File        : logging.py
+# File        : logging_setup.py
 # Description : Configures application logging, including console output, file rotation, retention policy, and log formatting.
 # Author      : SorinoSSK
 # Created On  : 2026-08-29
@@ -10,6 +10,8 @@
 # Notes       :
 #   - Centralised logging configuration for the application.
 #   - Intended to be initialised once during application entry points on startup.
+#   - Renamed from logging.py to avoid shadowing the standard library's logging module
+#     (see telegram_gateway/NON_COMPLIANCE_REPORT.md CCR-009).
 # =============================================================================
 # I M P O R T   H E A D E R
 

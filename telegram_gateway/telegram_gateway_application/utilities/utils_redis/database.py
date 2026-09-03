@@ -55,6 +55,12 @@ def initialise_redis_connection() -> None:
                     host=settings.REDIS_HOST,
                     port=settings.REDIS_PORT,
                     db=settings.REDIS_DB,
+                    username=settings.REDIS_USERNAME,
+                    password=settings.REDIS_PASSWORD,
+                    socket_connect_timeout=settings.REDIS_SOCKET_CONNECT_TIMEOUT,
+                    socket_timeout=settings.REDIS_SOCKET_TIMEOUT,
+                    socket_keepalive=settings.REDIS_SOCKET_KEEPALIVE,
+                    health_check_interval=settings.REDIS_HEALTH_CHECK_INTERVAL,
                     decode_responses=True
                 )
                 _client.ping()

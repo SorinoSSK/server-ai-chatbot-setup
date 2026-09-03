@@ -32,7 +32,7 @@ from ..utilities import ShutdownSignal
 from ..utils_gatekeeper.gatekeeper import track_unauthorised_access
 from ..utils_queue.queue import queue_push_task
 from ..utils_redis.database import create_task_mapping, get_chat_draft, create_chat_draft, delete_chat_draft
-from .gateway_outbound import send_message
+from .gateway_outbound import send_message, log_sanitised_exception
 from .utilities.typing_indicator import start_typing
 from .utilities.image_draft_handler import start_draft_timer, stop_draft_timer, continue_draft_timer
 from .utilities.button_prompt_handler import validate_bot_callback
@@ -102,6 +102,36 @@ def _extract_user_id(update: dict) -> int | None:
         return update["callback_query"].get("from", {}).get("id")
     return None
 
+def _summarise_update(update: dict) -> dict:
+    """
+    Builds a minimal, non-sensitive summary of an Update, safe for logging.
+
+    Args:
+        update (dict)
+
+    Returns:
+        dict:
+            {"update_id", "event_type"}.
+
+    Notes:
+        - Logging the raw update dict risks writing sender PII (name, username, phone
+          number for a shared contact) and free-text message content to disk logs -
+          see NON_COMPLIANCE_REPORT.md CCR-002. Use this summary in log statements instead
+          of the raw update.
+    """
+    if "message" in update:
+        event_type = "message"
+    elif "edited_message" in update:
+        event_type = "edited_message"
+    elif "callback_query" in update:
+        event_type = "callback_query"
+    elif "poll_answer" in update:
+        event_type = "poll_answer"
+    else:
+        event_type = "unknown"
+
+    return {"update_id": update.get("update_id"), "event_type": event_type}
+
 def _extract_media(message: dict) -> dict | None:
     """
     Extracts photo/video/document details from a Telegram message, if present.
@@ -170,10 +200,10 @@ def _resolve_file_url(file_id: str) -> str | None:
                 logger.warning(f"Failed to resolve file_id={file_id} via getFile (attempt {attempt}/{settings.TELEGRAM_SEND_MAX_ATTEMPTS}). Retrying...")
                 time.sleep(settings.TELEGRAM_SEND_RETRY_DELAY)
             else:
-                logger.exception(f"Failed to resolve file_id={file_id} via getFile after {settings.TELEGRAM_SEND_MAX_ATTEMPTS} attempts.")
+                log_sanitised_exception(f"Failed to resolve file_id={file_id} via getFile after {settings.TELEGRAM_SEND_MAX_ATTEMPTS} attempts.")
                 return None
         except requests.exceptions.RequestException:
-            logger.exception(f"Failed to resolve file_id={file_id} via getFile. Not retrying.")
+            log_sanitised_exception(f"Failed to resolve file_id={file_id} via getFile. Not retrying.")
             return None
 
 def _prune_recent_media_groups() -> None:
@@ -452,10 +482,10 @@ def poll_updates() -> None:
                         user_id = _extract_user_id(update)
 
                         if chat_id is None or user_id is None:
-                            logger.warning(f"Ignored invalid update - missing chat_id or user_id: {update}")
+                            logger.warning(f"Ignored invalid update - missing chat_id or user_id: {_summarise_update(update)}")
                         elif chat_id not in settings.TELEGRAM_ALLOWED_CHAT_IDS:
                             if track_unauthorised_access(chat_id):
-                                logger.warning(f"First unauthorised access from chat_id={chat_id}: {update}")
+                                logger.warning(f"First unauthorised access from chat_id={chat_id}: {_summarise_update(update)}")
                                 send_message(
                                     chat_id,
                                     f"Hello, I'm {settings.TELEGRAM_BOT_NAME}! I'd love to get to know you, but I only "
@@ -464,9 +494,9 @@ def poll_updates() -> None:
                                     parse_mode="HTML"
                                 )
                             else:
-                                logger.debug(f"Ignored update from unauthorised chat_id={chat_id}: {update}")
+                                logger.debug(f"Ignored update from unauthorised chat_id={chat_id}: {_summarise_update(update)}")
                         else:
-                            logger.info(f"Received Telegram update: {update}")
+                            logger.info(f"Received Telegram update: {_summarise_update(update)}")
                             _handle_update(chat_id, user_id, update)
 
                     # Only confirmed to Telegram once fully handled - see offset Notes above.
@@ -478,18 +508,18 @@ def poll_updates() -> None:
                     _update_attempts[update_id] = attempts
 
                     if attempts >= settings.TELEGRAM_UPDATE_MAX_ATTEMPTS:
-                        logger.exception(f"Giving up on update_id={update_id} after {attempts} failed attempts: {update}")
+                        log_sanitised_exception(f"Giving up on update_id={update_id} after {attempts} failed attempts: {_summarise_update(update)}")
                         offset = update_id + 1
                         _update_attempts.pop(update_id, None)
                     else:
-                        logger.exception(f"Unexpected error processing update_id={update_id} (attempt {attempts}/{settings.TELEGRAM_UPDATE_MAX_ATTEMPTS}). Will retry next poll.")
+                        log_sanitised_exception(f"Unexpected error processing update_id={update_id} (attempt {attempts}/{settings.TELEGRAM_UPDATE_MAX_ATTEMPTS}). Will retry next poll.")
                         break
 
         except requests.exceptions.RequestException:
-            logger.exception("Telegram long polling request failed. Retrying...")
+            log_sanitised_exception("Telegram long polling request failed. Retrying...")
             time.sleep(5)
         except Exception:
-            logger.exception("Unexpected error during Telegram long polling.")
+            log_sanitised_exception("Unexpected error during Telegram long polling.")
             time.sleep(5)
 
 def stop_polling() -> None:

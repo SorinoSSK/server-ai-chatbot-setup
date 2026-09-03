@@ -18,6 +18,7 @@
 
 import time
 import logging
+import traceback
 import requests
 
 from ...config import settings
@@ -29,6 +30,29 @@ from ..utils_queue.error_handling import record_send_success, record_send_failur
 logger = logging.getLogger(__name__)
 
 # =============================================================================
+
+def log_sanitised_exception(message: str) -> None:
+    """
+    Logs the currently-handled exception's traceback with the bot token redacted.
+
+    Args:
+        message (str):
+            Context message logged ahead of the traceback.
+
+    Returns:
+        None
+
+    Notes:
+        - requests/urllib3 exceptions (ConnectionError, Timeout, HTTPError, etc.) routinely
+          embed the full request URL - including settings.TELEGRAM_BOT_TOKEN - in their
+          message text. logger.exception() would write that token straight into the log
+          files (CWE-532 / CWE-522 - see NON_COMPLIANCE_REPORT.md CCR-001). Use this instead
+          of logger.exception() anywhere a Telegram Bot API request may have failed.
+        - Logged at ERROR level (not exc_info=True) since the traceback text itself is
+          rendered and redacted manually here.
+    """
+    redacted_traceback = traceback.format_exc().replace(settings.TELEGRAM_BOT_TOKEN, "***REDACTED***")
+    logger.error(f"{message}\n{redacted_traceback}")
 
 def _classify_rejection(exc: requests.exceptions.RequestException) -> tuple[int | None, str]:
     """
@@ -126,17 +150,17 @@ def send_message(chat_id: int | str, text: str, parse_mode: str | None = None, r
                 logger.warning(f"Failed to send message to Telegram (attempt {attempt}/{settings.TELEGRAM_SEND_MAX_ATTEMPTS}). Retrying...")
                 time.sleep(settings.TELEGRAM_SEND_RETRY_DELAY)
             else:
-                logger.exception(f"Failed to send message to Telegram after {settings.TELEGRAM_SEND_MAX_ATTEMPTS} attempts.")
+                log_sanitised_exception(f"Failed to send message to Telegram after {settings.TELEGRAM_SEND_MAX_ATTEMPTS} attempts.")
                 record_send_failure("unreachable")
                 return False
         except requests.exceptions.RequestException as exc:
             status_code, reason = _classify_rejection(exc)
             config_failure = _config_failure_reason(status_code)
             if config_failure:
-                logger.exception(f"Failed to send message to Telegram - {config_failure}. Not retrying.")
+                log_sanitised_exception(f"Failed to send message to Telegram - {config_failure}. Not retrying.")
                 record_send_failure(config_failure, status_code)
                 return False
-            logger.exception("Failed to send message to Telegram. Not retrying.")
+            log_sanitised_exception("Failed to send message to Telegram. Not retrying.")
             return {"error": True, "status_code": status_code, "reason": reason}
 
 def send_typing_action(chat_id: int | str) -> bool:
@@ -178,7 +202,7 @@ def send_typing_action(chat_id: int | str) -> bool:
             config_failure = _config_failure_reason(status_code)
             if config_failure:
                 record_send_failure(config_failure, status_code)
-        logger.exception("Failed to send typing action to Telegram.")
+        log_sanitised_exception("Failed to send typing action to Telegram.")
         return False
 
 def send_poll(chat_id: int | str, question: str, options: list, allows_multiple_answers: bool = False) -> dict | None:
@@ -240,17 +264,17 @@ def send_poll(chat_id: int | str, question: str, options: list, allows_multiple_
                 logger.warning(f"Failed to send poll to Telegram (attempt {attempt}/{settings.TELEGRAM_SEND_MAX_ATTEMPTS}). Retrying...")
                 time.sleep(settings.TELEGRAM_SEND_RETRY_DELAY)
             else:
-                logger.exception(f"Failed to send poll to Telegram after {settings.TELEGRAM_SEND_MAX_ATTEMPTS} attempts.")
+                log_sanitised_exception(f"Failed to send poll to Telegram after {settings.TELEGRAM_SEND_MAX_ATTEMPTS} attempts.")
                 record_send_failure("unreachable")
                 return None
         except requests.exceptions.RequestException as exc:
             status_code, reason = _classify_rejection(exc)
             config_failure = _config_failure_reason(status_code)
             if config_failure:
-                logger.exception(f"Failed to send poll to Telegram - {config_failure}. Not retrying.")
+                log_sanitised_exception(f"Failed to send poll to Telegram - {config_failure}. Not retrying.")
                 record_send_failure(config_failure, status_code)
                 return None
-            logger.exception("Failed to send poll to Telegram. Not retrying.")
+            log_sanitised_exception("Failed to send poll to Telegram. Not retrying.")
             return {"error": True, "status_code": status_code, "reason": reason}
 
 def stop_poll(chat_id: int | str, message_id: int) -> bool:
@@ -296,7 +320,7 @@ def stop_poll(chat_id: int | str, message_id: int) -> bool:
                 logger.warning(f"Failed to stop poll on Telegram (attempt {attempt}/{settings.TELEGRAM_SEND_MAX_ATTEMPTS}). Retrying...")
                 time.sleep(settings.TELEGRAM_SEND_RETRY_DELAY)
             else:
-                logger.exception(f"Failed to stop poll on Telegram after {settings.TELEGRAM_SEND_MAX_ATTEMPTS} attempts.")
+                log_sanitised_exception(f"Failed to stop poll on Telegram after {settings.TELEGRAM_SEND_MAX_ATTEMPTS} attempts.")
                 record_send_failure("unreachable")
                 return False
         except requests.exceptions.RequestException as exc:
@@ -304,7 +328,7 @@ def stop_poll(chat_id: int | str, message_id: int) -> bool:
             config_failure = _config_failure_reason(status_code)
             if config_failure:
                 record_send_failure(config_failure, status_code)
-            logger.exception(f"Failed to stop poll on Telegram for chat_id={chat_id} - already closed, or another error. Not retrying.")
+            log_sanitised_exception(f"Failed to stop poll on Telegram for chat_id={chat_id} - already closed, or another error. Not retrying.")
             return False
 
 def send_document(chat_id: int | str, url: str, caption: str | None = None) -> bool:
@@ -354,17 +378,17 @@ def send_document(chat_id: int | str, url: str, caption: str | None = None) -> b
                 logger.warning(f"Failed to send document to Telegram (attempt {attempt}/{settings.TELEGRAM_SEND_MAX_ATTEMPTS}). Retrying...")
                 time.sleep(settings.TELEGRAM_SEND_RETRY_DELAY)
             else:
-                logger.exception(f"Failed to send document to Telegram after {settings.TELEGRAM_SEND_MAX_ATTEMPTS} attempts.")
+                log_sanitised_exception(f"Failed to send document to Telegram after {settings.TELEGRAM_SEND_MAX_ATTEMPTS} attempts.")
                 record_send_failure("unreachable")
                 return False
         except requests.exceptions.RequestException as exc:
             status_code, reason = _classify_rejection(exc)
             config_failure = _config_failure_reason(status_code)
             if config_failure:
-                logger.exception(f"Failed to send document to Telegram - {config_failure}. Not retrying.")
+                log_sanitised_exception(f"Failed to send document to Telegram - {config_failure}. Not retrying.")
                 record_send_failure(config_failure, status_code)
                 return False
-            logger.exception("Failed to send document to Telegram. Not retrying.")
+            log_sanitised_exception("Failed to send document to Telegram. Not retrying.")
             return {"error": True, "status_code": status_code, "reason": reason}
 
 def send_photo(chat_id: int | str, url: str, caption: str | None = None) -> bool:
@@ -411,17 +435,17 @@ def send_photo(chat_id: int | str, url: str, caption: str | None = None) -> bool
                 logger.warning(f"Failed to send photo to Telegram (attempt {attempt}/{settings.TELEGRAM_SEND_MAX_ATTEMPTS}). Retrying...")
                 time.sleep(settings.TELEGRAM_SEND_RETRY_DELAY)
             else:
-                logger.exception(f"Failed to send photo to Telegram after {settings.TELEGRAM_SEND_MAX_ATTEMPTS} attempts.")
+                log_sanitised_exception(f"Failed to send photo to Telegram after {settings.TELEGRAM_SEND_MAX_ATTEMPTS} attempts.")
                 record_send_failure("unreachable")
                 return False
         except requests.exceptions.RequestException as exc:
             status_code, reason = _classify_rejection(exc)
             config_failure = _config_failure_reason(status_code)
             if config_failure:
-                logger.exception(f"Failed to send photo to Telegram - {config_failure}. Not retrying.")
+                log_sanitised_exception(f"Failed to send photo to Telegram - {config_failure}. Not retrying.")
                 record_send_failure(config_failure, status_code)
                 return False
-            logger.exception("Failed to send photo to Telegram. Not retrying.")
+            log_sanitised_exception("Failed to send photo to Telegram. Not retrying.")
             return {"error": True, "status_code": status_code, "reason": reason}
 
 def send_video(chat_id: int | str, url: str, caption: str | None = None) -> bool:
@@ -468,17 +492,17 @@ def send_video(chat_id: int | str, url: str, caption: str | None = None) -> bool
                 logger.warning(f"Failed to send video to Telegram (attempt {attempt}/{settings.TELEGRAM_SEND_MAX_ATTEMPTS}). Retrying...")
                 time.sleep(settings.TELEGRAM_SEND_RETRY_DELAY)
             else:
-                logger.exception(f"Failed to send video to Telegram after {settings.TELEGRAM_SEND_MAX_ATTEMPTS} attempts.")
+                log_sanitised_exception(f"Failed to send video to Telegram after {settings.TELEGRAM_SEND_MAX_ATTEMPTS} attempts.")
                 record_send_failure("unreachable")
                 return False
         except requests.exceptions.RequestException as exc:
             status_code, reason = _classify_rejection(exc)
             config_failure = _config_failure_reason(status_code)
             if config_failure:
-                logger.exception(f"Failed to send video to Telegram - {config_failure}. Not retrying.")
+                log_sanitised_exception(f"Failed to send video to Telegram - {config_failure}. Not retrying.")
                 record_send_failure(config_failure, status_code)
                 return False
-            logger.exception("Failed to send video to Telegram. Not retrying.")
+            log_sanitised_exception("Failed to send video to Telegram. Not retrying.")
             return {"error": True, "status_code": status_code, "reason": reason}
 
 def send_media_group(chat_id: int | str, items: list) -> bool:
@@ -523,17 +547,17 @@ def send_media_group(chat_id: int | str, items: list) -> bool:
                 logger.warning(f"Failed to send album to Telegram (attempt {attempt}/{settings.TELEGRAM_SEND_MAX_ATTEMPTS}). Retrying...")
                 time.sleep(settings.TELEGRAM_SEND_RETRY_DELAY)
             else:
-                logger.exception(f"Failed to send album to Telegram after {settings.TELEGRAM_SEND_MAX_ATTEMPTS} attempts.")
+                log_sanitised_exception(f"Failed to send album to Telegram after {settings.TELEGRAM_SEND_MAX_ATTEMPTS} attempts.")
                 record_send_failure("unreachable")
                 return False
         except requests.exceptions.RequestException as exc:
             status_code, reason = _classify_rejection(exc)
             config_failure = _config_failure_reason(status_code)
             if config_failure:
-                logger.exception(f"Failed to send album to Telegram - {config_failure}. Not retrying.")
+                log_sanitised_exception(f"Failed to send album to Telegram - {config_failure}. Not retrying.")
                 record_send_failure(config_failure, status_code)
                 return False
-            logger.exception("Failed to send album to Telegram. Not retrying.")
+            log_sanitised_exception("Failed to send album to Telegram. Not retrying.")
             return {"error": True, "status_code": status_code, "reason": reason}
 
 # =============================================================================

@@ -143,8 +143,8 @@ class Settings:
 
         # Queue Connection
         DEFAULT_Q_HOST                                          = "chatbot-rabbitmq"
-        DEFAULT_Q_USER                                          = "chatbotAdmin"
-        DEFAULT_Q_PASSWORD                                      = "chatbotAdmin"
+        DEFAULT_Q_USER                                          = ""
+        DEFAULT_Q_PASSWORD                                      = ""
         DEFAULT_Q_PORT                                          = 5672
         DEFAULT_Q_VHOST                                         = "chatbot_vhost"
         DEFAULT_Q_CHANNEL_IN                                    = "telegram_gateway_inbound_queue"
@@ -172,13 +172,25 @@ class Settings:
         # Redis Connection
         DEFAULT_REDIS_HOST                                      = "chatbot-redis"
         DEFAULT_REDIS_PORT                                      = 6379
+        DEFAULT_REDIS_USERNAME                                  = ""
+        DEFAULT_REDIS_PASSWORD                                  = ""
         DEFAULT_REDIS_DB                                        = 0
+        DEFAULT_REDIS_SOCKET_CONNECT_TIMEOUT                    = 5
+        DEFAULT_REDIS_SOCKET_TIMEOUT                            = 5
+        DEFAULT_REDIS_SOCKET_KEEPALIVE                          = True
+        DEFAULT_REDIS_HEALTH_CHECK_INTERVAL                     = 30
         DEFAULT_REDIS_TASK_RETRY_DELAY                          = 1
         DEFAULT_REDIS_TASK_MAX_ATTEMPTS                         = 5
         DEFAULT_REDIS_TASK_MAPPING_TTL_SECONDS                  = 86400
         self.REDIS_HOST                                         = os.getenv("REDIS_HOST") or DEFAULT_REDIS_HOST
         self.REDIS_PORT                                         = get_env_int("REDIS_PORT", DEFAULT_REDIS_PORT)
+        self.REDIS_USERNAME                                     = os.getenv("REDIS_USERNAME") or DEFAULT_REDIS_USERNAME
+        self.REDIS_PASSWORD                                     = os.getenv("REDIS_PASSWORD") or DEFAULT_REDIS_PASSWORD
         self.REDIS_DB                                           = get_env_int("REDIS_DB", DEFAULT_REDIS_DB, minimum=0)
+        self.REDIS_SOCKET_CONNECT_TIMEOUT                       = get_env_int("REDIS_SOCKET_CONNECT_TIMEOUT", DEFAULT_REDIS_SOCKET_CONNECT_TIMEOUT)
+        self.REDIS_SOCKET_TIMEOUT                               = get_env_int("REDIS_SOCKET_TIMEOUT", DEFAULT_REDIS_SOCKET_TIMEOUT)
+        self.REDIS_SOCKET_KEEPALIVE                             = get_env_bool("REDIS_SOCKET_KEEPALIVE", DEFAULT_REDIS_SOCKET_KEEPALIVE)
+        self.REDIS_HEALTH_CHECK_INTERVAL                        = get_env_int("REDIS_HEALTH_CHECK_INTERVAL", DEFAULT_REDIS_HEALTH_CHECK_INTERVAL)
         self.REDIS_TASK_RETRY_DELAY                             = get_env_int("REDIS_TASK_RETRY_DELAY", DEFAULT_REDIS_TASK_RETRY_DELAY)
         self.REDIS_TASK_MAX_ATTEMPTS                            = get_env_int("REDIS_TASK_MAX_ATTEMPTS", DEFAULT_REDIS_TASK_MAX_ATTEMPTS)
         self.REDIS_TASK_MAPPING_TTL_SECONDS                     = get_env_int("REDIS_TASK_MAPPING_TTL_SECONDS", DEFAULT_REDIS_TASK_MAPPING_TTL_SECONDS)
@@ -205,7 +217,7 @@ def get_env_int(name: str, default: int, minimum: int = 1) -> int:
             value = int(os.getenv(name) or default)
             return max(minimum, value)
         except ValueError:
-            return default
+            return max(minimum, default)
 
 def get_env_bool(name: str, default: bool) -> bool:
         """

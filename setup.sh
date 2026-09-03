@@ -33,6 +33,8 @@ get_masked_config_variables()
     echo "CHATBOT_RABBITMQ_PASSWORD"
     echo "CHATBOT_TELEGRAM_BOT_TOKEN"
     echo "CHATBOT_TELEGRAM_ALLOWED_CHAT_IDS"
+    echo "CHATBOT_REDIS_USERNAME"
+    echo "CHATBOT_REDIS_PASSWORD"
 }
 
 generate_config_sample()

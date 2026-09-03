@@ -21,7 +21,7 @@ telegram_gateway/telegram_gateway_application
 - `main.py` - application entry point; configures logging, registers shutdown signal handlers, and drives startup/shutdown.
 - `config.py` - centralised, environment-driven application configuration (see Environment Variables below).
 - `utilities/initialise.py` - startup/shutdown orchestration (`initialise_application()` / `terminate_application()`).
-- `utilities/logging.py` - console and rotating file logging configuration.
+- `utilities/logging_setup.py` - console and rotating file logging configuration.
 - `utilities/utilities.py` - shared, dependency-free helpers (e.g. `ShutdownSignal`).
 - `utilities/utils_gatekeeper/` - tracks repeated access attempts from unauthorised chats.
 - `utilities/utils_queue/` - RabbitMQ connection lifecycle, inbound message dispatch, and delivery-failure reporting.
