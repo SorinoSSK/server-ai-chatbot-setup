@@ -6,27 +6,16 @@
 #
 # Features    :
 #   - Runs a per-poll_id background loop through two phases:
-#       - AWAITING FIRST ANSWER (POLL_TIMEOUT_SECONDS): closes with a chat message
-#         if nobody answers in time. Nothing is pushed to the queue.
-#       - DEBOUNCING (POLL_DEBOUNCE_INITIAL_SECONDS, shortened to
-#         POLL_DEBOUNCE_SUBSEQUENT_SECONDS on every further answer): once answered,
-#         waits for things to go quiet before compiling and pushing the latest
-#         answer - capped overall by POLL_GLOBAL_CAP_SECONDS from poll creation,
-#         regardless of how many times debouncing resets.
-#   - Unrelated chat messages do not interact with an open poll at all - the bot is
-#     expected to answer them independently while the poll keeps running.
-#   - close_orphaned_polls() sweeps Redis on startup for polls left behind by a
-#     timer that did not survive the previous run (e.g. an app restart), closing
-#     each one out immediately - pushing whatever answer it already has, same as
-#     any other closure path.
+#       - AWAITING FIRST ANSWER (POLL_TIMEOUT_SECONDS): closes with a chat message if nobody answers in time.
+#         Nothing is pushed to the queue.
+#       - DEBOUNCING (POLL_DEBOUNCE_INITIAL_SECONDS, shortened to POLL_DEBOUNCE_SUBSEQUENT_SECONDS on every further answer): once answered, waits for things to go quiet before compiling and pushing the latest answer - capped overall by POLL_GLOBAL_CAP_SECONDS from poll creation, regardless of how many times debouncing resets.
+#   - Unrelated chat messages do not interact with an open poll at all - the bot is expected to answer them independently while the poll keeps running.
+#   - close_orphaned_polls() sweeps Redis on startup for polls left behind by a timer that did not survive the previous run (e.g. an app restart), closing each one out immediately - pushing whatever answer it already has, same as any other closure path.
 #
 # Notes       :
-#   - In-memory only - not persisted. Redis-side poll mapping has its own TTL as
-#     backstop, refreshed on every answer (see utils_redis/database.py::update_poll_answer()).
-#   - Whether a closure pushes an answer to the queue depends solely on whether the
-#     poll was ever answered, not on why it's closing - the same _finalise_poll()
-#     path handles a natural debounce expiry, the global cap being reached, and an
-#     orphan-sweep closure identically.
+#   - In-memory only - not persisted.
+#     Redis-side poll mapping has its own TTL as backstop, refreshed on every answer (see utils_redis/database.py::update_poll_answer()).
+#   - Whether a closure pushes an answer to the queue depends solely on whether the poll was ever answered, not on why it's closing - the same _finalise_poll() path handles a natural debounce expiry, the global cap being reached, and an orphan-sweep closure identically.
 #
 # =============================================================================
 # I M P O R T   H E A D E R
@@ -73,8 +62,7 @@ def _push_poll_answer(task_id: str, user_id: int | None, option_ids: list) -> No
         None
 
     Notes:
-        - Deferred import of queue_push_task to avoid a circular import
-          (queue.py -> message_handler.py -> this module -> queue.py).
+        - Deferred import of queue_push_task to avoid a circular import (queue.py -> message_handler.py -> this module -> queue.py).
     """
     from ...utils_queue.queue import queue_push_task
 
@@ -103,10 +91,8 @@ def _finalise_poll(poll_id: str, mapping: dict) -> None:
         None
 
     Notes:
-        - stop_poll() is best-effort - a poll already closed (e.g. a previous run's
-          orphan sweep raced with this one) is not treated as a hard failure.
-        - Shared by the normal in-memory closure path and close_orphaned_polls(), so
-          both close a poll out identically.
+        - stop_poll() is best-effort - a poll already closed (e.g. a previous run's orphan sweep raced with this one) is not treated as a hard failure.
+        - Shared by the normal in-memory closure path and close_orphaned_polls(), so both close a poll out identically.
     """
     chat_id = mapping.get("chat_id")
     task_id = mapping.get("task_id")
@@ -173,9 +159,7 @@ def _poll_loop(poll_id: str, event: threading.Event) -> None:
         None
 
     Notes:
-        - Every debounce deadline is clamped to started_at + POLL_GLOBAL_CAP_SECONDS,
-          so the global cap is enforced simply by whichever deadline is soonest - no
-          separate cap-check is needed.
+        - Every debounce deadline is clamped to started_at + POLL_GLOBAL_CAP_SECONDS, so the global cap is enforced simply by whichever deadline is soonest - no separate cap-check is needed.
     """
     started_at = time.monotonic()
 
@@ -246,14 +230,9 @@ def close_orphaned_polls() -> None:
         None
 
     Notes:
-        - Intended to be called once on startup, before polling resumes. A poll's
-          timer is in-memory only (see module Notes above), so it does not survive
-          an application restart - without this sweep, such a poll would sit
-          silently until its Redis TTL lapses, with no notice, no closure, and no
-          answer ever pushed, even if one had already been recorded.
-        - Since the timer's progress (which phase, how much time remains) isn't
-          persisted, an orphaned poll is closed out immediately rather than resumed
-          part-way through a phase.
+        - Intended to be called once on startup, before polling resumes.
+          A poll's timer is in-memory only (see module Notes above), so it does not survive an application restart - without this sweep, such a poll would sit silently until its Redis TTL lapses, with no notice, no closure, and no answer ever pushed, even if one had already been recorded.
+        - Since the timer's progress (which phase, how much time remains) isn't persisted, an orphaned poll is closed out immediately rather than resumed part-way through a phase.
     """
     poll_ids = get_all_poll_ids()
     if not poll_ids:

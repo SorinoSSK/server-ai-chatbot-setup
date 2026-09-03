@@ -1,15 +1,15 @@
 # =============================================================================
 # File        : logging.py
-# Description : Configures application logging, including console output, file rotation,
-#               retention policy, and log formatting.
-#
+# Description : Configures application logging, including console output, file rotation, retention policy, and log formatting.
 # Author      : SorinoSSK
 # Created On  : 2026-08-29
 #
+# Features    :
+#   - Console and daily/size-based rotating file logging, with retention management.
+#
 # Notes       :
-#   - Centralized logging configuration for the application.
-#   - Supports daily log rotation and log retention management.
-#   - To be initialised during application entry points on startup.*
+#   - Centralised logging configuration for the application.
+#   - Intended to be initialised once during application entry points on startup.
 # =============================================================================
 # I M P O R T   H E A D E R
 

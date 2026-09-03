@@ -9,12 +9,10 @@
 #     See README.md for the payload shape per type.
 #   - text messages may carry inline keyboard buttons - see utils_telegram/utilities/button_prompt_handler.py.
 #   - poll messages start their answer-collection timer on send - see utils_telegram/utilities/poll_response_handler.py.
-#   - A send rejected by Telegram (or by local validation) is reported as a Tier 1
-#     delivery_failed event, per task_id - see error_handling.py.
+#   - A send rejected by Telegram (or by local validation) is reported as a Tier 1 delivery_failed event, per task_id - see error_handling.py.
 #
 # Notes       :
-#   - Owns its own JSON parsing so a malformed payload is logged and dropped rather
-#     than requeued forever.
+#   - Owns its own JSON parsing so a malformed payload is logged and dropped rather than requeued forever.
 #   - Resolves chat_id/user_id from Redis via task_id.
 #
 # =============================================================================
@@ -60,12 +58,9 @@ def _handle_poll(task_id: str, chat_id: int, question: str, options: list, allow
     Notes:
         - Skipped (and logged) if question is missing. Null/invalid options are filtered out.
         - is_anonymous is not caller-configurable - see send_poll().
-        - A rejected send (see send_poll()) is reported as a Tier 1 delivery_failed event -
-          see error_handling.py. A connection failure or unauthorized token (Tier 2) is
-          already recorded internally by send_poll() - nothing further to do here.
-        - On a successful send, registers a poll:<poll_id> Redis mapping and starts its
-          AWAITING FIRST ANSWER / DEBOUNCING timer (see utils_telegram/utilities/poll_response_handler.py) -
-          without this, an incoming poll_answer update has nothing to correlate back to.
+        - A rejected send (see send_poll()) is reported as a Tier 1 delivery_failed event - see error_handling.py.
+          A connection failure or unauthorized token (Tier 2) is already recorded internally by send_poll() - nothing further to do here.
+        - On a successful send, registers a poll:<poll_id> Redis mapping and starts its AWAITING FIRST ANSWER / DEBOUNCING timer (see utils_telegram/utilities/poll_response_handler.py) - without this, an incoming poll_answer update has nothing to correlate back to.
     """
     if not question:
         logger.error(f"Poll payload for chat_id={chat_id} is missing a question. Message dropped.")
@@ -111,9 +106,8 @@ def _send_media_with_caption(send_func, attempted_type: str, task_id: str, chat_
     Notes:
         - Caption is cut to TELEGRAM_CAPTION_MAX_LENGTH; the remainder is sent as a follow-up message, only if the primary send succeeds.
         - A rejected primary send is reported as a Tier 1 delivery_failed event - see error_handling.py.
-          A connection failure or unauthorized token (Tier 2) is already recorded internally by
-          send_func - nothing further to do here. The follow-up remainder isn't itself
-          Tier 1-reported, to avoid a second event for what's really one logical send.
+          A connection failure or unauthorized token (Tier 2) is already recorded internally by send_func - nothing further to do here.
+          The follow-up remainder isn't itself Tier 1-reported, to avoid a second event for what's really one logical send.
     """
     if message and len(message) > settings.TELEGRAM_CAPTION_MAX_LENGTH:
         caption = message[:settings.TELEGRAM_CAPTION_MAX_LENGTH]
@@ -195,10 +189,9 @@ def _send_album_chunk(task_id: str, chat_id: int, chunk: list) -> None:
         None
 
     Notes:
-        - A rejected send is reported as a Tier 1 delivery_failed event, attempted_type="album" -
-          see error_handling.py. Applies even for a 1-item chunk sent via sendPhoto/sendVideo, since
-          it's still logically part of the album task. A connection failure or unauthorized token
-          (Tier 2) is already recorded internally - nothing further to do here.
+        - A rejected send is reported as a Tier 1 delivery_failed event, attempted_type="album" - see error_handling.py.
+          Applies even for a 1-item chunk sent via sendPhoto/sendVideo, since it's still logically part of the album task.
+          A connection failure or unauthorized token (Tier 2) is already recorded internally - nothing further to do here.
     """
     if len(chunk) < 2:
         item = chunk[0]
@@ -314,9 +307,8 @@ def _handle_text(task_id: str, chat_id: int, message: str, buttons: list[list[di
 
     Notes:
         - Falls back to a plain send_message() if buttons is missing/empty, or if every button fails to register.
-        - A rejected send (Telegram, or local validation - see send_message_with_buttons()) is reported
-          as a Tier 1 delivery_failed event - see error_handling.py. A connection failure or
-          unauthorized token (Tier 2) is already recorded internally - nothing further to do here.
+        - A rejected send (Telegram, or local validation - see send_message_with_buttons()) is reported as a Tier 1 delivery_failed event - see error_handling.py.
+          A connection failure or unauthorized token (Tier 2) is already recorded internally - nothing further to do here.
     """
     rows = _build_button_rows(chat_id, buttons) if buttons else []
     if rows:

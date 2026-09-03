@@ -1,7 +1,6 @@
 # =============================================================================
 # File        : button_prompt_handler.py
-# Description : File responsible for building inline-keyboard button prompts and
-#                validating the callback_query presses they generate.
+# Description : File responsible for building inline-keyboard button prompts and validating the callback_query presses they generate.
 # Author      : SorinoSSK
 # Created On  : 2026-09-01
 #
@@ -159,11 +158,9 @@ def send_message_with_buttons(chat_id: int | str, text: str, rows: list[list[dic
 
     Returns:
         bool | dict:
-            True if sent successfully. {"error": True, "status_code", "reason"} if either local
-            validation failed, or Telegram rejected the request (Tier 1 - see
-            utils_telegram/gateway_outbound.py module Notes; status_code is None for a local
-            validation failure, since no request was ever sent). False if unreachable or
-            unauthorized (Tier 2 - already recorded internally by send_message()).
+            True if sent successfully.
+            {"error": True, "status_code", "reason"} if either local validation failed, or Telegram rejected the request (Tier 1 - see utils_telegram/gateway_outbound.py module Notes; status_code is None for a local validation failure, since no request was ever sent).
+            False if unreachable or unauthorized (Tier 2 - already recorded internally by send_message()).
 
     Notes:
         - Fails closed (no send) if text exceeds TELEGRAM_MESSAGE_MAX_LENGTH or the keyboard fails validation - unlike caption overflow elsewhere, text is not split into a follow-up, since the buttons must stay attached to this one message.

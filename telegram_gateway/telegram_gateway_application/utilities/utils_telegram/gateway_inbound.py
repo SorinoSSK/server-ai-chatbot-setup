@@ -12,9 +12,7 @@
 # Notes       :
 #   - Uses Telegram's getUpdates long polling method, not webhooks.
 #   - Updates missing a chat_id/user_id, or from a chat not in TELEGRAM_ALLOWED_CHAT_IDS, are skipped (unauthorised chats get one reply - see utils_gatekeeper/gatekeeper.py).
-#   - poll_answer updates carry no chat_id of their own and are routed separately -
-#     see _handle_poll_answer() - correlating instead via the poll's own Redis mapping
-#     (see utils_telegram/utilities/poll_response_handler.py).
+#   - poll_answer updates carry no chat_id of their own and are routed separately - see _handle_poll_answer() - correlating instead via the poll's own Redis mapping (see utils_telegram/utilities/poll_response_handler.py).
 #   - Media without an instruction is staged as a Redis-backed draft (see utils_redis/database.py) until a text update finalises it, or it times out - see utilities/image_draft_handler.py.
 #   - Only one pending draft per chat_id at a time.
 #   - Album items (media_group_id) are never staged as a draft - the user is asked to resend one at a time; the reply is deduped per media_group_id.
@@ -48,12 +46,10 @@ logger = logging.getLogger(__name__)
 _stop_polling_event = ShutdownSignal()
 
 # Tracks failed attempts for the single update currently blocking offset advancement.
-# In-memory only - never holds more than one entry, since a retry-pending update
-# halts the batch (see poll_updates()) rather than letting others advance past it.
+# In-memory only - never holds more than one entry, since a retry-pending update halts the batch (see poll_updates()) rather than letting others advance past it.
 _update_attempts: dict[int, int] = {}
 
-# Dedupes the "please resend one at a time" album reply per media_group_id - Telegram
-# delivers each album item as its own separate update, all sharing one media_group_id.
+# Dedupes the "please resend one at a time" album reply per media_group_id - Telegram delivers each album item as its own separate update, all sharing one media_group_id.
 # In-memory only - only ever touched from poll_updates()'s single thread, no lock needed.
 _recent_media_groups: dict[str, float] = {}
 
@@ -299,13 +295,9 @@ def _handle_poll_answer(poll_answer: dict) -> None:
         None
 
     Notes:
-        - Carries no chat_id of its own - correlates back to one via the poll_id
-          mapping created when the poll was sent (see message_handler.py::_handle_poll()).
-          No separate TELEGRAM_ALLOWED_CHAT_IDS check is needed here, since that
-          mapping only ever exists for a poll the gateway itself sent to an
-          already-authorised chat.
-        - A poll_id with no active timer (unknown, already closed, or expired) is
-          logged and ignored, rather than treated as an error.
+        - Carries no chat_id of its own - correlates back to one via the poll_id mapping created when the poll was sent (see message_handler.py::_handle_poll()).
+          No separate TELEGRAM_ALLOWED_CHAT_IDS check is needed here, since that mapping only ever exists for a poll the gateway itself sent to an already-authorised chat.
+        - A poll_id with no active timer (unknown, already closed, or expired) is logged and ignored, rather than treated as an error.
     """
     poll_id = poll_answer.get("poll_id")
     user_id = (poll_answer.get("user") or {}).get("id")

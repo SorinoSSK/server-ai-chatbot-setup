@@ -17,6 +17,13 @@ from pathlib import Path
 # =============================================================================
 
 class Settings:
+    """
+    Loads and holds every environment-driven setting the application depends on.
+
+    Each setting falls back to a sensible default when its environment variable is unset or invalid.
+    A single instance (settings, below) is constructed once and imported everywhere else as the application's sole source of configuration.
+    """
+
     def __init__(self):
         # Application Common
         self.DATA_DIR = Path("/telegram_gateway/telegram_gateway_application/data")
@@ -79,11 +86,9 @@ class Settings:
         self.TELEGRAM_CALLBACK_TTL_SECONDS                      = get_env_int("TELEGRAM_CALLBACK_TTL_SECONDS", DEFAULT_TELEGRAM_CALLBACK_TTL_SECONDS)
 
         # Draft Handling (media received without an instruction yet - see utils_telegram/utilities/image_draft_handler.py)
-        # The draft is kept alive by a repeating "keep-alive" cycle: each cycle, a notice
-        # (with a "give me a little while more" button) is sent partway through; if the
-        # user doesn't press it (or finalise the draft) before the cycle ends, the draft
-        # expires. Pressing it grants one more cycle. The final cycle sends a
-        # button-less last notice instead, since DRAFT_CLOSE_SECONDS is a hard cap.
+        # The draft is kept alive by a repeating "keep-alive" cycle: each cycle, a notice (with a "give me a little while more" button) is sent partway through; if the user doesn't press it (or finalise the draft) before the cycle ends, the draft expires.
+        # Pressing it grants one more cycle.
+        # The final cycle sends a button-less last notice instead, since DRAFT_CLOSE_SECONDS is a hard cap.
         DEFAULT_DRAFT_CLOSE_SECONDS                             = 3300   # 55 min hard cap across all cycles (Telegram's file link is only guaranteed for 1 hour)
         DEFAULT_DRAFT_CYCLE_SECONDS                             = 300    # length of one keep-alive cycle (5 min)
         DEFAULT_DRAFT_CYCLE_NOTICE_LEAD_SECONDS                 = 180    # notice sent this long before each cycle ends (3 min - i.e. 2 min into a 5 min cycle)
@@ -98,16 +103,11 @@ class Settings:
         self.MEDIA_GROUP_DEDUPE_SECONDS                         = get_env_int("MEDIA_GROUP_DEDUPE_SECONDS", DEFAULT_MEDIA_GROUP_DEDUPE_SECONDS)
 
         # Poll Handling (poll -> poll_answer correlation - see utils_telegram/utilities/poll_response_handler.py)
-        # A poll is always sent non-anonymous (TELEGRAM_POLL_ANONYMOUS), so an answer
-        # can be attributed to its responder. Two phases per poll, governed by one
-        # in-memory timer:
-        #   - AWAITING FIRST ANSWER (POLL_TIMEOUT_SECONDS): closes with a chat
-        #     message if nobody answers in time. No queue push.
-        #   - DEBOUNCING (POLL_DEBOUNCE_INITIAL_SECONDS, shortened to
-        #     POLL_DEBOUNCE_SUBSEQUENT_SECONDS on every further answer): once
-        #     answered, compiles and pushes the latest answer once things go quiet -
-        #     capped overall by POLL_GLOBAL_CAP_SECONDS from poll creation, regardless
-        #     of how many times debouncing resets.
+        # A poll is always sent non-anonymous (TELEGRAM_POLL_ANONYMOUS), so an answer can be attributed to its responder.
+        # Two phases per poll, governed by one in-memory timer:
+        #   - AWAITING FIRST ANSWER (POLL_TIMEOUT_SECONDS): closes with a chat message if nobody answers in time.
+        #     No queue push.
+        #   - DEBOUNCING (POLL_DEBOUNCE_INITIAL_SECONDS, shortened to POLL_DEBOUNCE_SUBSEQUENT_SECONDS on every further answer): once answered, compiles and pushes the latest answer once things go quiet - capped overall by POLL_GLOBAL_CAP_SECONDS from poll creation, regardless of how many times debouncing resets.
         DEFAULT_TELEGRAM_POLL_ANONYMOUS                         = False
         DEFAULT_POLL_TIMEOUT_SECONDS                            = 300  # 5 min hard cap while awaiting a first answer
         DEFAULT_POLL_DEBOUNCE_INITIAL_SECONDS                   = 120  # 2 min debounce after the first answer
@@ -122,10 +122,8 @@ class Settings:
         self.POLL_MAPPING_TTL_SECONDS                           = get_env_int("POLL_MAPPING_TTL_SECONDS", DEFAULT_POLL_MAPPING_TTL_SECONDS)
 
         # Error Handling (Tier 1/Tier 2 delivery failures - see utils_queue/error_handling.py)
-        # Tier 2's "unreachable" alert only fires once this many consecutive
-        # connection-level send failures (across all sends) have accumulated - a
-        # single blip is expected noise, not a systemic signal. A 401 ("unauthorized")
-        # bypasses this and fires immediately regardless.
+        # Tier 2's "unreachable" alert only fires once this many consecutive connection-level send failures (across all sends) have accumulated - a single blip is expected noise, not a systemic signal.
+        # A 401 ("unauthorized") bypasses this and fires immediately regardless.
         DEFAULT_GATEWAY_ALERT_FAILURE_THRESHOLD                 = 5
         self.GATEWAY_ALERT_FAILURE_THRESHOLD                    = get_env_int("GATEWAY_ALERT_FAILURE_THRESHOLD", DEFAULT_GATEWAY_ALERT_FAILURE_THRESHOLD)
 

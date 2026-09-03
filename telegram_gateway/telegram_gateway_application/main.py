@@ -5,8 +5,7 @@
 # Created On  : 2026-08-29
 #
 # Features    :
-#   - Initialises RabbitMQ and starts the RabbitMQ consumer and Telegram long
-#     polling loop, each on its own thread.
+#   - Initialises RabbitMQ and starts the RabbitMQ consumer and Telegram long polling loop, each on its own thread.
 #   - Performs a graceful shutdown of both threads on SIGINT/SIGTERM.
 #
 # =============================================================================
@@ -34,6 +33,17 @@ _shutdown_event = ShutdownSignal()
 # M A I N
 
 def main():
+    """
+    Runs the Telegram Gateway application for its entire process lifetime.
+
+    Registers shutdown signal handlers, initialises the application, then blocks the main thread until a shutdown signal is received before terminating.
+
+    Args:
+        None
+
+    Returns:
+        None
+    """
     logger.info("Starting Telegram Gateway...")
 
     signal.signal(signal.SIGINT, _shutdown_event.handle_signal)

@@ -1,40 +1,22 @@
 # =============================================================================
 # File        : image_draft_handler.py
-# Description : File responsible for warning about and closing a pending draft
-#                (media received without an instruction yet).
+# Description : File responsible for warning about and closing a pending draft (media received without an instruction yet).
 # Author      : SorinoSSK
 # Created On  : 2026-08-31
 #
 # Features    :
-#   - Runs a per-chat_id background loop keeping a pending draft alive through a
-#     fixed schedule of repeating "keep-alive" cycles (DRAFT_CLOSE_SECONDS worth,
-#     in DRAFT_CYCLE_SECONDS segments). Each cycle shows "typing...", then sends
-#     a notice partway through asking the user to press a button if they need
-#     more time; then, if unanswered, shows "typing..." again immediately before
-#     the cycle ends - moving on to the next scheduled cycle regardless, unless
-#     this was the final one, in which case the draft closes.
-#   - Pressing the button sends an acknowledgement and skips ahead to the next
-#     cycle immediately, instead of waiting out the rest of the current one; the
-#     final cycle's notice has no button instead, since it's the last one - if
-#     that goes unanswered too, the draft closes.
-#   - close_orphaned_drafts() sweeps Redis on startup for drafts left behind by a
-#     keep-alive loop that did not survive the previous run (e.g. an app restart),
-#     closing each one out immediately rather than leaving it silently pending.
+#   - Runs a per-chat_id background loop keeping a pending draft alive through a fixed schedule of repeating "keep-alive" cycles (DRAFT_CLOSE_SECONDS worth, in DRAFT_CYCLE_SECONDS segments).
+#     Each cycle shows "typing...", then sends a notice partway through asking the user to press a button if they need more time; then, if unanswered, shows "typing..." again immediately before the cycle ends - moving on to the next scheduled cycle regardless, unless this was the final one, in which case the draft closes.
+#   - Pressing the button sends an acknowledgement and skips ahead to the next cycle immediately, instead of waiting out the rest of the current one; the final cycle's notice has no button instead, since it's the last one - if that goes unanswered too, the draft closes.
+#   - close_orphaned_drafts() sweeps Redis on startup for drafts left behind by a keep-alive loop that did not survive the previous run (e.g. an app restart), closing each one out immediately rather than leaving it silently pending.
 #
 # Notes       :
 #   - In-memory only - not persisted. Redis-side draft record has its own TTL as backstop.
-#   - Per cycle (length DRAFT_CYCLE_SECONDS), two "typing..." windows, each
-#     DRAFT_TYPING_LEAD_SECONDS long, immediately precede the two messages a
-#     cycle can send:
-#       - the notice, at DRAFT_CYCLE_SECONDS-DRAFT_CYCLE_NOTICE_LEAD_SECONDS
-#         into the cycle.
-#       - the close message, at DRAFT_CYCLE_SECONDS into the cycle - only sent
-#         on the final cycle, if it ends with no response.
-#   - A button press at any point up to the cycle's end (including during the
-#     second "typing..." window) skips ahead to the next cycle immediately.
-#   - Total draft lifetime is capped at DRAFT_CLOSE_SECONDS, since the schedule
-#     of cycles is fixed regardless of button presses - the final cycle offers
-#     no button, since no further cycle remains to skip ahead to.
+#   - Per cycle (length DRAFT_CYCLE_SECONDS), two "typing..." windows, each DRAFT_TYPING_LEAD_SECONDS long, immediately precede the two messages a cycle can send:
+#       - the notice, at DRAFT_CYCLE_SECONDS-DRAFT_CYCLE_NOTICE_LEAD_SECONDS into the cycle.
+#       - the close message, at DRAFT_CYCLE_SECONDS into the cycle - only sent on the final cycle, if it ends with no response.
+#   - A button press at any point up to the cycle's end (including during the second "typing..." window) skips ahead to the next cycle immediately.
+#   - Total draft lifetime is capped at DRAFT_CLOSE_SECONDS, since the schedule of cycles is fixed regardless of button presses - the final cycle offers no button, since no further cycle remains to skip ahead to.
 #
 # =============================================================================
 # I M P O R T   H E A D E R
@@ -107,6 +89,16 @@ _ACCEPT_MESSAGES = [
 # =============================================================================
 
 def _typing_key(chat_id: int) -> str:
+    """
+    Builds the typing_indicator.py registry key used for a draft's "typing..." pings, distinct from a task_id's own key.
+
+    Args:
+        chat_id (int)
+
+    Returns:
+        str:
+            The key used to start/stop the typing indicator for this draft.
+    """
     return f"draft:{chat_id}"
 
 def _random_message(messages: list[str]) -> str:
@@ -241,16 +233,10 @@ def _draft_loop(chat_id: int, media_type: str, control: dict) -> None:
         None
 
     Notes:
-        - Each cycle has two "typing... -> message" beats: a silent wait, "typing...",
-          then the notice (with a continue button, except on the final cycle); then
-          another silent wait, "typing..." again, then - if still unanswered - the
-          cycle ends.
-        - An unanswered non-final cycle does not close the draft - it simply moves on
-          to the next scheduled cycle, which sends its own notice in turn. Only an
-          unanswered final cycle actually closes the draft.
-        - A continue button press at any point up to the cycle's end sends an
-          acknowledgement and immediately moves on to the next cycle, skipping the
-          rest of the current cycle's wait - it does not carry over unused time.
+        - Each cycle has two "typing... -> message" beats: a silent wait, "typing...", then the notice (with a continue button, except on the final cycle); then another silent wait, "typing..." again, then - if still unanswered - the cycle ends.
+        - An unanswered non-final cycle does not close the draft - it simply moves on to the next scheduled cycle, which sends its own notice in turn.
+          Only an unanswered final cycle actually closes the draft.
+        - A continue button press at any point up to the cycle's end sends an acknowledgement and immediately moves on to the next cycle, skipping the rest of the current cycle's wait - it does not carry over unused time.
         - Uses control["event"].wait() throughout so an early stop cancels immediately.
     """
     event = control["event"]
@@ -369,13 +355,9 @@ def close_orphaned_drafts() -> None:
         None
 
     Notes:
-        - Intended to be called once on startup, before polling begins. A draft's
-          keep-alive loop is in-memory only (see module Notes above), so it does not
-          survive an application restart - without this sweep, such a draft would sit
-          silently until its Redis TTL lapses, with no notice or close message ever sent.
-        - Since the loop's progress (cycle index, extensions used) isn't persisted,
-          an orphaned draft is closed out immediately rather than resumed part-way
-          through a cycle.
+        - Intended to be called once on startup, before polling begins.
+          A draft's keep-alive loop is in-memory only (see module Notes above), so it does not survive an application restart - without this sweep, such a draft would sit silently until its Redis TTL lapses, with no notice or close message ever sent.
+        - Since the loop's progress (cycle index, extensions used) isn't persisted, an orphaned draft is closed out immediately rather than resumed part-way through a cycle.
     """
     chat_ids = get_all_chat_draft_ids()
     if not chat_ids:

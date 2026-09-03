@@ -330,8 +330,7 @@ def get_all_chat_draft_ids() -> list[int]:
             chat_ids with a draft:<chat_id> key present; empty list on failure.
 
     Notes:
-        - Used on startup to sweep up drafts whose in-memory keep-alive timer did not
-          survive an application restart (see utils_telegram/utilities/image_draft_handler.py).
+        - Used on startup to sweep up drafts whose in-memory keep-alive timer did not survive an application restart (see utils_telegram/utilities/image_draft_handler.py).
         - Uses SCAN (not KEYS) so it doesn't block Redis on a large keyspace.
     """
     try:
@@ -410,8 +409,8 @@ def create_poll_mapping(poll_id: str, chat_id: int, task_id: str, message_id: in
     Notes:
         - Stored as poll:<poll_id> -> json {chat_id, task_id, message_id, user_id, option_ids}.
         - user_id/option_ids start empty - unknown until a poll_answer update arrives - see update_poll_answer().
-        - Writes with nx=True. TTL is a Redis-side backstop beyond the poll's hard cap
-          (see utils_telegram/utilities/poll_response_handler.py) in case the in-memory timer is lost.
+        - Writes with nx=True.
+          TTL is a Redis-side backstop beyond the poll's hard cap (see utils_telegram/utilities/poll_response_handler.py) in case the in-memory timer is lost.
     """
     value = json.dumps({
         "chat_id": chat_id,
@@ -484,11 +483,8 @@ def update_poll_answer(poll_id: str, user_id: int, option_ids: list) -> bool:
             True if updated successfully; otherwise False (including an unknown poll_id).
 
     Notes:
-        - Overwrites user_id/option_ids with the latest state - see poll_response_handler.py
-          for how repeated answers (debounced) are handled.
-        - Refreshes the TTL back to settings.POLL_MAPPING_TTL_SECONDS on every call, since
-          this record is the restart-recovery backstop for whatever the poll's actual latest
-          answer is - see close_orphaned_polls().
+        - Overwrites user_id/option_ids with the latest state - see poll_response_handler.py for how repeated answers (debounced) are handled.
+        - Refreshes the TTL back to settings.POLL_MAPPING_TTL_SECONDS on every call, since this record is the restart-recovery backstop for whatever the poll's actual latest answer is - see close_orphaned_polls().
     """
     mapping = get_poll_mapping(poll_id)
     if mapping is None:
@@ -524,8 +520,7 @@ def get_all_poll_ids() -> list[str]:
             poll_ids with a poll:<poll_id> key present; empty list on failure.
 
     Notes:
-        - Used on startup to sweep up polls whose in-memory timer did not survive an
-          application restart (see utils_telegram/utilities/poll_response_handler.py).
+        - Used on startup to sweep up polls whose in-memory timer did not survive an application restart (see utils_telegram/utilities/poll_response_handler.py).
         - Uses SCAN (not KEYS) so it doesn't block Redis on a large keyspace.
     """
     try:

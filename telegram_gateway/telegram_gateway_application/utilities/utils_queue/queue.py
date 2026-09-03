@@ -27,9 +27,7 @@ from .message_handler import process_message
 
 logger = logging.getLogger(__name__)
 
-# Publish and consume each use their own dedicated connection, confined to their own
-# thread (publish: caller's thread, consume: _consumer_thread), since a pika
-# BlockingConnection must not be shared or used concurrently across threads.
+# Publish and consume each use their own dedicated connection, confined to their own thread (publish: caller's thread, consume: _consumer_thread), since a pika BlockingConnection must not be shared or used concurrently across threads.
 _lock_publish = threading.RLock()
 _lock_consume = threading.RLock()
 
@@ -42,14 +40,23 @@ _channel_consume = None
 _consumer_thread = None
 _consumer_running = False
 
-# Tracks failed attempts per message body, so a deterministically-failing message is
-# eventually dropped instead of being requeued forever. In-memory only - only ever
-# touched from the single consumer thread (pika callbacks run sequentially), no lock needed.
+# Tracks failed attempts per message body, so a deterministically-failing message is eventually dropped instead of being requeued forever.
+# In-memory only - only ever touched from the single consumer thread (pika callbacks run sequentially), no lock needed.
 _message_attempts: dict[bytes, int] = {}
 
 # =============================================================================
 
 def _build_rabbitmq_parameters() -> pika.ConnectionParameters:
+    """
+    Builds the connection parameters shared by both the publish and consume RabbitMQ connections.
+
+    Args:
+        None
+
+    Returns:
+        pika.ConnectionParameters:
+            Parameters built from the application's RabbitMQ configuration.
+    """
     credentials = pika.PlainCredentials(settings.Q_USER, settings.Q_PASSWORD)
     return pika.ConnectionParameters(
         host=settings.Q_HOST,
@@ -396,3 +403,5 @@ def stop_queue_consumer():
                 _connection_consume.add_callback_threadsafe(_channel_consume.stop_consuming)
             except Exception:
                 logger.exception("Failed to schedule RabbitMQ consumer stop.")
+
+# =============================================================================

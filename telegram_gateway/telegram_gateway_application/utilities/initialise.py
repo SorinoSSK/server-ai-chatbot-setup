@@ -62,8 +62,7 @@ def initialise_application() -> None:
     # Initialise Redis - required before polling starts, since poll_updates() uses it for task mapping.
     initialise_redis_connection()
 
-    # Close out any draft left behind by a previous run before new messages can arrive -
-    # its in-memory keep-alive timer did not survive the restart (see image_draft_handler.py).
+    # Close out any draft left behind by a previous run before new messages can arrive - its in-memory keep-alive timer did not survive the restart (see image_draft_handler.py).
     close_orphaned_drafts()
 
     # Same as above, for any poll left behind by a previous run - see poll_response_handler.py.
