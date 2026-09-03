@@ -43,13 +43,8 @@ def log_sanitised_exception(message: str) -> None:
         None
 
     Notes:
-        - requests/urllib3 exceptions (ConnectionError, Timeout, HTTPError, etc.) routinely
-          embed the full request URL - including settings.TELEGRAM_BOT_TOKEN - in their
-          message text. logger.exception() would write that token straight into the log
-          files (CWE-532 / CWE-522 - see NON_COMPLIANCE_REPORT.md CCR-001). Use this instead
-          of logger.exception() anywhere a Telegram Bot API request may have failed.
-        - Logged at ERROR level (not exc_info=True) since the traceback text itself is
-          rendered and redacted manually here.
+        - requests/urllib3 exceptions (ConnectionError, Timeout, HTTPError, etc.) routinely embed the full request URL - including settings.TELEGRAM_BOT_TOKEN - in their message text. logger.exception() would write that token straight into the log files (CWE-532 / CWE-522 - see NON_COMPLIANCE_REPORT.md CCR-001). Use this instead of logger.exception() anywhere a Telegram Bot API request may have failed.
+        - Logged at ERROR level (not exc_info=True) since the traceback text itself is rendered and redacted manually here.
     """
     redacted_traceback = traceback.format_exc().replace(settings.TELEGRAM_BOT_TOKEN, "***REDACTED***")
     logger.error(f"{message}\n{redacted_traceback}")

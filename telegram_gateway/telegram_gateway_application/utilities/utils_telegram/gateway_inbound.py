@@ -6,8 +6,7 @@
 #
 # Features    :
 #   - Long-polls the Telegram Bot API for new updates (messages, button presses, poll answers, etc.)
-#   - Resolves incoming photo/video/document to a fetchable URL and stages it as a
-#     pending draft until an instruction (text) arrives, or the draft times out.
+#   - Resolves incoming photo/video/document to a fetchable URL and stages it as a pending draft until an instruction (text) arrives, or the draft times out.
 #
 # Notes       :
 #   - Uses Telegram's getUpdates long polling method, not webhooks.
@@ -114,10 +113,7 @@ def _summarise_update(update: dict) -> dict:
             {"update_id", "event_type"}.
 
     Notes:
-        - Logging the raw update dict risks writing sender PII (name, username, phone
-          number for a shared contact) and free-text message content to disk logs -
-          see NON_COMPLIANCE_REPORT.md CCR-002. Use this summary in log statements instead
-          of the raw update.
+        - Logging the raw update dict risks writing sender PII (name, username, phone number for a shared contact) and free-text message content to disk logs - see NON_COMPLIANCE_REPORT.md CCR-002. Use this summary in log statements instead of the raw update.
     """
     if "message" in update:
         event_type = "message"

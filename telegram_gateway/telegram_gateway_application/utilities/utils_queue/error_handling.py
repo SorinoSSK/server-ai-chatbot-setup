@@ -44,8 +44,7 @@ def push_tier1_delivery_failed(task_id: str, attempted_type: str, status_code: i
             "image" | "video" | "album" | "file" | "text" | "poll".
 
         status_code (int | None):
-            Telegram's HTTP status code, if the request reached Telegram; otherwise
-            None (e.g. a local validation failure caught before any request was sent).
+            Telegram's HTTP status code, if the request reached Telegram; otherwise None (e.g. a local validation failure caught before any request was sent).
 
         reason (str):
             Telegram's own error description, or a local validation failure message.

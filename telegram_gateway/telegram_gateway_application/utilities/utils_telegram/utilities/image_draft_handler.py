@@ -183,8 +183,7 @@ def _send_close_message(chat_id: int, media_type: str) -> None:
         None
 
     Notes:
-        - Shared by _draft_loop()'s own hard-close and close_orphaned_drafts(), so both
-          close a draft out identically.
+        - Shared by _draft_loop()'s own hard-close and close_orphaned_drafts(), so both close a draft out identically.
     """
     send_message(
         chat_id,
@@ -206,8 +205,7 @@ def _consume_continue(control: dict, is_final_cycle: bool) -> bool:
 
     Returns:
         bool:
-            True if a valid "continue" signal was consumed (event cleared, action reset);
-            otherwise False, leaving control untouched.
+            True if a valid "continue" signal was consumed (event cleared, action reset); otherwise False, leaving control untouched.
     """
     if control["action"] == "continue" and not is_final_cycle:
         control["event"].clear()

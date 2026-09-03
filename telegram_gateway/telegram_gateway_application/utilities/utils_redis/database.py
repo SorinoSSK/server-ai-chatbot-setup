@@ -405,8 +405,7 @@ def create_poll_mapping(poll_id: str, chat_id: int, task_id: str, message_id: in
         task_id (str)
 
         message_id (int):
-            The poll message's message_id - required to close it later via stopPoll (which
-            takes chat_id + message_id, not poll_id).
+            The poll message's message_id - required to close it later via stopPoll (which takes chat_id + message_id, not poll_id).
 
     Returns:
         bool:

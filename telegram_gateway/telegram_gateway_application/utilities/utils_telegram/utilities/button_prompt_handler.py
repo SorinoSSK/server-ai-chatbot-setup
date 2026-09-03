@@ -5,17 +5,13 @@
 # Created On  : 2026-09-01
 #
 # Features    :
-#   - Validates an inline keyboard against the Bot API's size limits (message length,
-#     buttons per row, total buttons, callback_data byte length).
-#   - Registers each button's callback_data against a purpose/chat_id/payload, generic
-#     to any feature that wants to issue buttons (not specific to draft expiry).
-#   - Validates an incoming callback_query.data as genuinely bot-issued, consuming it
-#     so each press is single-use.
+#   - Validates an inline keyboard against the Bot API's size limits (message length, buttons per row, total buttons, callback_data byte length).
+#   - Registers each button's callback_data against a purpose/chat_id/payload, generic to any feature that wants to issue buttons (not specific to draft expiry).
+#   - Validates an incoming callback_query.data as genuinely bot-issued, consuming it so each press is single-use.
 #
 # Notes       :
 #   - In-memory only - not persisted, resets on application restart.
-#   - Locked because registration can happen from either the poll thread or the
-#     RabbitMQ consumer thread, while validation happens on the poll thread.
+#   - Locked because registration can happen from either the poll thread or the RabbitMQ consumer thread, while validation happens on the poll thread.
 #
 # =============================================================================
 # I M P O R T   H E A D E R

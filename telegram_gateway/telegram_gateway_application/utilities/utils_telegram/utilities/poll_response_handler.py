@@ -53,8 +53,7 @@ def _push_poll_answer(task_id: str, user_id: int | None, option_ids: list) -> No
         task_id (str)
 
         user_id (int | None):
-            The responder's id - for the Debate Orchestrator's use only (see
-            AI_AGENT_ARCHITECTURE.md); never forwarded on to the LLM agents.
+            The responder's id - for the Debate Orchestrator's use only (see AI_AGENT_ARCHITECTURE.md); never forwarded on to the LLM agents.
 
         option_ids (list)
 
@@ -128,8 +127,7 @@ def handle_poll_answer(poll_id: str, user_id: int, option_ids: list) -> bool:
 
     Returns:
         bool:
-            True if poll_id was an active, tracked poll and the answer was recorded;
-            otherwise False (unknown/already-closed poll_id, or a Redis write failure).
+            True if poll_id was an active, tracked poll and the answer was recorded; otherwise False (unknown/already-closed poll_id, or a Redis write failure).
     """
     with _lock:
         control = _active_polls.get(poll_id)
@@ -196,8 +194,7 @@ def start_poll_timer(poll_id: str, chat_id: int) -> None:
         poll_id (str)
 
         chat_id (int):
-            Unused directly - kept for logging context only; all state is read from
-            the poll's Redis mapping (see create_poll_mapping()).
+            Unused directly - kept for logging context only; all state is read from the poll's Redis mapping (see create_poll_mapping()).
 
     Returns:
         None
