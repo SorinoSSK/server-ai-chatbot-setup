@@ -333,16 +333,18 @@ A photo/video/document arriving **without** a caption, or with one but no furthe
 - Whether the finalising text still applies to the pending media (e.g. the user changed their mind) is not decided by the gateway - it always attaches the draft's media to whatever text finalises it; that judgement call is left to the backend.
 
 **Timeout**, per draft, is a repeating keep-alive cycle rather than a single countdown (see `utils_telegram/utilities/image_draft_handler.py`).
-Each cycle is `DRAFT_CYCLE_SECONDS` long (5 min by default) and has two "typing..." windows, one immediately before each of the two messages a cycle can send:
+Each cycle is `DRAFT_CYCLE_SECONDS` long (5 min by default) and has exactly one "typing..." window, immediately before the one message a cycle sends:
 - `DRAFT_CYCLE_SECONDS - DRAFT_CYCLE_NOTICE_LEAD_SECONDS - DRAFT_TYPING_LEAD_SECONDS` into the cycle (1 min by default): a "typing..." indicator starts.
 - `DRAFT_CYCLE_SECONDS - DRAFT_CYCLE_NOTICE_LEAD_SECONDS` into the cycle (2 min by default): typing stops, a notice is sent asking if the user needs more time, with a "Give me a little while more" button attached.
-- `DRAFT_CYCLE_SECONDS - DRAFT_TYPING_LEAD_SECONDS` into the cycle (4 min by default): if the button still hasn't been pressed, "typing..." starts again.
-- `DRAFT_CYCLE_SECONDS` into the cycle (5 min by default): typing stops.
-  If the button wasn't pressed by now (and the draft wasn't finalised), the cycle simply ends and the **next** scheduled cycle begins - sending its own notice at its own 2 min mark, and so on - **unless** this was the final cycle, in which case the draft is cleared and the user is told the bot will get to it later.
+- From there until `DRAFT_CYCLE_SECONDS` into the cycle (5 min by default): a further silent wait, with **no** typing indicator, watching for the button to be pressed.
+  A press is acknowledged immediately but does **not** shorten this wait - it plays out in full regardless, same as if the button were never pressed.
 
-The number of cycles is fixed by `DRAFT_CLOSE_SECONDS / DRAFT_CYCLE_SECONDS` (11 cycles at the defaults above, i.e. 55 min total - kept comfortably under Telegram's 1-hour file link guarantee) and runs its course regardless of whether the button is ever pressed.
-Pressing the button at any point up to a cycle's end (including during the second "typing..." window) sends a short acknowledgement and **skips ahead** to the next scheduled cycle immediately, instead of waiting out the rest of the current one - it does not add extra cycles beyond the fixed total.
-The final cycle's notice has no button instead, since there's no further cycle to skip ahead to - if it still isn't finalised by the end of that cycle, the draft is cleared the same way.
+**Whether the button was pressed at any point during that cycle is what decides what happens once the cycle's full 5 minutes has elapsed:**
+- **Pressed at least once** → the draft proceeds to its next scheduled cycle, which repeats the same pattern from its own start (its own 1 min typing, 2 min notice, silent wait to its own close point).
+- **Never pressed** → the draft closes at the end of this cycle, the same way an unanswered final cycle does - it does **not** silently continue to the next scheduled cycle.
+
+The final cycle's notice has no button at all, since there's no further cycle to reach - it always closes at its own end, regardless of response.
+The number of cycles is capped by `DRAFT_CLOSE_SECONDS / DRAFT_CYCLE_SECONDS` (11 cycles at the defaults above, i.e. 55 min total - kept comfortably under Telegram's 1-hour file link guarantee), but that ceiling is only reached if the button is pressed on every single cycle along the way; a draft that's never answered at all closes after just its first cycle (5 min by default).
 
 The keep-alive cycle above is **in-memory only** - it does not survive an application restart, though the Redis-backed draft record itself does (it has its own TTL, `DRAFT_MAPPING_TTL_SECONDS`, slightly beyond `DRAFT_CLOSE_SECONDS`, as a backstop).
 Since the loop's progress isn't persisted, a restart would otherwise leave a draft silently pending with no further notices and no close message, for up to that TTL.
