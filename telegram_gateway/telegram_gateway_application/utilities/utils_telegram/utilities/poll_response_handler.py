@@ -27,7 +27,13 @@ import threading
 
 from ....config import settings
 from ..gateway_outbound import send_message, stop_poll
-from ...utils_redis.database import get_poll_mapping, update_poll_answer, delete_poll_mapping, get_all_poll_ids, generate_session
+from ...utils_redis.database import (
+    get_poll_mapping,
+    update_poll_answer,
+    delete_poll_mapping,
+    get_all_poll_ids,
+    generate_session
+)
 
 # =============================================================================
 # G L O B A L   V A R I A B L E
@@ -64,8 +70,7 @@ def _push_poll_answer(task_id: str, option_ids: list) -> None:
     if not session_id:
         logger.error(f"Failed to resolve session_id for task_id={task_id}. Poll answer dropped.")
         return
-
-    if not queue_push_task({
+    elif not queue_push_task({
         "task_id": task_id,
         "session_id": session_id,
         "text": "",
@@ -75,6 +80,8 @@ def _push_poll_answer(task_id: str, option_ids: list) -> None:
         "poll_answer": option_ids
     }):
         logger.error(f"Failed to push poll answer for task_id={task_id} to RabbitMQ. Message dropped.")
+    else:
+        logger.info(f"Pushed poll answer for task_id={task_id} to RabbitMQ.")
 
 def _push_poll_timed_out(task_id: str) -> None:
     """
@@ -98,13 +105,14 @@ def _push_poll_timed_out(task_id: str) -> None:
     if not session_id:
         logger.error(f"Failed to resolve session_id for task_id={task_id}. poll_timed_out event dropped.")
         return
-
-    if not queue_push_task({
+    elif not queue_push_task({
         "task_id": task_id,
         "session_id": session_id,
         "type": "poll_timed_out"
     }):
         logger.error(f"Failed to push poll_timed_out event for task_id={task_id} to RabbitMQ. Event dropped.")
+    else:
+        logger.info(f"Pushed poll_timed_out event for task_id={task_id} to RabbitMQ.")
 
 def _finalise_poll(poll_id: str, mapping: dict) -> None:
     """
@@ -162,16 +170,15 @@ def handle_poll_answer(poll_id: str, user_id: int, option_ids: list) -> bool:
     with _lock:
         control = _active_polls.get(poll_id)
 
-    if control is None:
-        return False
-
-    if not update_poll_answer(poll_id, user_id, option_ids):
-        logger.error(f"Failed to persist poll answer for poll_id={poll_id}. Answer not recorded.")
-        return False
-
-    control["event"].set()
-    logger.info(f"Recorded poll answer for poll_id={poll_id} (user_id={user_id}).")
-    return True
+        if control is None:
+            return False
+        elif not update_poll_answer(poll_id, user_id, option_ids):
+            logger.error(f"Failed to persist poll answer for poll_id={poll_id}. Answer not recorded.")
+            return False
+        else:
+            control["event"].set()
+            logger.info(f"Recorded poll answer for poll_id={poll_id} (user_id={user_id}).")
+            return True
 
 def _poll_loop(poll_id: str, control: dict) -> None:
     """
@@ -199,34 +206,36 @@ def _poll_loop(poll_id: str, control: dict) -> None:
             _active_polls.pop(poll_id, None)
         logger.info(f"Poll timer for poll_id={poll_id} stopped by a session reset.")
         return
-    if not answered:
+    elif not answered:
         with _lock:
             _active_polls.pop(poll_id, None)
         mapping = get_poll_mapping(poll_id)
         if mapping is not None:
             _finalise_poll(poll_id, mapping)
         return
-    event.clear()
-
-    deadline = min(time.monotonic() + settings.POLL_DEBOUNCE_INITIAL_SECONDS, started_at + settings.POLL_GLOBAL_CAP_SECONDS)
-    while True:
-        wait_seconds = max(0, deadline - time.monotonic())
-        answered_again = event.wait(wait_seconds)
-        if control.get("stop"):
-            with _lock:
-                _active_polls.pop(poll_id, None)
-            logger.info(f"Poll timer for poll_id={poll_id} stopped by a session reset.")
-            return
-        if not answered_again:
-            break
+    else:
         event.clear()
-        deadline = min(time.monotonic() + settings.POLL_DEBOUNCE_SUBSEQUENT_SECONDS, started_at + settings.POLL_GLOBAL_CAP_SECONDS)
 
-    with _lock:
-        _active_polls.pop(poll_id, None)
-    mapping = get_poll_mapping(poll_id)
-    if mapping is not None:
-        _finalise_poll(poll_id, mapping)
+        deadline = min(time.monotonic() + settings.POLL_DEBOUNCE_INITIAL_SECONDS, started_at + settings.POLL_GLOBAL_CAP_SECONDS)
+        while True:
+            wait_seconds = max(0, deadline - time.monotonic())
+            answered_again = event.wait(wait_seconds)
+            if control.get("stop"):
+                with _lock:
+                    _active_polls.pop(poll_id, None)
+                logger.info(f"Poll timer for poll_id={poll_id} stopped by a session reset.")
+                return
+            elif not answered_again:
+                break
+            else:
+                event.clear()
+                deadline = min(time.monotonic() + settings.POLL_DEBOUNCE_SUBSEQUENT_SECONDS, started_at + settings.POLL_GLOBAL_CAP_SECONDS)
+
+        with _lock:
+            _active_polls.pop(poll_id, None)
+        mapping = get_poll_mapping(poll_id)
+        if mapping is not None:
+            _finalise_poll(poll_id, mapping)
 
 def start_poll_timer(poll_id: str, chat_id: int) -> None:
     """
@@ -247,9 +256,9 @@ def start_poll_timer(poll_id: str, chat_id: int) -> None:
     with _lock:
         if poll_id in _active_polls:
             return
-
-        control = {"event": threading.Event(), "stop": False}
-        _active_polls[poll_id] = control
+        else:
+            control = {"event": threading.Event(), "stop": False}
+            _active_polls[poll_id] = control
 
     threading.Thread(
         target=_poll_loop,
@@ -275,21 +284,20 @@ def stop_poll_for_reset(poll_id: str) -> None:
     """
     with _lock:
         control = _active_polls.get(poll_id)
-
-    if control is not None:
-        control["stop"] = True
-        control["event"].set()
+        if control is not None:
+            control["stop"] = True
+            control["event"].set()
 
     mapping = get_poll_mapping(poll_id)
     if mapping is None:
         return
+    else:
+        chat_id = mapping.get("chat_id")
+        message_id = mapping.get("message_id")
 
-    chat_id = mapping.get("chat_id")
-    message_id = mapping.get("message_id")
-
-    stop_poll(chat_id, message_id)
-    delete_poll_mapping(poll_id, chat_id)
-    logger.info(f"Closed poll_id={poll_id} for chat_id={chat_id} as part of a session reset (no answer pushed).")
+        stop_poll(chat_id, message_id)
+        delete_poll_mapping(poll_id, chat_id)
+        logger.info(f"Closed poll_id={poll_id} for chat_id={chat_id} as part of a session reset (no answer pushed).")
 
 def close_orphaned_polls() -> None:
     """
@@ -309,13 +317,13 @@ def close_orphaned_polls() -> None:
     poll_ids = get_all_poll_ids()
     if not poll_ids:
         return
-
-    for poll_id in poll_ids:
-        mapping = get_poll_mapping(poll_id)
-        if mapping is None:
-            continue
-
-        _finalise_poll(poll_id, mapping)
-        logger.info(f"Closed orphaned poll_id={poll_id} left behind by a previous run.")
+    else:
+        for poll_id in poll_ids:
+            mapping = get_poll_mapping(poll_id)
+            if mapping is None:
+                continue
+            else:
+                _finalise_poll(poll_id, mapping)
+                logger.info(f"Closed orphaned poll_id={poll_id} left behind by a previous run.")
 
 # =============================================================================

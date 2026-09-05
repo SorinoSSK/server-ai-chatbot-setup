@@ -10,7 +10,10 @@
 | **Follow-up Review Date** | 2026-09-04 — scoped to the `user_id`-removal / permanent `session_id` change (CCR-012–CCR-014) |
 | **Second Follow-up Review Date** | 2026-09-05 — scoped to `TODO.md`'s graceful `session_reset` implementation (CCR-012/CCR-013 remediation verification; CCR-015 new) |
 | **Revalidation Date** | 2026-09-05 — "revalidate all open CCR" (CCR-005, CCR-011, CCR-014, CCR-015 re-checked against current disk state) |
-| **Review Depth** | 3 iterations (initial read, cross-file/context analysis, evidence validation); follow-up pass likewise 3 iterations (structural/data-flow read, cross-file/concurrency analysis, evidence re-validation); second follow-up pass likewise 3 iterations (checklist-vs-code trace, concurrency/lock-symmetry analysis, evidence re-validation); revalidation pass - direct source re-read of every open finding, no assumptions carried over from prior report text |
+| **Third Follow-up Review Date** | 2026-09-05 — scoped to a behaviour change in `utils_telegram/utilities/image_draft_handler.py`'s draft keep-alive cycle (continue-button wait-preservation logic); CCR-016–CCR-018 new |
+| **Validation Date** | 2026-09-05 — "validate CCR 16, 17, and 18" (all three re-checked directly against current source) |
+| **Second Validation Date** | 2026-09-05 — "validate CCR 16, 17, and 18" repeated (all three found RESOLVED, not authored this session) |
+| **Review Depth** | 3 iterations (initial read, cross-file/context analysis, evidence validation); follow-up pass likewise 3 iterations (structural/data-flow read, cross-file/concurrency analysis, evidence re-validation); second follow-up pass likewise 3 iterations (checklist-vs-code trace, concurrency/lock-symmetry analysis, evidence re-validation); revalidation pass - direct source re-read of every open finding, no assumptions carried over from prior report text; third follow-up pass - full control-flow and cross-thread interleaving trace of the changed file against `README.md`'s documented spec and the structurally analogous `poll_response_handler.py` |
 
 ---
 
@@ -28,6 +31,8 @@
 **Additional files re-reviewed in the 2026-09-04 follow-up pass (`user_id`-removal / `session_id` change):** `utils_queue/message_handler.py`, `utils_queue/error_handling.py`, `utils_redis/database.py`, `utils_telegram/gateway_inbound.py`, `utils_telegram/utilities/poll_response_handler.py`, `utils_telegram/utilities/image_draft_handler.py`, `README.md` (payload contract) — see CCR-012–CCR-014 and the accompanying informational note.
 
 **Additional files re-reviewed in the 2026-09-05 second follow-up pass (`TODO.md` `session_reset` implementation):** `utils_session/session_reset_handler.py` (new), `utils_redis/database.py`, `utils_queue/message_handler.py`, `utils_queue/error_handling.py`, `utilities/initialise.py`, `config.py`, `utils_telegram/utilities/poll_response_handler.py`, `utils_telegram/utilities/image_draft_handler.py`, `utils_telegram/gateway_inbound.py`, `utils_queue/queue.py`, `README.md`, `config_sample.ini`, `compose.dev.yml` — see CCR-012/CCR-013 (resolved), CCR-014 (re-confirmed open), CCR-015 (new), and the accompanying informational note.
+
+**Additional files re-reviewed in the 2026-09-05 third follow-up pass (`image_draft_handler.py` behaviour change):** `utils_telegram/utilities/image_draft_handler.py` (changed file), cross-referenced against `README.md` §"Pending drafts", `config.py` (`DRAFT_*` settings, `get_env_int()`), `utils_telegram/utilities/poll_response_handler.py` (structurally analogous control-dict/background-loop pattern), `utils_telegram/utilities/button_prompt_handler.py`, `utils_telegram/gateway_inbound.py`, `utils_redis/database.py::reset_session()`/`delete_chat_draft()` — see CCR-016–CCR-018 (new).
 
 **Standards Evaluated:** PEP 8, PEP 257, OWASP Top 10, CWE mappings, Bandit-style secure coding guidance, general secure-scripting/reliability best practice.
 
@@ -59,7 +64,18 @@ CCR-011 was not part of the reverification request and remains **OPEN**, unexami
 
 As of this revalidation, only **CCR-005** (Low, accepted risk) and **CCR-011** (Low, skipped/unaddressed) remain open in this report.
 
-**Total Findings (cumulative):** 17 (1 High, 6 Medium, 7 Low, 3 Informational) - 15 numbered findings (CCR-001–CCR-015) plus 2 unnumbered informational notes (session-identifier retention, 2026-09-04; `RESET_NOTICE_MESSAGE` shipping blank, 2026-09-05).
+**Third Follow-up Review (2026-09-05, on request, "changes have been made to image_draft_handler.py including behaviour change, validate non-compliance" — scoped to a behaviour change in the draft keep-alive cycle's continue-button handling):** Re-read `utils_telegram/utilities/image_draft_handler.py` directly against current source, exhaustively tracing every control-flow path — including cross-thread interleaving between the per-chat background loop and the RabbitMQ/Telegram-polling thread invoking `continue_draft_timer()`/`stop_draft_timer()` — against `README.md`'s independently-maintained spec for this exact feature (§"Pending drafts") and `config.py`'s actual default values. The changed behaviour itself (a continue-button press now preserves the current cycle's remaining wait rather than cutting it short) was confirmed correctly and consistently implemented, matching `README.md` exactly at current defaults, with no reachable data-corruption, crash, or resource-leak path identified across every interleaving traced. At the user's explicit instruction, three findings arising from this review — one previously assessed as not independently reachable/no-action-required — are recorded below as open non-compliance findings: **CCR-016, CCR-017, CCR-018**.
+
+**Total Findings (cumulative):** 20 (1 High, 6 Medium, 8 Low, 5 Informational) - 18 numbered findings (CCR-001–CCR-018) plus 2 unnumbered informational notes (session-identifier retention, 2026-09-04; `RESET_NOTICE_MESSAGE` shipping blank, 2026-09-05).
+
+**Validation (2026-09-05, same day, on request "validate CCR 16, 17, and 18"):** All three findings were re-read directly against current source (not cached report text) rather than assumed still accurate from the prior pass. All three are **re-confirmed Open, substance unchanged**. One incidental, non-substantive change was found in the file in the interim: `_stop()` was renamed to `_stop_draft_loop()` (identical body/behaviour) — CCR-018's Location/Evidence has been corrected to reflect this; it does not affect CCR-016 or CCR-017. CCR-018's cross-file comparison against `poll_response_handler.py` was also independently re-checked and remains accurate (that file is unchanged).
+
+**Second Validation (2026-09-05, same day, on request "validate CCR 16, 17, and 18" repeated):** All three findings were re-read directly against current source. This time, **all three are confirmed RESOLVED** — each finding's own recommended remediation has been applied, near-verbatim, since the previous validation moments earlier:
+- **CCR-016: RESOLVED** — `_wait_full_duration()` now explicitly branches on `control["action"] == "continue"` then `control["action"] == "stop"`, with a final `else` that logs a warning and defensively treats any unrecognised state as stop, replacing the prior implicit by-elimination inference.
+- **CCR-017: RESOLVED** — the `# Wait 1 min`/`# Start typing and Wait 1 min` comments have been replaced with settings-derived phrasing (`# Silent wait before this cycle's typing indicator starts`; `# Start typing and hold it for DRAFT_TYPING_LEAD_SECONDS, immediately before the notice`) that no longer hardcodes a default duration.
+- **CCR-018: RESOLVED** — `_stop_draft_loop()`, `continue_draft_timer()`, and `_consume_continue()` now all mutate `control["action"]`/`control["event"]` inside `with _lock:`, and the module's own header Notes explicitly document this convention by name, referencing all three functions.
+
+**Provenance:** none of these three fixes were made by me / not part of any edit in this session — validating current disk state only, consistent with the provenance caveat already applied to CCR-003/004/008/012–015 above.
 
 **Compliance Verdict: Mostly Compliant** (see updated rationale at the end of this document)
 
@@ -660,6 +676,151 @@ For consistency and defence-in-depth (not because a concrete exploit path was pr
 
 ---
 
+### ~~CCR-016~~ — RESOLVED
+
+**Severity:** Low
+
+**Review Date:** 2026-09-05 (third follow-up pass — `image_draft_handler.py` behaviour change)
+
+**Location:** `utilities/utils_telegram/utilities/image_draft_handler.py::_wait_full_duration()` (lines 254–265), in conjunction with `_consume_continue()` (lines 218–223)
+
+**Violated Standard:**
+- CWE-670: Always-Incorrect Control Flow Implementation (closest applicable mapping — implicit-by-elimination branching rather than an explicit state check)
+
+**Description:**
+When `event.wait(remaining)` returns `True` (the shared `control["event"]` was signalled) and `_consume_continue(control, is_final_cycle)` returns `False`, the code unconditionally infers `"stop"` (`else: return "stop"`) rather than explicitly checking `control["action"] == "stop"`. This is currently safe only because the only two producers of `event.set()` in this file are `_stop()` (which always pairs it with `control["action"] = "stop"`) and `continue_draft_timer()` (which always pairs it with `control["action"] = "continue"`) — the inference that "not a valid continue" therefore means "stop" is implicit, not enforced by an explicit check against the actual state value.
+
+**Evidence:**
+```python
+# _consume_continue() only special-cases "continue"
+if control["action"] == "continue" and not is_final_cycle:
+    control["event"].clear()
+    control["action"] = None
+    return True
+else:
+    return False
+
+# _wait_full_duration() treats every other outcome identically as "stop"
+elif _consume_continue(control, is_final_cycle):
+    ...
+    was_extended = True
+else:
+    return "stop"
+```
+
+**Impact:**
+No currently-reachable defect — verified by tracing every writer of `control["action"]`/`control["event"]` in this file and its two external callers (`continue_draft_timer()`, `stop_draft_timer()`/`_stop()`); both writers are consistent with the implicit assumption. The risk is a future-maintenance fragility: if a third `action` value is ever introduced, or a signal is ever set without an accompanying `action` update, it would be silently misclassified as a stop with no error surfaced.
+
+**Recommended Remediation:** Make the check explicit — e.g. `elif control["action"] == "stop": return "stop"` — with a distinct, logged outcome for any unrecognised `action` value, for self-documenting robustness against future extension.
+
+**Confidence:** High (verified by tracing every writer of the shared control-dict fields across the file and its callers).
+
+**Validation (2026-09-05, on request, "validate CCR 16, 17, and 18"):** Re-read `image_draft_handler.py` directly against current source. `_wait_full_duration()` (lines 254–265) and `_consume_continue()` (lines 218–223) are unchanged in substance — the `else: return "stop"` branch still infers a stop outcome by elimination rather than an explicit `control["action"] == "stop"` check. One incidental, non-substantive change was found elsewhere in the file since the original finding was recorded: `_stop()` has been renamed to `_stop_draft_loop()` (same body, same two-line mutation at what are now lines 147–148) — this does not affect this finding's substance, since `_wait_full_duration()`/`_consume_continue()` never reference that function by name. No fix applied to this finding's own logic.
+
+**Resolution Status:** RESOLVED (validated 2026-09-05, second validation pass, not authored this session)
+
+**Second Validation Result:** `_wait_full_duration()` (now lines 267–286) no longer infers "stop" by elimination. It now explicitly checks `elif control["action"] == "continue" and not is_final_cycle:` (consuming via `_consume_continue()`), then `elif control["action"] == "stop": return "stop"`, and finally a genuinely new `else` branch — `logger.warning(f"...unrecognised control state (action={control['action']!r}...)"); return "stop"` — that logs and defensively defaults to stop only for a truly unrecognised value, rather than silently assuming every non-continue signal must be a stop. This closes the exact fragility this finding described.
+
+**Classification:** The underlying CWE-670 concern (implicit-by-elimination control-flow inference) is resolved. Finding is validated as resolved.
+
+**Confidence (re-verification):** High — verified directly against current file contents.
+
+**Status:** RESOLVED (re-confirmed 2026-09-05)
+
+---
+
+### ~~CCR-017~~ — RESOLVED
+
+**Severity:** Informational
+
+**Review Date:** 2026-09-05 (third follow-up pass — `image_draft_handler.py` behaviour change)
+
+**Location:** `utilities/utils_telegram/utilities/image_draft_handler.py::_draft_loop()`, lines 295 and 300 (comments `# Wait 1 min`, `# Start typing and Wait 1 min`)
+
+**Violated Standard:** None formally violated — general code-comment accuracy / self-documenting-code best practice (no specific numbered rule).
+
+**Description:**
+These comments hardcode the *default* config-derived durations (1 minute) rather than describing the underlying computation generically. They are currently accurate against `DEFAULT_DRAFT_CYCLE_SECONDS`/`DEFAULT_DRAFT_CYCLE_NOTICE_LEAD_SECONDS`/`DEFAULT_DRAFT_TYPING_LEAD_SECONDS` (verified directly against `config.py`), but will silently go stale/misleading if `DRAFT_CYCLE_SECONDS`, `DRAFT_CYCLE_NOTICE_LEAD_SECONDS`, or `DRAFT_TYPING_LEAD_SECONDS` is ever reconfigured via environment variable in a deployment, since the comment text does not derive from or reference the settings it describes.
+
+**Evidence:**
+```python
+# Wait 1 min
+wait_before_notice_typing = max(0, settings.DRAFT_CYCLE_SECONDS - settings.DRAFT_CYCLE_NOTICE_LEAD_SECONDS - settings.DRAFT_TYPING_LEAD_SECONDS)
+...
+# Start typing and Wait 1 min
+start_typing(_typing_key(chat_id), chat_id)
+```
+
+**Impact:** No functional effect — cosmetic/documentation accuracy only. A future operator who reconfigures these settings without also updating the comment would find the comment misleading relative to actual runtime behaviour.
+
+**Recommended Remediation:** Rephrase generically, e.g. `# Silent wait before this cycle's typing indicator starts`, rather than embedding the current default's literal duration.
+
+**Confidence:** High.
+
+**Validation (2026-09-05, on request, "validate CCR 16, 17, and 18"):** Re-read `image_draft_handler.py::_draft_loop()` directly against current source. The comments `# Wait 1 min` (line 295) and `# Start typing and Wait 1 min` (line 300) are unchanged, word-for-word, and still accurate only against the current `DEFAULT_DRAFT_*` values in `config.py` (re-confirmed unchanged). No fix applied.
+
+**Resolution Status:** RESOLVED (validated 2026-09-05, second validation pass, not authored this session)
+
+**Second Validation Result:** Both comments have been replaced with settings-derived phrasing that no longer hardcodes a default duration: `# Wait 1 min` (line 295) is now `# Silent wait before this cycle's typing indicator starts` (line 316); `# Start typing and Wait 1 min` (line 300) is now `# Start typing and hold it for DRAFT_TYPING_LEAD_SECONDS, immediately before the notice` (line 321) — the latter explicitly names the setting it depends on rather than embedding its current default value. This closes the staleness risk this finding described.
+
+**Classification:** The underlying comment-accuracy concern is resolved. Finding is validated as resolved.
+
+**Confidence (re-verification):** High — verified directly against current file contents.
+
+**Status:** RESOLVED (re-confirmed 2026-09-05)
+
+---
+
+### ~~CCR-018~~ — RESOLVED
+
+**Severity:** Informational
+
+**Review Date:** 2026-09-05 (third follow-up pass — `image_draft_handler.py` behaviour change)
+
+**Location:** `utilities/utils_telegram/utilities/image_draft_handler.py` — `continue_draft_timer()` (lines 175–176), `_stop_draft_loop()` (lines 147–148, renamed from `_stop()` — see Validation note below), `_consume_continue()` (lines 219–220) — all mutate `control["action"]`/`control["event"]` outside `_lock`.
+
+**Violated Standard:**
+- CWE-362: Concurrent Execution using Shared Resource with Improper Synchronization ('Race Condition') — nearest mapping, cited for traceability.
+
+**Description:**
+`_lock` in this file only guards mutations of the `_active_drafts` dict itself (adding/removing a `chat_id` entry); the individual fields *within* a given `control` object are read/written from different threads — the per-chat background loop (`_draft_loop()`/`_consume_continue()`) versus the RabbitMQ/Telegram-polling thread invoking `continue_draft_timer()`/`stop_draft_timer()` — with no lock around those specific field accesses.
+
+**Evidence:**
+```python
+# continue_draft_timer() — mutates control fields outside _lock
+with _lock:
+    control = _active_drafts.get(chat_id)
+...
+control["action"] = "continue"     # outside the lock
+control["event"].set()             # outside the lock
+```
+
+**Impact:**
+Every reachable interleaving was traced by hand (a button press racing a cycle's own timeout, a stale/leftover signal surviving into a subsequent cycle, an "invalid continue" landing on the final cycle) and none produced data corruption, a crash, or a resource leak — each producer of `event.set()` pairs it with a single, CPython-GIL-atomic write to `action`, and `_consume_continue()`'s `.clear()` on any recognised press guarantees no stale "set" state survives into a later cycle's wait. This is the same unsynchronized-field pattern already present in `poll_response_handler.py` (`control.get("stop")`, `control["event"].set()` also mutated outside `_lock`), so it is an established, apparently deliberate house pattern for these lightweight control dicts rather than a defect unique to this file. Recorded here as an open item at the user's instruction rather than closed as "no action required," since the underlying unsynchronized-access pattern is a genuine, present fact in the code regardless of whether an exploitable interleaving was found.
+
+**Recommended Remediation:** If revisited, consider documenting this narrow-lock-scope convention explicitly in both files' module Notes for future maintainers, and/or widening `_lock`'s scope to cover the individual `control` field mutations for defence-in-depth, consistent with how `_active_drafts` membership itself is already protected.
+
+**Confidence:** Medium — no exploitable path was found in every interleaving traced, but cross-thread races are inherently harder to prove exhaustively than sequential logic; the underlying lock-scope fact itself is High confidence.
+
+**Validation (2026-09-05, on request, "validate CCR 16, 17, and 18"):** Re-read `image_draft_handler.py` directly against current source. The unsynchronized pattern is unchanged in substance: `continue_draft_timer()` (lines 175–176) still mutates `control["action"]`/`control["event"]` after its `with _lock:` block has already exited; `_consume_continue()` (lines 219–220) still holds no lock at all. One naming-only change was found: `_stop()` has been renamed to `_stop_draft_loop()`, with the identical two-line mutation (`control["action"] = "stop"`; `control["event"].set()`) still occurring after its own `with _lock:` block exits (now lines 143–148) — the rename does not alter this finding's substance, and the Location above has been corrected to reflect it. Re-confirmed against `poll_response_handler.py` (unchanged, re-read directly): `handle_poll_answer()`'s `control["event"].set()` (line 172) and `stop_poll_for_reset()`'s `control["stop"] = True` / `control["event"].set()` (lines 280–281) both still mutate outside their respective `with _lock:` blocks — the cross-file pattern comparison this finding relies on remains accurate. No fix applied.
+
+**Resolution Status:** RESOLVED (validated 2026-09-05, second validation pass, not authored this session)
+
+**Second Validation Result:** All three functions now mutate the shared `control` fields from inside `with _lock:`, not after it exits:
+- `_stop_draft_loop()` (lines 149–156): the `control["action"] = "stop"` / `control["event"].set()` mutation moved inside the same `with _lock:` block that pops `chat_id` from `_active_drafts`.
+- `continue_draft_timer()` (lines 179–189): the `control["action"] = "continue"` / `control["event"].set()` mutation likewise moved inside its `with _lock:` block.
+- `_consume_continue()` (lines 233–239): now itself opens `with _lock:` around its full check-clear-reset sequence, where previously it held no lock at all.
+
+The module's own header Notes (line 15) now explicitly documents this: "`_lock` guards both `_active_drafts` membership and each control dict's own 'action'/'event' field mutations - `_stop_draft_loop()`/`continue_draft_timer()`... and `_consume_continue()`... all mutate the same shared control fields, so all three hold `_lock` across those mutations." This closes the unsynchronized-access gap this finding described; the pattern comparison against `poll_response_handler.py` (still using the narrower lock-scope convention) is no longer applicable to this file, since `image_draft_handler.py` has since diverged to a stricter convention.
+
+**Classification:** The underlying CWE-362 concern (unsynchronized cross-thread mutation of the shared `control` dict) is resolved. Finding is validated as resolved.
+
+**Confidence (re-verification):** High — verified directly against current file contents, including the code's own updated module Notes.
+
+**Status:** RESOLVED (re-confirmed 2026-09-05)
+
+---
+
 ## Compliance Verdict
 
 **Verdict: Mostly Compliant** (improved from the pre-remediation baseline of the same rating — as of the 2026-09-05 revalidation, no Critical/High/Medium-severity findings remain open; exactly one Low-severity item is genuinely outstanding, alongside one Low-severity accepted risk)
@@ -675,9 +836,16 @@ A second follow-up review (2026-09-05), scoped to `TODO.md`'s subsequent gracefu
 
 A subsequent revalidation (2026-09-05, same day, on request "revalidate all open CCR") re-checked every finding still marked Open - CCR-005, CCR-011, CCR-014, CCR-015 - directly against current source. **CCR-014 and CCR-015 were both found to have been fixed in the interim**, outside this session's own edits (the unused `user_id` variable removed; `create_poll_mapping()` now holds `_get_chat_lock()` the same way `create_task_mapping()` does). Only **CCR-005** and **CCR-011** remain open as of this revalidation.
 
+A third follow-up review (2026-09-05, same day, on request "changes have been made to image_draft_handler.py including behaviour change, validate non-compliance") examined a subsequent behaviour change to the draft keep-alive cycle's continue-button handling in `image_draft_handler.py`. The changed behaviour itself was confirmed correctly and consistently implemented against `README.md`'s spec, with no exploitable defect identified across an exhaustive cross-thread interleaving trace. At the user's explicit instruction, three findings from this review are recorded as open non-compliance items — **CCR-016** (Low, an implicit rather than explicit state check with a future-maintenance fragility risk), **CCR-017** (Informational, default-value-hardcoded comments that could go stale under reconfiguration), and **CCR-018** (Informational, unsynchronized in-memory control-dict field mutation across threads — a pattern already present elsewhere in the codebase, not unique to this change, but logged as open rather than closed per instruction).
+
 **Remaining Blockers to a "Compliant" Verdict:**
 1. CCR-005 (Low) — RabbitMQ/Redis connections lack TLS in transit; unchanged, re-confirmed still open on revalidation (2026-09-05). Treated as a low-severity, network-topology-dependent accepted risk under the same closed-host deployment context validated for CCR-003, rather than a hard blocker.
 2. CCR-011 (Low) — `_registered_callbacks` has no hard size cap; re-confirmed still open on revalidation (2026-09-05). **[Skipped at the user's request during the 2026-09-03 remediation pass; not examined again since]**
+
+**Resolved / no longer blocking (this pass):**
+- ~~CCR-016~~ (Low → n/a) — RESOLVED (validated 2026-09-05, second validation pass, not authored this session). `_wait_full_duration()` now explicitly checks `control["action"]` for both `"continue"` and `"stop"`, with a logged, defensive fallback for any unrecognised value.
+- ~~CCR-017~~ (Informational → n/a) — RESOLVED (validated 2026-09-05, second validation pass, not authored this session). Hardcoded-duration comments in `_draft_loop()` replaced with settings-derived phrasing.
+- ~~CCR-018~~ (Informational → n/a) — RESOLVED (validated 2026-09-05, second validation pass, not authored this session). `_lock`'s scope widened to cover all `control` dict field mutations across `_stop_draft_loop()`/`continue_draft_timer()`/`_consume_continue()`, documented explicitly in the module's own header Notes.
 
 **Resolved / no longer blocking:**
 - ~~CCR-003~~ (Medium → n/a) — RESOLVED (validated 2026-09-03). Hard-coded functional default credential removed from source.
@@ -688,7 +856,7 @@ A subsequent revalidation (2026-09-05, same day, on request "revalidate all open
 - ~~CCR-014~~ (Low → n/a) — RESOLVED (validated 2026-09-05, revalidation pass). Unused `user_id` assignment removed from `message_handler.py::process_message()`.
 - ~~CCR-015~~ (Low → n/a) — RESOLVED (validated 2026-09-05, revalidation pass). `create_poll_mapping()` now holds `_get_chat_lock(chat_id)` across its write+index step, mirroring `create_task_mapping()`.
 
-No Critical/High/Medium-severity findings remain open in this report as of 2026-09-05. Exactly two Low-severity items remain (CCR-005, an accepted risk; CCR-011, unaddressed/skipped) - neither requires a behavioural/architectural rewrite, and both remain addressable as scoped, targeted fixes whenever the user chooses to action them.
+No Critical/High/Medium-severity findings remain open in this report as of 2026-09-05. Exactly two Low-severity items remain open (CCR-005, an accepted risk; CCR-011, unaddressed/skipped) - neither requires a behavioural/architectural rewrite. CCR-016, CCR-017, and CCR-018 (identified and validated as still-open earlier the same day) were re-validated once more on request and found to have all been resolved in the interim, outside this session's own edits - none remain open.
 
 ---
 
@@ -713,6 +881,9 @@ No Critical/High/Medium-severity findings remain open in this report as of 2026-
 | ~~CCR-015~~ | Low | Reliability / Security | utils_redis/database.py::create_poll_mapping vs. reset_session | CWE-362 | **RESOLVED** (validated 2026-09-05 revalidation, not authored this session) |
 | Informational | Informational | Governance | utils_redis/database.py::_get_or_create_session | None (design disclosure) | Accepted design choice (2026-09-04) |
 | Informational | Informational | Governance | utils_session/session_reset_handler.py::RESET_NOTICE_MESSAGE | None (design disclosure) | Accepted design choice, pre-deployment item (new, 2026-09-05) |
+| ~~CCR-016~~ | Low | Reliability / Maintainability | utils_telegram/utilities/image_draft_handler.py::_wait_full_duration | CWE-670 (closest) | **RESOLVED** (validated 2026-09-05, second validation pass, not authored this session) |
+| ~~CCR-017~~ | Informational | Maintainability | utils_telegram/utilities/image_draft_handler.py::_draft_loop | None (comment accuracy) | **RESOLVED** (validated 2026-09-05, second validation pass, not authored this session) |
+| ~~CCR-018~~ | Informational | Reliability | utils_telegram/utilities/image_draft_handler.py (control dict mutation) | CWE-362 (closest) | **RESOLVED** (validated 2026-09-05, second validation pass, not authored this session) |
 
 ---
 
@@ -752,6 +923,14 @@ No Critical/High/Medium-severity findings remain open in this report as of 2026-
 | CCR-014 | CWE-563 | The unused `user_id = mapping.get("user_id")` assignment in `message_handler.py::process_message()` is confirmed removed; `grep` for `user_id` across the file returns only a stale mention in the module's own header comment. RESOLVED. |
 | CCR-015 | CWE-362 | `create_poll_mapping()` (`utils_redis/database.py`) confirmed now wrapping its write+`sadd` step in `with _get_chat_lock(chat_id):`, mirroring `create_task_mapping()`; the function's own docstring was also updated to state this explicitly. RESOLVED. |
 
+**Re-verified, not authored this session (validated 2026-09-05 against current disk state on request — "validate CCR 16, 17, and 18," second pass):**
+
+| Finding ID | Violated Rule | Validation Result |
+|------------|----------------|--------------------|
+| CCR-016 | CWE-670 (closest) | `image_draft_handler.py::_wait_full_duration()` confirmed now explicitly branching on `control["action"] == "continue"` then `control["action"] == "stop"`, with a logged `else` fallback for any unrecognised value, replacing the prior implicit by-elimination inference. RESOLVED. |
+| CCR-017 | None (comment accuracy) | `image_draft_handler.py::_draft_loop()`'s two hardcoded-duration comments confirmed replaced with settings-derived phrasing that no longer embeds a literal default value. RESOLVED. |
+| CCR-018 | CWE-362 (closest) | `image_draft_handler.py`'s `_stop_draft_loop()`/`continue_draft_timer()`/`_consume_continue()` confirmed now all mutating the shared `control` dict fields from inside `with _lock:`; the module's own header Notes updated to document this explicitly. RESOLVED. |
+
 ---
 
-*This report was originally a static, evidence-backed review; a subsequent revision additionally recorded an instructed remediation pass. All code changes were scoped to the minimum necessary to resolve each targeted finding, preserving existing behaviour. Where confidence is Medium (deployment-context-dependent findings), assumptions are stated explicitly within the relevant finding. A further follow-up review (2026-09-04) is appended above (CCR-012–CCR-014 and one informational note), scoped to the `user_id`-removal / permanent `session_id` change — review-only, no code modified, no Fix Mode entered. A second follow-up review (2026-09-05) is appended above (CCR-012/CCR-013 confirmed resolved, CCR-014 re-confirmed open, CCR-015 and one further informational note added), scoped to `TODO.md`'s graceful `session_reset` implementation — review-only, no code modified, no Fix Mode entered; the CCR-012/CCR-013 remediation itself was not authored in this session. A subsequent revalidation pass (2026-09-05, same day) re-checked every then-open finding (CCR-005, CCR-011, CCR-014, CCR-015) directly against current source; CCR-014 and CCR-015 are now confirmed resolved (also not authored in this session), leaving only CCR-005 and CCR-011 open — review-only, no code modified, no Fix Mode entered.*
+*This report was originally a static, evidence-backed review; a subsequent revision additionally recorded an instructed remediation pass. All code changes were scoped to the minimum necessary to resolve each targeted finding, preserving existing behaviour. Where confidence is Medium (deployment-context-dependent findings), assumptions are stated explicitly within the relevant finding. A further follow-up review (2026-09-04) is appended above (CCR-012–CCR-014 and one informational note), scoped to the `user_id`-removal / permanent `session_id` change — review-only, no code modified, no Fix Mode entered. A second follow-up review (2026-09-05) is appended above (CCR-012/CCR-013 confirmed resolved, CCR-014 re-confirmed open, CCR-015 and one further informational note added), scoped to `TODO.md`'s graceful `session_reset` implementation — review-only, no code modified, no Fix Mode entered; the CCR-012/CCR-013 remediation itself was not authored in this session. A subsequent revalidation pass (2026-09-05, same day) re-checked every then-open finding (CCR-005, CCR-011, CCR-014, CCR-015) directly against current source; CCR-014 and CCR-015 are now confirmed resolved (also not authored in this session), leaving only CCR-005 and CCR-011 open. A third follow-up review (2026-09-05, same day) is appended above (CCR-016–CCR-018 added), scoped to a behaviour change in `image_draft_handler.py`'s draft keep-alive cycle — review-only, no code modified, no Fix Mode entered; all three findings were initially recorded as Open at the user's explicit instruction, including one (CCR-018) whose underlying pattern was independently confirmed to be already present elsewhere in the codebase (`poll_response_handler.py`) rather than unique to the reviewed change. A first validation pass (2026-09-05, same day) re-confirmed all three still open, correcting one incidental function rename (`_stop()` → `_stop_draft_loop()`) discovered along the way. A second validation pass (2026-09-05, same day, on request) found all three had since been resolved, outside this session's own edits, each remediated near-verbatim to this report's own recommended fix — review-only, no code modified by this session, no Fix Mode entered.*

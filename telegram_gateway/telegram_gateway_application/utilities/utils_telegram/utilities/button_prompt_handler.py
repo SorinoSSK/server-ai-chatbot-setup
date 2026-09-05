@@ -79,22 +79,22 @@ def register_bot_button(text: str, purpose: str, chat_id: int, payload: dict | N
     if not text:
         logger.error("Refused to register a button with empty text.")
         return None
+    else:
+        _prune_expired_callbacks()
 
-    _prune_expired_callbacks()
+        token = secrets.token_urlsafe(24)
+        with _lock:
+            _registered_callbacks[token] = {
+                "chat_id": chat_id,
+                "purpose": purpose,
+                "payload": payload or {},
+                "created_at": time.monotonic()
+            }
 
-    token = secrets.token_urlsafe(24)
-    with _lock:
-        _registered_callbacks[token] = {
-            "chat_id": chat_id,
-            "purpose": purpose,
-            "payload": payload or {},
-            "created_at": time.monotonic()
-        }
+        logger.info(f"Registered button for chat_id={chat_id} (purpose={purpose!r}).")
+        return {"text": text, "callback_data": token}
 
-    logger.info(f"Registered button for chat_id={chat_id} (purpose={purpose!r}).")
-    return {"text": text, "callback_data": token}
-
-def validate_inline_buttons(rows: list[list[dict]]) -> dict | None:
+def _validate_inline_buttons(rows: list[list[dict]]) -> dict | None:
     """
     Validates button rows against Telegram's inline keyboard limits, wrapping them into reply_markup if valid.
 
@@ -114,28 +114,27 @@ def validate_inline_buttons(rows: list[list[dict]]) -> dict | None:
     if total_buttons == 0:
         logger.error("Refused to validate an inline keyboard with no buttons.")
         return None
-
-    if total_buttons > settings.TELEGRAM_BUTTONS_MAX_TOTAL:
+    elif total_buttons > settings.TELEGRAM_BUTTONS_MAX_TOTAL:
         logger.error(f"Refused to validate an inline keyboard with {total_buttons} buttons - exceeds the {settings.TELEGRAM_BUTTONS_MAX_TOTAL} button limit.")
         return None
-
-    for row in rows:
-        if len(row) > settings.TELEGRAM_BUTTONS_MAX_PER_ROW:
-            logger.error(f"Refused to validate an inline keyboard row with {len(row)} buttons - exceeds the {settings.TELEGRAM_BUTTONS_MAX_PER_ROW} per-row limit.")
-            return None
-
-        for button in row:
-            callback_data = button.get("callback_data") or ""
-            if not button.get("text") or not callback_data:
-                logger.error(f"Refused to validate an inline keyboard with an invalid button: {button}.")
+    else:
+        for row in rows:
+            if len(row) > settings.TELEGRAM_BUTTONS_MAX_PER_ROW:
+                logger.error(f"Refused to validate an inline keyboard row with {len(row)} buttons - exceeds the {settings.TELEGRAM_BUTTONS_MAX_PER_ROW} per-row limit.")
                 return None
+            else:
+                for button in row:
+                    callback_data = button.get("callback_data") or ""
+                    if not button.get("text") or not callback_data:
+                        logger.error(f"Refused to validate an inline keyboard with an invalid button: {button}.")
+                        return None
+                    else:
+                        callback_data_bytes = len(callback_data.encode("utf-8"))
+                        if callback_data_bytes > settings.TELEGRAM_CALLBACK_DATA_MAX_BYTES:
+                            logger.error(f"Refused to validate an inline keyboard - callback_data is {callback_data_bytes} bytes, exceeds the {settings.TELEGRAM_CALLBACK_DATA_MAX_BYTES} byte limit.")
+                            return None
 
-            callback_data_bytes = len(callback_data.encode("utf-8"))
-            if callback_data_bytes > settings.TELEGRAM_CALLBACK_DATA_MAX_BYTES:
-                logger.error(f"Refused to validate an inline keyboard - callback_data is {callback_data_bytes} bytes, exceeds the {settings.TELEGRAM_CALLBACK_DATA_MAX_BYTES} byte limit.")
-                return None
-
-    return {"inline_keyboard": rows}
+        return {"inline_keyboard": rows}
 
 def send_message_with_buttons(chat_id: int | str, text: str, rows: list[list[dict]], parse_mode: str | None = None) -> bool | dict:
     """
@@ -147,7 +146,7 @@ def send_message_with_buttons(chat_id: int | str, text: str, rows: list[list[dic
         text (str)
 
         rows (list[list[dict]]):
-            Rows of buttons - see validate_inline_buttons().
+            Rows of buttons - see _validate_inline_buttons().
 
         parse_mode (str | None, optional):
             See send_message(). Defaults to None.
@@ -165,14 +164,14 @@ def send_message_with_buttons(chat_id: int | str, text: str, rows: list[list[dic
         reason = f"text is {len(text)} characters, exceeds the {settings.TELEGRAM_MESSAGE_MAX_LENGTH} character limit"
         logger.error(f"Refused to send message to chat_id={chat_id} - {reason}.")
         return {"error": True, "status_code": None, "reason": reason}
-
-    keyboard = validate_inline_buttons(rows)
-    if keyboard is None:
-        reason = "inline keyboard failed validation"
-        logger.error(f"Refused to send message to chat_id={chat_id} - {reason}.")
-        return {"error": True, "status_code": None, "reason": reason}
-
-    return send_message(chat_id, text, parse_mode=parse_mode, reply_markup=keyboard)
+    else:
+        keyboard = _validate_inline_buttons(rows)
+        if keyboard is None:
+            reason = "inline keyboard failed validation"
+            logger.error(f"Refused to send message to chat_id={chat_id} - {reason}.")
+            return {"error": True, "status_code": None, "reason": reason}
+        else:
+            return send_message(chat_id, text, parse_mode=parse_mode, reply_markup=keyboard)
 
 def validate_bot_callback(callback_data: str, chat_id: int) -> dict | None:
     """
@@ -200,12 +199,11 @@ def validate_bot_callback(callback_data: str, chat_id: int) -> dict | None:
     if entry is None:
         logger.warning(f"Rejected callback_data from chat_id={chat_id} - not a currently registered bot-issued button (expired, already used, or forged).")
         return None
-
-    if entry["chat_id"] != chat_id:
+    elif entry["chat_id"] != chat_id:
         logger.warning(f"Rejected callback_data from chat_id={chat_id} - registered to a different chat_id={entry['chat_id']}.")
         return None
-
-    logger.info(f"Validated button press from chat_id={chat_id} (purpose={entry['purpose']!r}).")
-    return {"purpose": entry["purpose"], "payload": entry["payload"]}
+    else:
+        logger.info(f"Validated button press from chat_id={chat_id} (purpose={entry['purpose']!r}).")
+        return {"purpose": entry["purpose"], "payload": entry["payload"]}
 
 # =============================================================================

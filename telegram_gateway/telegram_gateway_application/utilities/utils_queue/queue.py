@@ -67,7 +67,7 @@ def _build_rabbitmq_parameters() -> pika.ConnectionParameters:
         blocked_connection_timeout=settings.Q_BLOCKED_CONNECTION_TIMEOUT
     )
 
-def initialise_rabbitmq_publish_connection() -> None:
+def _initialise_rabbitmq_publish_connection() -> None:
     """
     Opens the RabbitMQ connection used for publishing, reused across requests.
 
@@ -95,7 +95,7 @@ def initialise_rabbitmq_publish_connection() -> None:
         else:
             logger.warning("Reinitialisation of RabbitMQ publish connection occured. No new RabbitMQ initialisation is made.")
 
-def initialise_rabbitmq_consume_connection() -> None:
+def _initialise_rabbitmq_consume_connection() -> None:
     """
     Opens the RabbitMQ connection used by the background consumer thread.
 
@@ -137,8 +137,8 @@ def initialise_rabbitmq_connection() -> None:
         pika.exceptions.AMQPConnectionError:
             If either connection cannot be established.
     """
-    initialise_rabbitmq_publish_connection()
-    initialise_rabbitmq_consume_connection()
+    _initialise_rabbitmq_publish_connection()
+    _initialise_rabbitmq_consume_connection()
 
 def close_rabbitmq_connection() -> None:
     """
@@ -170,7 +170,7 @@ def close_rabbitmq_connection() -> None:
             _connection_consume.close()
             logger.info("RabbitMQ consume connection has been closed.")
 
-def get_rabbitmq_publish_channel() -> pika.adapters.blocking_connection.BlockingChannel:
+def _get_rabbitmq_publish_channel() -> pika.adapters.blocking_connection.BlockingChannel:
     """
     Retrieves an opened channel for publishing messages to RabbitMQ, initialising it if needed.
 
@@ -188,11 +188,11 @@ def get_rabbitmq_publish_channel() -> pika.adapters.blocking_connection.Blocking
 
     with _lock_publish:
         if _connection_publish is None or _connection_publish.is_closed:
-            initialise_rabbitmq_publish_connection()
+            _initialise_rabbitmq_publish_connection()
 
         return _channel_publish
 
-def get_rabbitmq_consume_channel() -> pika.adapters.blocking_connection.BlockingChannel:
+def _get_rabbitmq_consume_channel() -> pika.adapters.blocking_connection.BlockingChannel:
     """
     Retrieves an opened channel for consuming messages from RabbitMQ, initialising it if needed.
 
@@ -210,7 +210,7 @@ def get_rabbitmq_consume_channel() -> pika.adapters.blocking_connection.Blocking
 
     with _lock_consume:
         if _connection_consume is None or _connection_consume.is_closed:
-            initialise_rabbitmq_consume_connection()
+            _initialise_rabbitmq_consume_connection()
 
         return _channel_consume
 
@@ -230,7 +230,7 @@ def queue_push_task(payload: dict) -> bool:
     """
     for attempt in range(1, settings.Q_PUSH_MAX_ATTEMPTS + 1):
         try:
-            channel = get_rabbitmq_publish_channel()
+            channel = _get_rabbitmq_publish_channel()
             channel.queue_declare(queue=settings.Q_CHANNEL_OUT, durable=True)
             channel.basic_publish(
                 exchange="",
@@ -258,38 +258,6 @@ def queue_push_task(payload: dict) -> bool:
     logger.error(f"Failed to push task to RabbitMQ after {settings.Q_PUSH_MAX_ATTEMPTS} attempts.")
     return False
 
-def queue_pull_task() -> dict | None:
-    """
-    Pull one task from a RabbitMQ queue.
-
-    Args:
-        None
-
-    Returns:
-        dict | None:
-            The message received; otherwise None.
-
-    Raises:
-        pika.exceptions.AMQPConnectionError:
-            If the connection needs to be (re)initialised and cannot be established.
-
-        json.JSONDecodeError:
-            If the message body is not valid JSON.
-
-        UnicodeDecodeError:
-            If the message body cannot be decoded.
-    """
-    channel = get_rabbitmq_consume_channel()
-    channel.queue_declare(queue=settings.Q_CHANNEL_IN, durable=True)
-    # Ack the message later
-    method_frame, header_frame, body = channel.basic_get(queue=settings.Q_CHANNEL_IN, auto_ack=False)
-    if method_frame is None:
-        return None
-    else:
-        payload = json.loads(body.decode())
-        channel.basic_ack(delivery_tag=method_frame.delivery_tag)
-        return payload
-
 def queue_consume_task():
     """
     Consumes messages from RabbitMQ in a loop, reconnecting automatically on connection failures.
@@ -312,51 +280,52 @@ def queue_consume_task():
             running = _consumer_running
         if not running:
             break
-        try:
-            channel = get_rabbitmq_consume_channel()
-            channel.queue_declare(queue=settings.Q_CHANNEL_IN, durable=True)
+        else:
+            try:
+                channel = _get_rabbitmq_consume_channel()
+                channel.queue_declare(queue=settings.Q_CHANNEL_IN, durable=True)
 
-            def callback(ch, method, properties, body):
-                try:
-                    payload = body.decode()
-                except UnicodeDecodeError:
-                    logger.error("Received RabbitMQ message with an undecodable body. Dropping (not requeued).")
-                    ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
-                    return
-
-                try:
-                    process_message(payload)
-                    ch.basic_ack(delivery_tag=method.delivery_tag)
-                    _message_attempts.pop(body, None)
-                except Exception:
-                    attempts = _message_attempts.get(body, 0) + 1
-                    _message_attempts[body] = attempts
-
-                    if attempts >= settings.Q_CONSUME_MAX_ATTEMPTS:
-                        logger.exception(f"Giving up on message after {attempts} attempts. Dropping (not requeued).")
-                        _message_attempts.pop(body, None)
+                def callback(ch, method, properties, body):
+                    try:
+                        payload = body.decode()
+                    except UnicodeDecodeError:
+                        logger.error("Received RabbitMQ message with an undecodable body. Dropping (not requeued).")
                         ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
-                    else:
-                        logger.exception(f"Failed to process incoming RabbitMQ message (attempt {attempts}/{settings.Q_CONSUME_MAX_ATTEMPTS}). Requeuing...")
-                        ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
+                        return
 
-            channel.basic_consume(
-                queue=settings.Q_CHANNEL_IN,
-                on_message_callback=callback,
-                auto_ack=False
-            )
-            logger.info("RabbitMQ consumer started")
-            channel.start_consuming()
-        except (
-            pika.exceptions.AMQPConnectionError,
-            pika.exceptions.StreamLostError,
-            pika.exceptions.ChannelWrongStateError,
-        ):
-            logger.warning("RabbitMQ consumer disconnected. Reconnecting...")
-            time.sleep(settings.Q_CONSUME_RETRY_DELAY)
-        except Exception:
-            logger.exception("Unexpected RabbitMQ consumer error detected.")
-            time.sleep(settings.Q_CONSUME_RETRY_DELAY)
+                    try:
+                        process_message(payload)
+                        ch.basic_ack(delivery_tag=method.delivery_tag)
+                        _message_attempts.pop(body, None)
+                    except Exception:
+                        attempts = _message_attempts.get(body, 0) + 1
+                        _message_attempts[body] = attempts
+
+                        if attempts >= settings.Q_CONSUME_MAX_ATTEMPTS:
+                            logger.exception(f"Giving up on message after {attempts} attempts. Dropping (not requeued).")
+                            _message_attempts.pop(body, None)
+                            ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
+                        else:
+                            logger.exception(f"Failed to process incoming RabbitMQ message (attempt {attempts}/{settings.Q_CONSUME_MAX_ATTEMPTS}). Requeuing...")
+                            ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
+
+                channel.basic_consume(
+                    queue=settings.Q_CHANNEL_IN,
+                    on_message_callback=callback,
+                    auto_ack=False
+                )
+                logger.info("RabbitMQ consumer started")
+                channel.start_consuming()
+            except (
+                pika.exceptions.AMQPConnectionError,
+                pika.exceptions.StreamLostError,
+                pika.exceptions.ChannelWrongStateError,
+            ):
+                logger.warning("RabbitMQ consumer disconnected. Reconnecting...")
+                time.sleep(settings.Q_CONSUME_RETRY_DELAY)
+            except Exception:
+                logger.exception("Unexpected RabbitMQ consumer error detected.")
+                time.sleep(settings.Q_CONSUME_RETRY_DELAY)
 
 def start_queue_consumer():
     """
