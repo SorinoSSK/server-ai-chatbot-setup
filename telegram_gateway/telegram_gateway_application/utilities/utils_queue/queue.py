@@ -280,51 +280,52 @@ def queue_consume_task():
             running = _consumer_running
         if not running:
             break
-        try:
-            channel = _get_rabbitmq_consume_channel()
-            channel.queue_declare(queue=settings.Q_CHANNEL_IN, durable=True)
+        else:
+            try:
+                channel = _get_rabbitmq_consume_channel()
+                channel.queue_declare(queue=settings.Q_CHANNEL_IN, durable=True)
 
-            def callback(ch, method, properties, body):
-                try:
-                    payload = body.decode()
-                except UnicodeDecodeError:
-                    logger.error("Received RabbitMQ message with an undecodable body. Dropping (not requeued).")
-                    ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
-                    return
-
-                try:
-                    process_message(payload)
-                    ch.basic_ack(delivery_tag=method.delivery_tag)
-                    _message_attempts.pop(body, None)
-                except Exception:
-                    attempts = _message_attempts.get(body, 0) + 1
-                    _message_attempts[body] = attempts
-
-                    if attempts >= settings.Q_CONSUME_MAX_ATTEMPTS:
-                        logger.exception(f"Giving up on message after {attempts} attempts. Dropping (not requeued).")
-                        _message_attempts.pop(body, None)
+                def callback(ch, method, properties, body):
+                    try:
+                        payload = body.decode()
+                    except UnicodeDecodeError:
+                        logger.error("Received RabbitMQ message with an undecodable body. Dropping (not requeued).")
                         ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
-                    else:
-                        logger.exception(f"Failed to process incoming RabbitMQ message (attempt {attempts}/{settings.Q_CONSUME_MAX_ATTEMPTS}). Requeuing...")
-                        ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
+                        return
 
-            channel.basic_consume(
-                queue=settings.Q_CHANNEL_IN,
-                on_message_callback=callback,
-                auto_ack=False
-            )
-            logger.info("RabbitMQ consumer started")
-            channel.start_consuming()
-        except (
-            pika.exceptions.AMQPConnectionError,
-            pika.exceptions.StreamLostError,
-            pika.exceptions.ChannelWrongStateError,
-        ):
-            logger.warning("RabbitMQ consumer disconnected. Reconnecting...")
-            time.sleep(settings.Q_CONSUME_RETRY_DELAY)
-        except Exception:
-            logger.exception("Unexpected RabbitMQ consumer error detected.")
-            time.sleep(settings.Q_CONSUME_RETRY_DELAY)
+                    try:
+                        process_message(payload)
+                        ch.basic_ack(delivery_tag=method.delivery_tag)
+                        _message_attempts.pop(body, None)
+                    except Exception:
+                        attempts = _message_attempts.get(body, 0) + 1
+                        _message_attempts[body] = attempts
+
+                        if attempts >= settings.Q_CONSUME_MAX_ATTEMPTS:
+                            logger.exception(f"Giving up on message after {attempts} attempts. Dropping (not requeued).")
+                            _message_attempts.pop(body, None)
+                            ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
+                        else:
+                            logger.exception(f"Failed to process incoming RabbitMQ message (attempt {attempts}/{settings.Q_CONSUME_MAX_ATTEMPTS}). Requeuing...")
+                            ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
+
+                channel.basic_consume(
+                    queue=settings.Q_CHANNEL_IN,
+                    on_message_callback=callback,
+                    auto_ack=False
+                )
+                logger.info("RabbitMQ consumer started")
+                channel.start_consuming()
+            except (
+                pika.exceptions.AMQPConnectionError,
+                pika.exceptions.StreamLostError,
+                pika.exceptions.ChannelWrongStateError,
+            ):
+                logger.warning("RabbitMQ consumer disconnected. Reconnecting...")
+                time.sleep(settings.Q_CONSUME_RETRY_DELAY)
+            except Exception:
+                logger.exception("Unexpected RabbitMQ consumer error detected.")
+                time.sleep(settings.Q_CONSUME_RETRY_DELAY)
 
 def start_queue_consumer():
     """

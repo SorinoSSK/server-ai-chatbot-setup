@@ -66,21 +66,21 @@ def _handle_poll(task_id: str, chat_id: int, question: str, options: list, allow
     if not question:
         logger.error(f"Poll payload for chat_id={chat_id} is missing a question. Message dropped.")
         return
-
-    valid_options = [option for option in (options or []) if option]
-    result = send_poll(chat_id, question, valid_options, allows_multiple_answers)
-    if result is None:
-        return
-
-    if result.get("error"):
-        push_tier1_delivery_failed(task_id, "poll", result.get("status_code"), result.get("reason"))
-        return
-
-    poll_id = result["poll_id"]
-    if create_poll_mapping(poll_id, chat_id, task_id, result["message_id"]):
-        start_poll_timer(poll_id, chat_id)
     else:
-        logger.error(f"Failed to create poll mapping for poll_id={poll_id} (task_id={task_id}). Answers to this poll will not be collected.")
+        valid_options = [option for option in (options or []) if option]
+        result = send_poll(chat_id, question, valid_options, allows_multiple_answers)
+        if result is None:
+            return
+        else:
+            if result.get("error"):
+                push_tier1_delivery_failed(task_id, "poll", result.get("status_code"), result.get("reason"))
+                return
+            else:
+                poll_id = result["poll_id"]
+                if create_poll_mapping(poll_id, chat_id, task_id, result["message_id"]):
+                    start_poll_timer(poll_id, chat_id)
+                else:
+                    logger.error(f"Failed to create poll mapping for poll_id={poll_id} (task_id={task_id}). Answers to this poll will not be collected.")
 
 def _send_media_with_caption(send_func, attempted_type: str, task_id: str, chat_id: int, url: str, message: str) -> None:
     """
@@ -333,20 +333,19 @@ def _format_duration(seconds: int) -> str | None:
     """
     if seconds <= 0:
         return None
-
-    if seconds < 60:
+    elif seconds < 60:
         return f"{seconds} second{'s' if seconds != 1 else ''}"
-
-    minutes = seconds // 60
-    if minutes < 60:
-        return f"{minutes} minute{'s' if minutes != 1 else ''}"
-
-    hours = minutes // 60
-    remaining_minutes = minutes % 60
-    if remaining_minutes:
-        return f"{hours} hour{'s' if hours != 1 else ''} {remaining_minutes} minute{'s' if remaining_minutes != 1 else ''}"
     else:
-        return f"{hours} hour{'s' if hours != 1 else ''}"
+        minutes = seconds // 60
+        if minutes < 60:
+            return f"{minutes} minute{'s' if minutes != 1 else ''}"
+        else:
+            hours = minutes // 60
+            remaining_minutes = minutes % 60
+            if remaining_minutes:
+                return f"{hours} hour{'s' if hours != 1 else ''} {remaining_minutes} minute{'s' if remaining_minutes != 1 else ''}"
+            else:
+                return f"{hours} hour{'s' if hours != 1 else ''}"
 
 def _handle_completed(task_id: str, chat_id: int) -> None:
     """
@@ -462,48 +461,48 @@ def process_message(payload: str) -> None:
     if not isinstance(data, dict):
         logger.critical(f"Received RabbitMQ message with a non-object JSON payload: {payload}")
         return
-
-    task_id = data.get("task_id")
-    if not task_id:
-        logger.critical(f"Received RabbitMQ message with missing task_id field: {payload}")
     else:
-        stop_typing(task_id)
-
-        mapping = get_task_mapping(task_id)
-        if not mapping:
-            logger.error(f"No task mapping found in Redis for task_id={task_id}. Message dropped.")
+        task_id = data.get("task_id")
+        if not task_id:
+            logger.critical(f"Received RabbitMQ message with missing task_id field: {payload}")
         else:
-            chat_id = mapping.get("chat_id")
+            stop_typing(task_id)
 
-            message_type = data.get("type")
-            if message_type == "poll":
-                _handle_poll(
-                    task_id,
-                    chat_id,
-                    data.get("question"),
-                    data.get("options"),
-                    data.get("allows_multiple_answers")
-                )
-            elif message_type == "image":
-                _handle_image(task_id, chat_id, data.get("url"), data.get("caption"))
-            elif message_type == "video":
-                _handle_video(task_id, chat_id, data.get("url"), data.get("caption"))
-            elif message_type == "album":
-                _handle_album(task_id, chat_id, data.get("items"))
-            elif message_type == "file":
-                _handle_file(task_id, chat_id, data.get("url"), data.get("caption"))
-            elif message_type == "text":
-                _handle_text(task_id, chat_id, data.get("text"), data.get("buttons"))
-            elif message_type == "completed":
-                _handle_completed(task_id, chat_id)
-            elif message_type == "error":
-                _handle_error(task_id, chat_id, data.get("error_type"), data.get("message"))
-            elif message_type == "session_reset":
-                _handle_session_reset(task_id, chat_id)
+            mapping = get_task_mapping(task_id)
+            if not mapping:
+                logger.error(f"No task mapping found in Redis for task_id={task_id}. Message dropped.")
             else:
-                logger.error(f"Received RabbitMQ message with unknown type={message_type}: {payload}")
+                chat_id = mapping.get("chat_id")
 
-            if message_type in ("poll", "image", "video", "album", "file", "text"):
-                logger.info(f"Routed {message_type} response for task_id={task_id} (chat_id={chat_id}) to its handler.")
+                message_type = data.get("type")
+                if message_type == "poll":
+                    _handle_poll(
+                        task_id,
+                        chat_id,
+                        data.get("question"),
+                        data.get("options"),
+                        data.get("allows_multiple_answers")
+                    )
+                elif message_type == "image":
+                    _handle_image(task_id, chat_id, data.get("url"), data.get("caption"))
+                elif message_type == "video":
+                    _handle_video(task_id, chat_id, data.get("url"), data.get("caption"))
+                elif message_type == "album":
+                    _handle_album(task_id, chat_id, data.get("items"))
+                elif message_type == "file":
+                    _handle_file(task_id, chat_id, data.get("url"), data.get("caption"))
+                elif message_type == "text":
+                    _handle_text(task_id, chat_id, data.get("text"), data.get("buttons"))
+                elif message_type == "completed":
+                    _handle_completed(task_id, chat_id)
+                elif message_type == "error":
+                    _handle_error(task_id, chat_id, data.get("error_type"), data.get("message"))
+                elif message_type == "session_reset":
+                    _handle_session_reset(task_id, chat_id)
+                else:
+                    logger.error(f"Received RabbitMQ message with unknown type={message_type}: {payload}")
+
+                if message_type in ("poll", "image", "video", "album", "file", "text"):
+                    logger.info(f"Routed {message_type} response for task_id={task_id} (chat_id={chat_id}) to its handler.")
 
 # =============================================================================

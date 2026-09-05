@@ -64,23 +64,23 @@ def push_tier1_delivery_failed(task_id: str, attempted_type: str, status_code: i
     if not session_id:
         logger.error(f"Failed to resolve session_id for task_id={task_id}. Tier 1 delivery_failed event dropped.")
         return False
+    else:
+        payload = {
+            "task_id": task_id,
+            "session_id": session_id,
+            "type": "delivery_failed",
+            "tier": 1,
+            "attempted_type": attempted_type,
+            "status_code": status_code,
+            "reason": reason
+        }
 
-    payload = {
-        "task_id": task_id,
-        "session_id": session_id,
-        "type": "delivery_failed",
-        "tier": 1,
-        "attempted_type": attempted_type,
-        "status_code": status_code,
-        "reason": reason
-    }
-
-    if not queue_push_task(payload):
-        logger.error(f"Failed to push Tier 1 delivery_failed event for task_id={task_id} to RabbitMQ. Event dropped.")
-        return False
-
-    logger.info(f"Pushed Tier 1 delivery_failed event for task_id={task_id} (attempted_type={attempted_type}, status_code={status_code}).")
-    return True
+        if not queue_push_task(payload):
+            logger.error(f"Failed to push Tier 1 delivery_failed event for task_id={task_id} to RabbitMQ. Event dropped.")
+            return False
+        else:
+            logger.info(f"Pushed Tier 1 delivery_failed event for task_id={task_id} (attempted_type={attempted_type}, status_code={status_code}).")
+            return True
 
 def record_send_success() -> None:
     """
@@ -170,8 +170,8 @@ def _push_tier2_gateway_alert(reason: str, status_code: int | None) -> bool:
     if not queue_push_task(payload):
         logger.error("Failed to push Tier 2 gateway_alert event to RabbitMQ. Event dropped (already logged critically above).")
         return False
-
-    logger.info(f"Pushed Tier 2 gateway_alert event (reason={reason}).")
-    return True
+    else:
+        logger.info(f"Pushed Tier 2 gateway_alert event (reason={reason}).")
+        return True
 
 # =============================================================================
