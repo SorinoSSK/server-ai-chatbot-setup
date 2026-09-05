@@ -20,12 +20,21 @@
 import logging
 import threading
 
-from .utils_queue.queue import initialise_rabbitmq_connection, start_queue_consumer, stop_queue_consumer, close_rabbitmq_connection
+from .utils_queue.queue import (
+    initialise_rabbitmq_connection,
+    start_queue_consumer,
+    stop_queue_consumer,
+    close_rabbitmq_connection
+)
 from .utils_redis.database import initialise_redis_connection, close_redis_connection
 from .utils_telegram.gateway_inbound import poll_updates, stop_polling
 from .utils_telegram.utilities.image_draft_handler import close_orphaned_drafts
 from .utils_telegram.utilities.poll_response_handler import close_orphaned_polls
-from .utils_session.session_reset_handler import resync_pending_resets, start_pending_reset_ceiling_sweep, stop_pending_reset_ceiling_sweep
+from .utils_session.session_reset_handler import (
+    resync_pending_resets, 
+    start_pending_reset_ceiling_sweep, 
+    stop_pending_reset_ceiling_sweep
+)
 
 # =============================================================================
 # G L O B A L   V A R I A B L E
