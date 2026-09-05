@@ -5,7 +5,7 @@
 # Created On  : 2026-08-29
 #
 # Features    :
-#   - Dispatches incoming queue messages by type - poll/image/video/album/file/text/completed/error.
+#   - Dispatches incoming queue messages by type - poll/image/video/album/file/text/completed/error/session_reset.
 #     See README.md for the payload shape per type.
 #   - text messages may carry inline keyboard buttons - see utils_telegram/utilities/button_prompt_handler.py.
 #   - poll messages start their answer-collection timer on send - see utils_telegram/utilities/poll_response_handler.py.
@@ -28,6 +28,7 @@ from ..utils_telegram.gateway_outbound import send_message, send_poll, send_phot
 from ..utils_telegram.utilities.button_prompt_handler import register_bot_button, send_message_with_buttons
 from ..utils_telegram.utilities.typing_indicator import stop_typing
 from ..utils_telegram.utilities.poll_response_handler import start_poll_timer
+from ..utils_session.session_reset_handler import handle_session_reset_request, resolve_pending_reset_if_ready
 from .error_handling import push_tier1_delivery_failed
 
 # =============================================================================
@@ -347,18 +348,44 @@ def _format_duration(seconds: int) -> str | None:
     else:
         return f"{hours} hour{'s' if hours != 1 else ''}"
 
-def _handle_completed(task_id: str) -> None:
+def _handle_completed(task_id: str, chat_id: int) -> None:
     """
     Handle a completed marker payload - deletes the task's Redis mapping.
 
     Args:
         task_id (str)
 
+        chat_id (int):
+            Passed through to delete_task_mapping() so the task_id is also unindexed from session_tasks:<chat_id> - see utils_redis/database.py.
+
     Returns:
         None
+
+    Notes:
+        - Also gives a deferred session_reset for chat_id a chance to resolve now that this task_id no longer counts as open - see utils_session/session_reset_handler.py::resolve_pending_reset_if_ready().
     """
-    deleted = delete_task_mapping(task_id)
+    deleted = delete_task_mapping(task_id, chat_id)
     logger.info(f"Task task_id={task_id} completed. Is mapping deleted successfully: {deleted}.")
+    resolve_pending_reset_if_ready(chat_id)
+
+def _handle_session_reset(task_id: str, chat_id: int) -> None:
+    """
+    Handle a session_reset marker payload - thin delegate onto utils_session/session_reset_handler.py.
+
+    Args:
+        task_id (str):
+            The task_id the session_reset instruction arrived on - see handle_session_reset_request()'s own docstring.
+
+        chat_id (int)
+
+    Returns:
+        None
+
+    Notes:
+        - Execution authority for triggering a reset belongs to the orchestrator, not this gateway - this handler only carries out a reset instruction already decided upstream.
+        - See utils_session/session_reset_handler.py for the whitelist check, defer-vs-immediate decision, and what a reset actually clears/acks/notifies.
+    """
+    handle_session_reset_request(task_id, chat_id)
 
 def _handle_error(task_id: str, chat_id: int, error_type: str, message: str) -> None:
     """
@@ -380,6 +407,7 @@ def _handle_error(task_id: str, chat_id: int, error_type: str, message: str) -> 
     Notes:
         - "token_exhausted": duration is omitted from the reply if message is missing/invalid.
         - Any other error_type: message is HTML-escaped and sent as-is (untrusted, agent-supplied).
+        - Also gives a deferred session_reset for chat_id a chance to resolve now that this task_id no longer counts as open - see utils_session/session_reset_handler.py::resolve_pending_reset_if_ready().
     """
     if error_type == "token_exhausted":
         try:
@@ -406,8 +434,9 @@ def _handle_error(task_id: str, chat_id: int, error_type: str, message: str) -> 
             parse_mode="HTML"
         )
 
-    deleted = delete_task_mapping(task_id)
+    deleted = delete_task_mapping(task_id, chat_id)
     logger.info(f"Task task_id={task_id} errored (error_type={error_type}). Is mapping deleted successfully: {deleted}.")
+    resolve_pending_reset_if_ready(chat_id)
 
 def process_message(payload: str) -> None:
     """
@@ -445,7 +474,6 @@ def process_message(payload: str) -> None:
             logger.error(f"No task mapping found in Redis for task_id={task_id}. Message dropped.")
         else:
             chat_id = mapping.get("chat_id")
-            user_id = mapping.get("user_id")
 
             message_type = data.get("type")
             if message_type == "poll":
@@ -467,9 +495,11 @@ def process_message(payload: str) -> None:
             elif message_type == "text":
                 _handle_text(task_id, chat_id, data.get("text"), data.get("buttons"))
             elif message_type == "completed":
-                _handle_completed(task_id)
+                _handle_completed(task_id, chat_id)
             elif message_type == "error":
                 _handle_error(task_id, chat_id, data.get("error_type"), data.get("message"))
+            elif message_type == "session_reset":
+                _handle_session_reset(task_id, chat_id)
             else:
                 logger.error(f"Received RabbitMQ message with unknown type={message_type}: {payload}")
 

@@ -134,6 +134,23 @@ class Settings:
             if chat_id.strip().lstrip("-").isdigit()
         }
 
+        # Session Reset (see utils_session/session_reset_handler.py)
+        # Whitelist of chat IDs allowed to trigger a session_reset. Same pattern as TELEGRAM_ALLOWED_CHAT_IDS above.
+        DEFAULT_SESSION_RESET_ALLOWED_CHAT_IDS = ""
+        self.SESSION_RESET_ALLOWED_CHAT_IDS = {
+            int(chat_id.strip())
+            for chat_id in (os.getenv("SESSION_RESET_ALLOWED_CHAT_IDS") or DEFAULT_SESSION_RESET_ALLOWED_CHAT_IDS).split(",")
+            if chat_id.strip().lstrip("-").isdigit()
+        }
+        # Ceiling on how long a deferred session_reset may wait for its chat's open task_id(s) to
+        # naturally complete before being forced through regardless (treated as abandoned for reset
+        # purposes only) - backstops a completed/error that never arrives (a poll that timed out with
+        # nothing pushed, an orphaned/expired task mapping, or any other stuck task) - see TODO.md §8.
+        DEFAULT_PENDING_RESET_MAX_WAIT_SECONDS                  = 3600   # 1h - comfortably above POLL_GLOBAL_CAP_SECONDS/DRAFT_CLOSE_SECONDS, so a still-genuinely-in-flight poll/draft is never mistaken for a stuck one
+        DEFAULT_PENDING_RESET_SWEEP_INTERVAL_SECONDS            = 60     # how often the ceiling above is checked
+        self.PENDING_RESET_MAX_WAIT_SECONDS                     = get_env_int("PENDING_RESET_MAX_WAIT_SECONDS", DEFAULT_PENDING_RESET_MAX_WAIT_SECONDS)
+        self.PENDING_RESET_SWEEP_INTERVAL_SECONDS               = get_env_int("PENDING_RESET_SWEEP_INTERVAL_SECONDS", DEFAULT_PENDING_RESET_SWEEP_INTERVAL_SECONDS)
+
         # Event types Telegram is asked to deliver - restricts what getUpdates returns server-side (does not filter by chat).
         self.TELEGRAM_ALLOWED_UPDATES = [
             update_type.strip()

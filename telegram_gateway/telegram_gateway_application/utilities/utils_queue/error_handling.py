@@ -21,6 +21,7 @@ import logging
 import threading
 
 from ...config import settings
+from ..utils_redis.database import generate_session
 
 # =============================================================================
 # G L O B A L   V A R I A B L E
@@ -55,11 +56,18 @@ def push_tier1_delivery_failed(task_id: str, attempted_type: str, status_code: i
 
     Notes:
         - Used only when a specific request was rejected (by Telegram, or by local validation) - never for connection-level failures, which carry no "wrong tool" signal and are reported via record_send_failure() instead.
+        - session_id is resolved via generate_session() and is mandatory on every outbound payload - see utils_redis/database.py.
     """
     from .queue import queue_push_task
 
+    session_id = generate_session(task_id=task_id)
+    if not session_id:
+        logger.error(f"Failed to resolve session_id for task_id={task_id}. Tier 1 delivery_failed event dropped.")
+        return False
+
     payload = {
         "task_id": task_id,
+        "session_id": session_id,
         "type": "delivery_failed",
         "tier": 1,
         "attempted_type": attempted_type,
@@ -102,8 +110,7 @@ def record_send_failure(reason: str, status_code: int | None = None) -> None:
             "unauthorized" | "not_found" | "unreachable".
 
         status_code (int | None, optional):
-            Telegram's HTTP status code, if any (e.g. 401 for "unauthorized",
-            404 for "not_found"). Defaults to None.
+            Telegram's HTTP status code, if any (e.g. 401 for "unauthorized", 404 for "not_found"). Defaults to None.
 
     Returns:
         None
@@ -144,7 +151,7 @@ def _push_tier2_gateway_alert(reason: str, status_code: int | None) -> bool:
             True if pushed successfully; otherwise False.
 
     Notes:
-        - task_id is deliberately None - this isn't about any single task, so consumers of Q_CHANNEL_OUT need to expect a task_id-less message of type="gateway_alert".
+        - task_id and session_id are both deliberately None - this isn't about any single task or chat, so consumers of Q_CHANNEL_OUT need to expect a task_id/session_id-less message of type="gateway_alert".
         - Always logged at CRITICAL first, regardless of the queue push outcome, so this stays visible via infra/log-based monitoring even if RabbitMQ itself is part of what's currently broken.
     """
     logger.critical(f"Gateway alert: Telegram delivery failed - reason={reason}, status_code={status_code}. Human intervention likely required.")
@@ -153,6 +160,7 @@ def _push_tier2_gateway_alert(reason: str, status_code: int | None) -> bool:
 
     payload = {
         "task_id": None,
+        "session_id": None,
         "type": "gateway_alert",
         "tier": 2,
         "reason": reason,
