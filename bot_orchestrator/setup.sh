@@ -47,60 +47,56 @@ docker_network_check()
     fi
 }
 
-tg_prod_build_docker()
+bo_prod_build_docker()
 {
-    # Docker to build all from <project>/telegram_gateway
-    docker build -f Dockerfile.prod -t "${CHATBOT_TELEGRAM_GATEWAY_PROD_IMAGE_NAME}:${CHATBOT_TELEGRAM_GATEWAY_PROD_VERSION}" .
+    # Docker to build all from <project>/bot_orchestrator
+    docker build -f Dockerfile.prod -t "${CHATBOT_BOT_ORCHESTRATOR_PROD_IMAGE_NAME}:${CHATBOT_BOT_ORCHESTRATOR_PROD_VERSION}" .
 }
 
-tg_dev_build_docker()
+bo_dev_build_docker()
 {
-    # Docker to build all from <project>/telegram_gateway
-    docker build -f Dockerfile.dev -t "${CHATBOT_TELEGRAM_GATEWAY_DEV_IMAGE_NAME}" .
+    # Docker to build all from <project>/bot_orchestrator
+    docker build -f Dockerfile.dev -t "${CHATBOT_BOT_ORCHESTRATOR_DEV_IMAGE_NAME}" .
 }
 
-tg_dev_run_docker()
+bo_dev_run_docker()
 {
     local dev_path="${1:-}"
-    tg_dev_remove_docker
+    bo_dev_remove_docker
     docker_network_check
-    # Port publishing disabled for now. To re-enable, add back:
-    #   -p "${CHATBOT_TELEGRAM_GATEWAY_DEV_PORT}:${CHATBOT_TELEGRAM_GATEWAY_DEV_PORT}" \
     if [[ -n "${dev_path}" ]]; then
-        echo "Exposed telegram_gateway_application."
+        echo "Exposed bot_orchestrator_application."
         docker run -d \
-            --name "${CHATBOT_TELEGRAM_GATEWAY_DEV_CONTAINER_NAME}" \
+            --name "${CHATBOT_BOT_ORCHESTRATOR_DEV_CONTAINER_NAME}" \
             --network "${CHATBOT_NETWORK_NAME}" \
-            -e "TELEGRAM_BOT_TOKEN=${CHATBOT_TELEGRAM_BOT_TOKEN}" \
-            -e "TELEGRAM_ALLOWED_CHAT_IDS=${CHATBOT_TELEGRAM_ALLOWED_CHAT_IDS}" \
-            -e "SESSION_RESET_ALLOWED_CHAT_IDS=${CHATBOT_SESSION_RESET_ALLOWED_CHAT_IDS}" \
-            -v "${dev_path}/telegram_gateway_application:/telegram_gateway/telegram_gateway_application" \
-            "${CHATBOT_TELEGRAM_GATEWAY_DEV_IMAGE_NAME}"
+            -e "Q_USER=${CHATBOT_RABBITMQ_USERNAME}" \
+            -e "Q_PASSWORD=${CHATBOT_RABBITMQ_PASSWORD}" \
+            -v "${dev_path}/bot_orchestrator_application:/bot_orchestrator/bot_orchestrator_application" \
+            "${CHATBOT_BOT_ORCHESTRATOR_DEV_IMAGE_NAME}"
     else
         docker run -d \
-            --name "${CHATBOT_TELEGRAM_GATEWAY_DEV_CONTAINER_NAME}" \
+            --name "${CHATBOT_BOT_ORCHESTRATOR_DEV_CONTAINER_NAME}" \
             --network "${CHATBOT_NETWORK_NAME}" \
-            -e "TELEGRAM_BOT_TOKEN=${CHATBOT_TELEGRAM_BOT_TOKEN}" \
-            -e "TELEGRAM_ALLOWED_CHAT_IDS=${CHATBOT_TELEGRAM_ALLOWED_CHAT_IDS}" \
-            -e "SESSION_RESET_ALLOWED_CHAT_IDS=${CHATBOT_SESSION_RESET_ALLOWED_CHAT_IDS}" \
-            "${CHATBOT_TELEGRAM_GATEWAY_DEV_IMAGE_NAME}"
+            -e "Q_USER=${CHATBOT_RABBITMQ_USERNAME}" \
+            -e "Q_PASSWORD=${CHATBOT_RABBITMQ_PASSWORD}" \
+            "${CHATBOT_BOT_ORCHESTRATOR_DEV_IMAGE_NAME}"
     fi
 }
 
-tg_dev_remove_docker()
+bo_dev_remove_docker()
 {
-    stop_docker "${CHATBOT_TELEGRAM_GATEWAY_DEV_CONTAINER_NAME}"
-    if docker_check "${CHATBOT_TELEGRAM_GATEWAY_DEV_CONTAINER_NAME}"; then
-        docker rm "${CHATBOT_TELEGRAM_GATEWAY_DEV_CONTAINER_NAME}"
+    stop_docker "${CHATBOT_BOT_ORCHESTRATOR_DEV_CONTAINER_NAME}"
+    if docker_check "${CHATBOT_BOT_ORCHESTRATOR_DEV_CONTAINER_NAME}"; then
+        docker rm "${CHATBOT_BOT_ORCHESTRATOR_DEV_CONTAINER_NAME}"
     fi
 }
 
-tg_dev_access_docker()
+bo_dev_access_docker()
 {
-    docker exec -it "${CHATBOT_TELEGRAM_GATEWAY_DEV_CONTAINER_NAME}" sh
+    docker exec -it "${CHATBOT_BOT_ORCHESTRATOR_DEV_CONTAINER_NAME}" sh
 }
 
-tg_dev_show_menu()
+bo_dev_show_menu()
 {
     local dev_path="${1:-}"
     echo "Select an option:"
@@ -113,14 +109,14 @@ tg_dev_show_menu()
 
     case "${setup_select}" in
     1)
-        tg_dev_build_docker
-        tg_dev_run_docker "${dev_path}"
+        bo_dev_build_docker
+        bo_dev_run_docker "${dev_path}"
         ;;
     2)
-        tg_dev_remove_docker
+        bo_dev_remove_docker
         ;;
     3)
-        tg_dev_access_docker
+        bo_dev_access_docker
         ;;
     q|Q)
         exit 0
@@ -140,7 +136,7 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
         echo "NOTICE: ${script_dir}"
 
         source "${config_path}"
-        tg_dev_show_menu "${script_dir}"
+        bo_dev_show_menu "${script_dir}"
     else
         echo "NOTICE: ${config_path} not found."
     fi

@@ -30,7 +30,7 @@ from ...config import settings
 from ..utilities import ShutdownSignal
 from ..utils_gatekeeper.gatekeeper import track_unauthorised_access
 from ..utils_queue.queue import queue_push_task
-from ..utils_redis.database import create_task_mapping, get_chat_draft, create_chat_draft, delete_chat_draft
+from ..utils_redis.database import create_task_mapping, get_chat_draft, create_chat_draft, delete_chat_draft, generate_session
 from .gateway_outbound import send_message, log_sanitised_exception
 from .utilities.typing_indicator import start_typing
 from .utilities.image_draft_handler import start_draft_timer, stop_draft_timer, continue_draft_timer
@@ -282,6 +282,7 @@ def _push_task(chat_id: int, user_id: int, text: str, image_url: str = "", video
 
     Notes:
         - At most one of image_url/video_url/file_url is expected to be non-empty.
+        - session_id is resolved/created via generate_session() and is mandatory on every outbound payload - see utils_redis/database.py.
         - start_typing() begins only after queue_push_task() succeeds.
     """
     task_id = create_task_mapping(chat_id, user_id)
@@ -292,8 +293,19 @@ def _push_task(chat_id: int, user_id: int, text: str, image_url: str = "", video
             f"{settings.TELEGRAM_BOT_NAME} have been working hard and might be sick. "
             f"Could you check on {settings.TELEGRAM_BOT_NAME}?"
         )
+        return
+
+    session_id = generate_session(chat_id=chat_id)
+    if not session_id:
+        logger.error(f"Failed to resolve session_id for chat_id={chat_id}. Message dropped.")
+        send_message(
+            chat_id,
+            f"{settings.TELEGRAM_BOT_NAME} have been working hard and might be sick. "
+            f"Could you check on {settings.TELEGRAM_BOT_NAME}?"
+        )
     elif not queue_push_task({
         "task_id": task_id,
+        "session_id": session_id,
         "text": text or "",
         "image_url": image_url or "",
         "video_url": video_url or "",
