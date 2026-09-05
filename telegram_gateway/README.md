@@ -435,7 +435,7 @@ No per-task retry or different tool fixes either - human intervention is the onl
 
 #### `session_cleared`
 
-Pushed once a `session_reset` (see below) has actually taken effect for a chat - the orchestrator's positive confirmation that this specific `session_id` is gone on the gateway side. See `utils_session/session_reset_handler.py::push_session_cleared()`.
+Pushed once a `session_reset` (see below) has actually taken effect for a chat - the orchestrator's positive confirmation that this specific `session_id` is gone on the gateway side. See `utils_session/session_reset_handler.py::_push_session_cleared()`.
 
 ```json
 {"task_id": null, "session_id": "...", "chat_id": 123456789, "type": "session_cleared"}

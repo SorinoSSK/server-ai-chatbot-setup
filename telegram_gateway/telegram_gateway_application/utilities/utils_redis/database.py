@@ -875,7 +875,7 @@ def get_all_pending_resets() -> list[tuple[int, str, float]]:
             (chat_id, task_id, created_at) for every pending_reset:<chat_id> key present; empty list on failure.
 
     Notes:
-        - Used on startup to resync deferred resets that may have become resolvable while the gateway was down, and by the periodic PENDING_RESET_MAX_WAIT_SECONDS backstop sweep - see utils_session/session_reset_handler.py::resync_pending_resets()/enforce_pending_reset_ceiling().
+        - Used on startup to resync deferred resets that may have become resolvable while the gateway was down, and by the periodic PENDING_RESET_MAX_WAIT_SECONDS backstop sweep - see utils_session/session_reset_handler.py::resync_pending_resets()/_enforce_pending_reset_ceiling().
         - `created_at` is whatever was written by set_pending_reset() - used by the callers above to decide whether a pending reset has been waiting too long, not interpreted here.
         - Uses SCAN (not KEYS) so it doesn't block Redis on a large keyspace.
     """

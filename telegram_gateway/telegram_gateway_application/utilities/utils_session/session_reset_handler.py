@@ -14,7 +14,7 @@
 # Notes       :
 #   - Execution authority for triggering a reset belongs to the orchestrator, not this gateway - this module only carries out a reset instruction already decided upstream.
 #   - An open poll always has an open task_id (see utils_redis/database.py::has_open_tasks()), so it can only ever be encountered on the deferred path here, which waits rather than force-closing it - except defensively in the force-through path (see _force_apply_session_reset()), in case PENDING_RESET_MAX_WAIT_SECONDS is ever configured shorter than a poll's own maximum lifetime.
-#   - Deferred import of queue_push_task in push_session_cleared() to avoid a circular import (queue.py -> message_handler.py -> ... -> queue.py), same pattern as utils_queue/error_handling.py::push_tier1_delivery_failed() and utils_telegram/utilities/poll_response_handler.py::_push_poll_answer().
+#   - Deferred import of queue_push_task in _push_session_cleared() to avoid a circular import (queue.py -> message_handler.py -> ... -> queue.py), same pattern as utils_queue/error_handling.py::push_tier1_delivery_failed() and utils_telegram/utilities/poll_response_handler.py::_push_poll_answer().
 #
 # =============================================================================
 # I M P O R T   H E A D E R
@@ -34,7 +34,7 @@ from ..utils_telegram.utilities.poll_response_handler import stop_poll_for_reset
 
 logger = logging.getLogger(__name__)
 
-# Sent to a chat once its session has actually been reset - see send_reset_notice().
+# Sent to a chat once its session has actually been reset - see _send_reset_notice().
 # Set directly here - not chosen/generated at send-time.
 RESET_NOTICE_MESSAGE: str = "Looks like Rukia got a little refresh... let's start fresh."
 
@@ -57,7 +57,7 @@ def _is_reset_allowed(chat_id: int) -> bool:
     """
     return chat_id in settings.SESSION_RESET_ALLOWED_CHAT_IDS
 
-def push_session_cleared(chat_id: int, session_id: str) -> bool:
+def _push_session_cleared(chat_id: int, session_id: str) -> bool:
     """
     Pushes a session_cleared event onto Q_CHANNEL_OUT - the orchestrator's positive confirmation that a specific session_id is gone on the gateway side.
 
@@ -86,11 +86,11 @@ def push_session_cleared(chat_id: int, session_id: str) -> bool:
     if not queue_push_task(payload):
         logger.error(f"Failed to push session_cleared event for chat_id={chat_id} (session_id={session_id}) to RabbitMQ. Event dropped.")
         return False
+    else:
+        logger.info(f"Pushed session_cleared event for chat_id={chat_id} (session_id={session_id}).")
+        return True
 
-    logger.info(f"Pushed session_cleared event for chat_id={chat_id} (session_id={session_id}).")
-    return True
-
-def send_reset_notice(chat_id: int) -> None:
+def _send_reset_notice(chat_id: int) -> None:
     """
     Informs a chat that its session has just been reset.
 
@@ -110,8 +110,8 @@ def send_reset_notice(chat_id: int) -> None:
     if not RESET_NOTICE_MESSAGE:
         logger.warning(f"RESET_NOTICE_MESSAGE is unset - no reset notice sent for chat_id={chat_id}.")
         return
-
-    send_message(chat_id, RESET_NOTICE_MESSAGE)
+    else:
+        send_message(chat_id, RESET_NOTICE_MESSAGE)
 
 def _apply_session_reset(chat_id: int) -> None:
     """
@@ -126,15 +126,15 @@ def _apply_session_reset(chat_id: int) -> None:
     Notes:
         - Stops the chat's draft keep-alive timer first - Redis state alone can't stop an in-memory timer (see utils_telegram/utilities/image_draft_handler.py::stop_draft_timer()); reset_session() only clears the Redis-side draft record itself.
         - No poll-specific handling here - an open poll always has an open task_id, so this point is only ever reached once none remain (see module Notes above).
-        - push_session_cleared()/send_reset_notice() only fire if reset_session() actually had something to clear (a non-None session_id) - a chat with no session to begin with has nothing to ack or notify about.
+        - _push_session_cleared()/_send_reset_notice() only fire if reset_session() actually had something to clear (a non-None session_id) - a chat with no session to begin with has nothing to ack or notify about.
         - Used by every path that ultimately applies a reset: the immediate path (handle_session_reset_request()), the deferred/resolved path (resolve_pending_reset_if_ready()), and startup crash-recovery (resync_pending_resets()).
     """
     stop_draft_timer(chat_id)
 
     cleared_session_id = reset_session(chat_id)
     if cleared_session_id:
-        push_session_cleared(chat_id, cleared_session_id)
-        send_reset_notice(chat_id)
+        _push_session_cleared(chat_id, cleared_session_id)
+        _send_reset_notice(chat_id)
 
 def _force_apply_session_reset(chat_id: int, task_id: str) -> None:
     """
@@ -181,18 +181,18 @@ def handle_session_reset_request(task_id: str, chat_id: int) -> None:
     Notes:
         - A chat_id not in settings.SESSION_RESET_ALLOWED_CHAT_IDS is logged and dropped - no defer, no reset, no notice, no orchestrator ack.
           Decided: silent (log only), no response of any kind.
-        - No user-facing message is sent while a reset is deferred (see send_reset_notice()) - the chat only ever hears about a reset once it has actually taken effect.
+        - No user-facing message is sent while a reset is deferred (see _send_reset_notice()) - the chat only ever hears about a reset once it has actually taken effect.
     """
     if not _is_reset_allowed(chat_id):
         logger.warning(f"Rejected session_reset request for chat_id={chat_id} (task_id={task_id}) - chat_id is not whitelisted.")
         return
-
-    if has_open_tasks(chat_id):
-        set_pending_reset(chat_id, task_id)
-        logger.info(f"Deferred session_reset for chat_id={chat_id} (task_id={task_id}) - an in-flight task is still open.")
     else:
-        _apply_session_reset(chat_id)
-        logger.info(f"Applied session_reset immediately for chat_id={chat_id} (task_id={task_id}) - no in-flight task was open.")
+        if has_open_tasks(chat_id):
+            set_pending_reset(chat_id, task_id)
+            logger.info(f"Deferred session_reset for chat_id={chat_id} (task_id={task_id}) - an in-flight task is still open.")
+        else:
+            _apply_session_reset(chat_id)
+            logger.info(f"Applied session_reset immediately for chat_id={chat_id} (task_id={task_id}) - no in-flight task was open.")
 
 def resolve_pending_reset_if_ready(chat_id: int) -> None:
     """
@@ -210,13 +210,12 @@ def resolve_pending_reset_if_ready(chat_id: int) -> None:
     """
     if get_pending_reset(chat_id) is None:
         return
-
-    if has_open_tasks(chat_id):
+    elif has_open_tasks(chat_id):
         return
-
-    clear_pending_reset(chat_id)
-    _apply_session_reset(chat_id)
-    logger.info(f"Resolved deferred session_reset for chat_id={chat_id} - its last open task has completed.")
+    else:
+        clear_pending_reset(chat_id)
+        _apply_session_reset(chat_id)
+        logger.info(f"Resolved deferred session_reset for chat_id={chat_id} - its last open task has completed.")
 
 def _is_pending_reset_expired(created_at: float) -> bool:
     """
@@ -253,13 +252,12 @@ def resync_pending_resets() -> None:
             if _is_pending_reset_expired(created_at):
                 clear_pending_reset(chat_id)
                 _force_apply_session_reset(chat_id, task_id)
-            continue
+        else:
+            clear_pending_reset(chat_id)
+            _apply_session_reset(chat_id)
+            logger.info(f"Resynced deferred session_reset for chat_id={chat_id} (task_id={task_id}) on startup - its task had already completed.")
 
-        clear_pending_reset(chat_id)
-        _apply_session_reset(chat_id)
-        logger.info(f"Resynced deferred session_reset for chat_id={chat_id} (task_id={task_id}) on startup - its task had already completed.")
-
-def enforce_pending_reset_ceiling() -> None:
+def _enforce_pending_reset_ceiling() -> None:
     """
     Force-applies every deferred session_reset that's exceeded PENDING_RESET_MAX_WAIT_SECONDS - the §8 (TODO.md) backstop against a task_id that's never going to send a completed/error (a poll that timed out with nothing pushed, an orphaned/expired task mapping, or any other stuck task).
 
@@ -276,13 +274,13 @@ def enforce_pending_reset_ceiling() -> None:
     for chat_id, task_id, created_at in get_all_pending_resets():
         if not _is_pending_reset_expired(created_at):
             continue
-
-        clear_pending_reset(chat_id)
-        _force_apply_session_reset(chat_id, task_id)
+        else:
+            clear_pending_reset(chat_id)
+            _force_apply_session_reset(chat_id, task_id)
 
 def _pending_reset_ceiling_loop() -> None:
     """
-    Background loop calling enforce_pending_reset_ceiling() every PENDING_RESET_SWEEP_INTERVAL_SECONDS, until stop_pending_reset_ceiling_sweep() is called.
+    Background loop calling _enforce_pending_reset_ceiling() every PENDING_RESET_SWEEP_INTERVAL_SECONDS, until stop_pending_reset_ceiling_sweep() is called.
 
     Args:
         None
@@ -291,7 +289,7 @@ def _pending_reset_ceiling_loop() -> None:
         None
     """
     while not _ceiling_sweep_stop_event.wait(settings.PENDING_RESET_SWEEP_INTERVAL_SECONDS):
-        enforce_pending_reset_ceiling()
+        _enforce_pending_reset_ceiling()
 
 def start_pending_reset_ceiling_sweep() -> None:
     """
@@ -311,14 +309,14 @@ def start_pending_reset_ceiling_sweep() -> None:
 
     if _ceiling_sweep_thread is not None and _ceiling_sweep_thread.is_alive():
         return
-
-    _ceiling_sweep_stop_event.clear()
-    _ceiling_sweep_thread = threading.Thread(target=_pending_reset_ceiling_loop, daemon=True)
-    _ceiling_sweep_thread.start()
-    logger.info(
-        f"Started pending-reset ceiling sweep (every {settings.PENDING_RESET_SWEEP_INTERVAL_SECONDS}s, "
-        f"ceiling {settings.PENDING_RESET_MAX_WAIT_SECONDS}s)."
-    )
+    else:
+        _ceiling_sweep_stop_event.clear()
+        _ceiling_sweep_thread = threading.Thread(target=_pending_reset_ceiling_loop, daemon=True)
+        _ceiling_sweep_thread.start()
+        logger.info(
+            f"Started pending-reset ceiling sweep (every {settings.PENDING_RESET_SWEEP_INTERVAL_SECONDS}s, "
+            f"ceiling {settings.PENDING_RESET_MAX_WAIT_SECONDS}s)."
+        )
 
 def stop_pending_reset_ceiling_sweep() -> None:
     """
