@@ -135,6 +135,77 @@ docker restart <docker-container-name>
 - Requires RabbitMQ and Redis to be reachable at startup; Redis, in particular, is required before Telegram polling begins.
 - A deferred `session_reset` applies the instant its chat's open task(s) naturally clear, with no forewarning sent beforehand ("nothing is sent to the chat while a reset is only deferred/waiting" - see `session_reset` below) - in a conversation with a single message after a lull, the reset (and its notice) can land immediately behind that one reply. This is the deferred design behaving as specified, not a defect, but is worth being aware of - see `TODO.md` §8's open question on whether it needs its own mitigation.
 
+### Redis Key Hierarchy
+
+Every key `utils_redis/database.py` generates is namespaced by `chat_id` - Redis itself has no native parent/child key relationship (keys are flat strings, there is no cascading delete), so the grouping below is a conceptual model enforced entirely by application logic, chiefly `reset_session()`.
+
+```text
+chat_id
+ │
+ ├── session:<chat_id>                         -> session_id (str)
+ │     Permanent (no TTL) - created once by _get_or_create_session(),
+ │     cleared only by reset_session().
+ │
+ ├── session_tasks:<chat_id>                   -> SET of task_id
+ │     Index only - created via create_task_mapping()'s sadd().
+ │     │
+ │     └── task:<task_id>                      -> {"chat_id", "user_id"} (json)
+ │           TTL = REDIS_TASK_MAPPING_TTL_SECONDS.
+ │           One key per open task; indexed above so reset_session()
+ │           can find every task_id under this chat without a SCAN.
+ │
+ ├── session_polls:<chat_id>                   -> SET of poll_id
+ │     Index only - created via create_poll_mapping()'s sadd().
+ │     │
+ │     └── poll:<poll_id>                      -> {"chat_id", "task_id",
+ │                                                  "message_id", "user_id",
+ │                                                  "option_ids"} (json)
+ │           TTL = POLL_MAPPING_TTL_SECONDS.
+ │           One key per open poll. Carries task_id back to the task
+ │           that spawned it (a poll always has a parent task).
+ │
+ ├── draft:<chat_id>                           -> {"media_type", "media_url",
+ │                                                  "text", "has_caption"} (json)
+ │     TTL = DRAFT_MAPPING_TTL_SECONDS.
+ │     At most one pending draft per chat_id (nx=True on write).
+ │
+ └── pending_reset:<chat_id>                   -> {"task_id", "created_at"} (json)
+       No TTL. Only exists while a session_reset is deferred, waiting
+       for has_open_tasks(chat_id) to go false.
+```
+
+| Key pattern | Value | TTL | Created by | Cardinality per chat |
+|---|---|---|---|---|
+| `session:<chat_id>` | session_id | None | `_get_or_create_session()` | 1 |
+| `session_tasks:<chat_id>` | SET of task_id | None | `create_task_mapping()` | 1 (grows/shrinks) |
+| `task:<task_id>` | `{chat_id, user_id}` | `REDIS_TASK_MAPPING_TTL_SECONDS` | `create_task_mapping()` | 0..N |
+| `session_polls:<chat_id>` | SET of poll_id | None | `create_poll_mapping()` | 1 (grows/shrinks) |
+| `poll:<poll_id>` | `{chat_id, task_id, message_id, user_id, option_ids}` | `POLL_MAPPING_TTL_SECONDS` | `create_poll_mapping()` | 0..N |
+| `draft:<chat_id>` | `{media_type, media_url, text, has_caption}` | `DRAFT_MAPPING_TTL_SECONDS` | `create_chat_draft()` | 0..1 |
+| `pending_reset:<chat_id>` | `{task_id, created_at}` | None | `set_pending_reset()` | 0..1 |
+
+`session:<chat_id>` is the only permanent anchor - everything else is transient, either TTL-bound or deleted once resolved/completed. `session_tasks:<chat_id>`/`session_polls:<chat_id>` are pure indexes (pointers only, no state of their own), letting `reset_session()`/`has_open_tasks()` answer "what's open for this chat?" without a full keyspace `SCAN`. `task_id` bridges two branches: it's a member of `session_tasks:<chat_id>`, the id half of `task:<task_id>`, and also embedded inside `poll:<poll_id>` - so a poll always traces back to the task that created it.
+
+#### `reset_session(chat_id)` cascade
+
+`reset_session()` does not rely on any Redis-native cascading delete - it explicitly knows and deletes each key pattern above, by hand, all scoped to the same `chat_id`, under one `_get_chat_lock(chat_id)`:
+
+```text
+reset_session(chat_id)                         <- everything below keyed by the SAME chat_id
+ │
+ ├── read   session:<chat_id>                  -> captured as cleared_session_id (for the return value)
+ ├── read   session_tasks:<chat_id>            -> SMEMBERS gives the set of task_ids
+ │     └── for each task_id found:
+ │           delete  task:<task_id>            <- individually, one DEL per member
+ ├── delete session_tasks:<chat_id>            <- the index itself
+ ├── delete session:<chat_id>                  <- the session_id value is gone now
+ ├── delete draft:<chat_id>                    <- via delete_chat_draft()
+ └── delete session_polls:<chat_id>            <- the index itself only (see note below)
+```
+
+- **`poll:<poll_id>` is not deleted here.** Unlike `task:<task_id>`, `reset_session()` only clears the `session_polls:<chat_id>` index itself - it does not read that set's members and delete each `poll:<poll_id>` individually. Any open poll is expected to already be closed out (mapping and index entry both removed) by the caller before this runs - see `utils_queue/message_handler.py::_handle_session_reset()`. This is a defensive final sweep of the index in case one was missed, not the primary close-out path; a leftover `poll:<poll_id>` would otherwise just expire via `POLL_MAPPING_TTL_SECONDS`.
+- **`pending_reset:<chat_id>` is untouched by `reset_session()` entirely.** It's cleared independently by `clear_pending_reset()` in `utils_session/session_reset_handler.py`, on its own lifecycle - it records the reset request itself, so it can't be part of what the request it represents wipes.
+
 ### Environment Variables
 
 #### Logging

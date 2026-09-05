@@ -75,7 +75,7 @@ def initialise_redis_connection() -> None:
         else:
             logger.warning("Reinitialisation of Redis connection occured. No new Redis initialisation is made.")
 
-def get_redis_client() -> redis.Redis:
+def _get_redis_client() -> redis.Redis:
     """
     Retrieves the shared Redis client, initialising it first if needed.
 
@@ -114,7 +114,7 @@ def close_redis_connection() -> None:
             _client = None
             logger.info("Redis connection has been closed.")
 
-def redis_write(key: str, value: str, ttl_seconds: int | None = None, nx: bool = False) -> bool:
+def _redis_write(key: str, value: str, ttl_seconds: int | None = None, nx: bool = False) -> bool:
     """
     Writes a key-value pair to Redis, optionally with a TTL.
 
@@ -137,13 +137,13 @@ def redis_write(key: str, value: str, ttl_seconds: int | None = None, nx: bool =
         - Accepts str only - callers must serialise complex values first (e.g. json.dumps).
     """
     try:
-        client = get_redis_client()
+        client = _get_redis_client()
         return bool(client.set(key, value, ex=ttl_seconds, nx=nx))
     except Exception:
         logger.exception("Failed to write to Redis.")
         return False
 
-def redis_read(key: str) -> str | None:
+def _redis_read(key: str) -> str | None:
     """
     Reads a value from Redis.
 
@@ -155,13 +155,13 @@ def redis_read(key: str) -> str | None:
             The stored value if found; otherwise None (including on failure).
     """
     try:
-        client = get_redis_client()
+        client = _get_redis_client()
         return client.get(key)
     except Exception:
         logger.exception("Failed to read from Redis.")
         return None
 
-def redis_delete(key: str) -> bool:
+def _redis_delete(key: str) -> bool:
     """
     Deletes a key from Redis, retrying on a failed delete (e.g. a connection issue).
 
@@ -177,7 +177,7 @@ def redis_delete(key: str) -> bool:
     """
     for attempt in range(1, settings.REDIS_TASK_MAX_ATTEMPTS + 1):
         try:
-            client = get_redis_client()
+            client = _get_redis_client()
             return bool(client.delete(key))
         except Exception:
             if attempt < settings.REDIS_TASK_MAX_ATTEMPTS:
@@ -229,7 +229,7 @@ def get_task_mapping(task_id: str) -> dict | None:
 
     for attempt in range(1, settings.REDIS_TASK_MAX_ATTEMPTS + 1):
         try:
-            client = get_redis_client()
+            client = _get_redis_client()
             value = client.get(f"task:{task_id}")
             break
         except Exception:
@@ -243,12 +243,12 @@ def get_task_mapping(task_id: str) -> dict | None:
     if value is None:
         logger.warning(f"No task mapping found for task_id={task_id} (expired or unknown).")
         return None
-
-    try:
-        return json.loads(value)
-    except (json.JSONDecodeError, TypeError):
-        logger.error(f"Stored mapping for task_id={task_id} is not valid JSON: {value}")
-        return None
+    else:
+        try:
+            return json.loads(value)
+        except (json.JSONDecodeError, TypeError):
+            logger.error(f"Stored mapping for task_id={task_id} is not valid JSON: {value}")
+            return None
 
 def delete_task_mapping(task_id: str, chat_id: int | None = None) -> bool:
     """
@@ -272,11 +272,11 @@ def delete_task_mapping(task_id: str, chat_id: int | None = None) -> bool:
         mapping = get_task_mapping(task_id)
         chat_id = mapping.get("chat_id") if mapping else None
 
-    deleted = redis_delete(f"task:{task_id}")
+    deleted = _redis_delete(f"task:{task_id}")
 
     if chat_id is not None:
         try:
-            get_redis_client().srem(f"session_tasks:{chat_id}", task_id)
+            _get_redis_client().srem(f"session_tasks:{chat_id}", task_id)
         except Exception:
             logger.exception(f"Failed to remove task_id={task_id} from session_tasks:{chat_id}.")
 
@@ -314,9 +314,9 @@ def create_task_mapping(
     with _get_chat_lock(chat_id):
         for attempt in range(1, settings.REDIS_TASK_MAX_ATTEMPTS + 1):
             task_id = uuid.uuid4().hex
-            if redis_write(f"task:{task_id}", value, ttl_seconds, nx=True):
+            if _redis_write(f"task:{task_id}", value, ttl_seconds, nx=True):
                 try:
-                    get_redis_client().sadd(f"session_tasks:{chat_id}", task_id)
+                    _get_redis_client().sadd(f"session_tasks:{chat_id}", task_id)
                 except Exception:
                     logger.exception(f"Failed to index task_id={task_id} under session_tasks:{chat_id}. A future session reset may miss this task.")
 
@@ -346,7 +346,7 @@ def get_chat_draft(chat_id: int) -> dict | None:
 
     for attempt in range(1, settings.REDIS_TASK_MAX_ATTEMPTS + 1):
         try:
-            client = get_redis_client()
+            client = _get_redis_client()
             value = client.get(f"draft:{chat_id}")
             break
         except Exception:
@@ -359,12 +359,12 @@ def get_chat_draft(chat_id: int) -> dict | None:
 
     if value is None:
         return None
-
-    try:
-        return json.loads(value)
-    except (json.JSONDecodeError, TypeError):
-        logger.error(f"Stored draft for chat_id={chat_id} is not valid JSON: {value}")
-        return None
+    else:
+        try:
+            return json.loads(value)
+        except (json.JSONDecodeError, TypeError):
+            logger.error(f"Stored draft for chat_id={chat_id} is not valid JSON: {value}")
+            return None
 
 def delete_chat_draft(chat_id: int) -> bool:
     """
@@ -377,7 +377,7 @@ def delete_chat_draft(chat_id: int) -> bool:
         bool:
             True if the draft was deleted; otherwise False.
     """
-    return redis_delete(f"draft:{chat_id}")
+    return _redis_delete(f"draft:{chat_id}")
 
 def get_all_chat_draft_ids() -> list[int]:
     """
@@ -395,7 +395,7 @@ def get_all_chat_draft_ids() -> list[int]:
         - Uses SCAN (not KEYS) so it doesn't block Redis on a large keyspace.
     """
     try:
-        client = get_redis_client()
+        client = _get_redis_client()
         chat_ids = []
         for key in client.scan_iter(match="draft:*"):
             try:
@@ -440,7 +440,7 @@ def create_chat_draft(chat_id: int, media_type: str, media_url: str, text: str, 
         "text": text or "",
         "has_caption": has_caption
     })
-    created = redis_write(f"draft:{chat_id}", value, ttl_seconds=settings.DRAFT_MAPPING_TTL_SECONDS, nx=True)
+    created = _redis_write(f"draft:{chat_id}", value, ttl_seconds=settings.DRAFT_MAPPING_TTL_SECONDS, nx=True)
     if created:
         logger.info(f"Created {media_type} draft for chat_id={chat_id}.")
     else:
@@ -484,10 +484,10 @@ def create_poll_mapping(poll_id: str, chat_id: int, task_id: str, message_id: in
     })
 
     with _get_chat_lock(chat_id):
-        created = redis_write(f"poll:{poll_id}", value, ttl_seconds=settings.POLL_MAPPING_TTL_SECONDS, nx=True)
+        created = _redis_write(f"poll:{poll_id}", value, ttl_seconds=settings.POLL_MAPPING_TTL_SECONDS, nx=True)
         if created:
             try:
-                get_redis_client().sadd(f"session_polls:{chat_id}", poll_id)
+                _get_redis_client().sadd(f"session_polls:{chat_id}", poll_id)
             except Exception:
                 logger.exception(f"Failed to index poll_id={poll_id} under session_polls:{chat_id}. A future session reset may miss this poll.")
 
@@ -515,7 +515,7 @@ def get_poll_mapping(poll_id: str) -> dict | None:
 
     for attempt in range(1, settings.REDIS_TASK_MAX_ATTEMPTS + 1):
         try:
-            client = get_redis_client()
+            client = _get_redis_client()
             value = client.get(f"poll:{poll_id}")
             break
         except Exception:
@@ -528,12 +528,12 @@ def get_poll_mapping(poll_id: str) -> dict | None:
 
     if value is None:
         return None
-
-    try:
-        return json.loads(value)
-    except (json.JSONDecodeError, TypeError):
-        logger.error(f"Stored poll mapping for poll_id={poll_id} is not valid JSON: {value}")
-        return None
+    else:
+        try:
+            return json.loads(value)
+        except (json.JSONDecodeError, TypeError):
+            logger.error(f"Stored poll mapping for poll_id={poll_id} is not valid JSON: {value}")
+            return None
 
 def update_poll_answer(poll_id: str, user_id: int, option_ids: list) -> bool:
     """
@@ -560,10 +560,10 @@ def update_poll_answer(poll_id: str, user_id: int, option_ids: list) -> bool:
     if mapping is None:
         logger.warning(f"Could not update poll answer for poll_id={poll_id} - no mapping found.")
         return False
-
-    mapping["user_id"] = user_id
-    mapping["option_ids"] = option_ids
-    return redis_write(f"poll:{poll_id}", json.dumps(mapping), ttl_seconds=settings.POLL_MAPPING_TTL_SECONDS)
+    else:
+        mapping["user_id"] = user_id
+        mapping["option_ids"] = option_ids
+        return _redis_write(f"poll:{poll_id}", json.dumps(mapping), ttl_seconds=settings.POLL_MAPPING_TTL_SECONDS)
 
 def delete_poll_mapping(poll_id: str, chat_id: int | None = None) -> bool:
     """
@@ -587,11 +587,11 @@ def delete_poll_mapping(poll_id: str, chat_id: int | None = None) -> bool:
         mapping = get_poll_mapping(poll_id)
         chat_id = mapping.get("chat_id") if mapping else None
 
-    deleted = redis_delete(f"poll:{poll_id}")
+    deleted = _redis_delete(f"poll:{poll_id}")
 
     if chat_id is not None:
         try:
-            get_redis_client().srem(f"session_polls:{chat_id}", poll_id)
+            _get_redis_client().srem(f"session_polls:{chat_id}", poll_id)
         except Exception:
             logger.exception(f"Failed to remove poll_id={poll_id} from session_polls:{chat_id}.")
 
@@ -613,7 +613,7 @@ def has_open_tasks(chat_id: int) -> bool:
         - On a Redis failure, defaults to True (treated as still open) rather than False, so an uncertain read can only ever delay a reset, never force one through prematurely.
     """
     try:
-        return get_redis_client().scard(f"session_tasks:{chat_id}") > 0
+        return _get_redis_client().scard(f"session_tasks:{chat_id}") > 0
     except Exception:
         logger.exception(f"Failed to check session_tasks for chat_id={chat_id}. Treating as still open (deferring).")
         return True
@@ -634,7 +634,7 @@ def get_session_poll_ids(chat_id: int) -> list[str]:
           The deferred path itself never force-closes anything while genuinely waiting; only its PENDING_RESET_MAX_WAIT_SECONDS force-through backstop (§8, TODO.md) calls this defensively before applying, in case a misconfigured ceiling ever forces through while a poll is still technically alive - see poll_response_handler.py::stop_poll_for_reset().
     """
     try:
-        return list(get_redis_client().smembers(f"session_polls:{chat_id}"))
+        return list(_get_redis_client().smembers(f"session_polls:{chat_id}"))
     except Exception:
         logger.exception(f"Failed to read session_polls for chat_id={chat_id}.")
         return []
@@ -654,21 +654,22 @@ def _get_or_create_session(chat_id: int) -> str | None:
         - Stored as session:<chat_id> -> session_id, with no TTL - permanent until reset_session() clears it.
         - Writes with nx=True; a race against another creation for the same chat_id re-reads the winner's value rather than overwriting it (unlike create_task_mapping(), the key is deterministic per chat_id, so a losing writer can just re-read instead of generating a fresh id).
     """
-    existing = redis_read(f"session:{chat_id}")
+    existing = _redis_read(f"session:{chat_id}")
     if existing:
         return existing
-
-    session_id = uuid.uuid4().hex
-    if redis_write(f"session:{chat_id}", session_id, nx=True):
-        logger.info(f"Created session mapping session_id={session_id} for chat_id={chat_id}.")
-        return session_id
-
-    existing = redis_read(f"session:{chat_id}")
-    if existing:
-        return existing
-
-    logger.error(f"Failed to create or read session mapping for chat_id={chat_id}.")
-    return None
+    else:
+        session_id = uuid.uuid4().hex
+        if _redis_write(f"session:{chat_id}", session_id, nx=True):
+            logger.info(f"Created session mapping session_id={session_id} for chat_id={chat_id}.")
+            return session_id
+        else:
+            # Second read to verify if write is failed due to a race against another creation for the same chat_id
+            existing = _redis_read(f"session:{chat_id}")
+            if existing:
+                return existing
+            else:
+                logger.error(f"Failed to create or read session mapping for chat_id={chat_id}.")
+                return None
 
 def generate_session(chat_id: int | None = None, task_id: str | None = None) -> str | None:
     """
@@ -694,27 +695,26 @@ def generate_session(chat_id: int | None = None, task_id: str | None = None) -> 
     """
     if chat_id is not None:
         return _get_or_create_session(chat_id)
-
-    if task_id is not None:
+    elif task_id is not None:
         mapping = get_task_mapping(task_id)
         if mapping is None:
             logger.error(f"Could not resolve session_id for task_id={task_id} - no task mapping found.")
             return None
-
-        resolved_chat_id = mapping.get("chat_id")
-        session_id = redis_read(f"session:{resolved_chat_id}")
-        if session_id is None:
-            logger.critical(
-                f"No session mapping found for chat_id={resolved_chat_id} (resolved via task_id={task_id}). "
-                f"This should never happen - a session is expected to already exist by the time any task is "
-                f"created. Creating a new one so this message isn't dropped."
-            )
-            return _get_or_create_session(resolved_chat_id)
-
-        return session_id
-
-    logger.error("generate_session() called without chat_id or task_id. Cannot resolve a session.")
-    return None
+        else:
+            resolved_chat_id = mapping.get("chat_id")
+            session_id = _redis_read(f"session:{resolved_chat_id}")
+            if session_id is None:
+                logger.critical(
+                    f"No session mapping found for chat_id={resolved_chat_id} (resolved via task_id={task_id}). "
+                    f"This should never happen - a session is expected to already exist by the time any task is "
+                    f"created. Creating a new one so this message isn't dropped."
+                )
+                return _get_or_create_session(resolved_chat_id)
+            else:
+                return session_id
+    else:
+        logger.error("generate_session() called without chat_id or task_id. Cannot resolve a session.")
+        return None
 
 def reset_session(chat_id: int) -> str | None:
     """
@@ -737,22 +737,22 @@ def reset_session(chat_id: int) -> str | None:
           Without this, a task written and indexed in the narrow window between this function's read and its delete of session_tasks:<chat_id> could escape deletion entirely while still losing its index entry.
     """
     with _get_chat_lock(chat_id):
-        cleared_session_id = redis_read(f"session:{chat_id}")
+        cleared_session_id = _redis_read(f"session:{chat_id}")
 
         try:
-            client = get_redis_client()
+            client = _get_redis_client()
             task_ids = client.smembers(f"session_tasks:{chat_id}")
         except Exception:
             logger.exception(f"Failed to read session_tasks for chat_id={chat_id}. Task mappings may be left behind.")
             task_ids = set()
 
         for task_id in task_ids:
-            redis_delete(f"task:{task_id}")
+            _redis_delete(f"task:{task_id}")
 
-        redis_delete(f"session_tasks:{chat_id}")
-        redis_delete(f"session:{chat_id}")
+        _redis_delete(f"session_tasks:{chat_id}")
+        _redis_delete(f"session:{chat_id}")
         delete_chat_draft(chat_id)
-        redis_delete(f"session_polls:{chat_id}")
+        _redis_delete(f"session_polls:{chat_id}")
 
     logger.info(f"Session reset for chat_id={chat_id}: cleared session mapping, {len(task_ids)} task mapping(s), pending draft, and poll indexing.")
     return cleared_session_id
@@ -773,7 +773,7 @@ def get_all_poll_ids() -> list[str]:
         - Uses SCAN (not KEYS) so it doesn't block Redis on a large keyspace.
     """
     try:
-        client = get_redis_client()
+        client = _get_redis_client()
         poll_ids = []
         for key in client.scan_iter(match="poll:*"):
             try:
@@ -807,7 +807,7 @@ def set_pending_reset(chat_id: int, task_id: str) -> bool:
         - Writes with nx=False (default) - a repeat trigger while one is already pending just overwrites it (including a fresh `created_at`), since only the most recent session_reset instruction matters once it's finally applied.
     """
     value = json.dumps({"task_id": task_id, "created_at": time.time()})
-    written = redis_write(f"pending_reset:{chat_id}", value)
+    written = _redis_write(f"pending_reset:{chat_id}", value)
     if written:
         logger.info(f"Stored pending reset for chat_id={chat_id} (task_id={task_id}).")
     else:
@@ -826,15 +826,15 @@ def get_pending_reset_info(chat_id: int) -> dict | None:
         dict | None:
             {"task_id": str, "created_at": float} if a reset is pending for chat_id; otherwise None (including corrupt stored JSON, logged as an error).
     """
-    value = redis_read(f"pending_reset:{chat_id}")
+    value = _redis_read(f"pending_reset:{chat_id}")
     if value is None:
         return None
-
-    try:
-        return json.loads(value)
-    except (json.JSONDecodeError, TypeError):
-        logger.error(f"Stored pending reset for chat_id={chat_id} is not valid JSON: {value}")
-        return None
+    else:
+        try:
+            return json.loads(value)
+        except (json.JSONDecodeError, TypeError):
+            logger.error(f"Stored pending reset for chat_id={chat_id} is not valid JSON: {value}")
+            return None
 
 def get_pending_reset(chat_id: int) -> str | None:
     """
@@ -861,7 +861,7 @@ def clear_pending_reset(chat_id: int) -> bool:
         bool:
             True if a pending reset was deleted; otherwise False.
     """
-    return redis_delete(f"pending_reset:{chat_id}")
+    return _redis_delete(f"pending_reset:{chat_id}")
 
 def get_all_pending_resets() -> list[tuple[int, str, float]]:
     """
@@ -880,7 +880,7 @@ def get_all_pending_resets() -> list[tuple[int, str, float]]:
         - Uses SCAN (not KEYS) so it doesn't block Redis on a large keyspace.
     """
     try:
-        client = get_redis_client()
+        client = _get_redis_client()
         pending_resets = []
         for key in client.scan_iter(match="pending_reset:*"):
             try:
@@ -892,14 +892,14 @@ def get_all_pending_resets() -> list[tuple[int, str, float]]:
             value = client.get(key)
             if not value:
                 continue
-
-            try:
-                info = json.loads(value)
-                task_id = info["task_id"]
-                created_at = info["created_at"]
-            except (json.JSONDecodeError, TypeError, KeyError):
-                logger.error(f"Skipped pending_reset key with invalid JSON while sweeping Redis: {key}")
-                continue
+            else:
+                try:
+                    info = json.loads(value)
+                    task_id = info["task_id"]
+                    created_at = info["created_at"]
+                except (json.JSONDecodeError, TypeError, KeyError):
+                    logger.error(f"Skipped pending_reset key with invalid JSON while sweeping Redis: {key}")
+                    continue
 
             pending_resets.append((chat_id, task_id, created_at))
 
