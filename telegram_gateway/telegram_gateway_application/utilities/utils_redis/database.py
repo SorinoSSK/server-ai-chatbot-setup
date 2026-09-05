@@ -815,7 +815,7 @@ def set_pending_reset(chat_id: int, task_id: str) -> bool:
 
     return written
 
-def get_pending_reset_info(chat_id: int) -> dict | None:
+def _get_pending_reset_info(chat_id: int) -> dict | None:
     """
     Retrieves the {"task_id", "created_at"} a deferred session_reset is stored against for a chat_id.
 
@@ -847,7 +847,7 @@ def get_pending_reset(chat_id: int) -> str | None:
         str | None:
             The task_id if a reset is pending for chat_id; otherwise None.
     """
-    info = get_pending_reset_info(chat_id)
+    info = _get_pending_reset_info(chat_id)
     return info.get("task_id") if info else None
 
 def clear_pending_reset(chat_id: int) -> bool:
