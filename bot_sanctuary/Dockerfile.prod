@@ -1,0 +1,30 @@
+FROM python:3.12.4-slim
+LABEL maintainer="SorinoSSK"
+
+ARG APP_UID=1000
+ARG APP_GID=1000
+
+RUN groupadd -g ${APP_GID} bot_sanctuary_grp && \
+    useradd -u ${APP_UID} -g bot_sanctuary_grp -m bot_sanctuary_usr
+
+RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /bot_sanctuary
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY bot_sanctuary_application ./bot_sanctuary_application
+RUN mkdir -p ./bot_sanctuary_application/data/logs && \
+    chown -R bot_sanctuary_usr:bot_sanctuary_grp ./bot_sanctuary_application/data
+
+USER bot_sanctuary_usr
+
+# Native claude CLI - Node-free, auto-detects host architecture. Installed into
+# bot_sanctuary_usr's own home (run after the USER switch above) so both the
+# app and an administrator's `docker exec` land on the same installation.
+RUN curl -fsSL https://claude.ai/install.sh | bash
+ENV PATH="/home/bot_sanctuary_usr/.local/bin:${PATH}"
+ENV PYTHONUNBUFFERED=1
+
+CMD ["python", "-m", "bot_sanctuary_application.main"]

@@ -7,7 +7,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 FILES_TO_IMPORT=(
 "${SCRIPT_DIR}/telegram_gateway/setup.sh"
-"${SCRIPT_DIR}/bot_orchestrator/setup.sh"
+"${SCRIPT_DIR}/bot_sanctuary/setup.sh"
 )
 
 for FILE_TO_IMPORT in "${FILES_TO_IMPORT[@]}"; do
@@ -38,6 +38,8 @@ get_masked_config_variables()
     echo "CHATBOT_NAME"
     echo "CHATBOT_REDIS_USERNAME"
     echo "CHATBOT_REDIS_PASSWORD"
+    echo "CHATBOT_LLM_TYPE"
+    echo "CHATBOT_LLM_OAUTH_TOKEN"
 }
 
 generate_config_sample()
@@ -101,21 +103,21 @@ build_telegram_gateway_dev_image()
     cd "${current_dir}"
 }
 
-build_bot_orchestrator_dev_image()
+build_bot_sanctuary_dev_image()
 {
     local script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-    local dev_path="${script_dir}/${CHATBOT_BOT_ORCHESTRATOR_PATH_NAME}"
+    local dev_path="${script_dir}/${CHATBOT_BOT_SANCTUARY_PATH_NAME}"
     echo "Associated path: ${dev_path}"
     current_dir="$(pwd)"
     cd "${dev_path}"
-    bo_dev_build_docker
+    bs_dev_build_docker
     cd "${current_dir}"
 }
 
 build_all_dev_images()
 {
     build_telegram_gateway_dev_image
-    build_bot_orchestrator_dev_image
+    build_bot_sanctuary_dev_image
 }
 
 create_redis_data_path()
@@ -127,7 +129,7 @@ run_dev()
 {
     cp ./config.ini ./.env
     tg_dev_remove_docker
-    bo_dev_remove_docker
+    bs_dev_remove_docker
     create_redis_data_path
     docker compose -f compose.dev.yml up -d
 }
@@ -154,21 +156,21 @@ build_telegram_gateway_prod_image()
     cd "${current_dir}"
 }
 
-build_bot_orchestrator_prod_image()
+build_bot_sanctuary_prod_image()
 {
     local script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-    local dev_path="${script_dir}/${CHATBOT_BOT_ORCHESTRATOR_PATH_NAME}"
+    local dev_path="${script_dir}/${CHATBOT_BOT_SANCTUARY_PATH_NAME}"
     echo "Associated path: ${dev_path}"
     current_dir="$(pwd)"
     cd "${dev_path}"
-    bo_prod_build_docker
+    bs_prod_build_docker
     cd "${current_dir}"
 }
 
 build_all_prod_images()
 {
     build_telegram_gateway_prod_image
-    build_bot_orchestrator_prod_image
+    build_bot_sanctuary_prod_image
 }
 
 # Production Functions End

@@ -47,56 +47,61 @@ docker_network_check()
     fi
 }
 
-bo_prod_build_docker()
+bs_prod_build_docker()
 {
-    # Docker to build all from <project>/bot_orchestrator
-    docker build -f Dockerfile.prod -t "${CHATBOT_BOT_ORCHESTRATOR_PROD_IMAGE_NAME}:${CHATBOT_BOT_ORCHESTRATOR_PROD_VERSION}" .
+    # Docker to build all from <project>/bot_sanctuary
+    docker build -f Dockerfile.prod -t "${CHATBOT_BOT_SANCTUARY_PROD_IMAGE_NAME}:${CHATBOT_BOT_SANCTUARY_PROD_VERSION}" .
 }
 
-bo_dev_build_docker()
+bs_dev_build_docker()
 {
-    # Docker to build all from <project>/bot_orchestrator
-    docker build -f Dockerfile.dev -t "${CHATBOT_BOT_ORCHESTRATOR_DEV_IMAGE_NAME}" .
+    # Docker to build all from <project>/bot_sanctuary
+    docker build -f Dockerfile.dev -t "${CHATBOT_BOT_SANCTUARY_DEV_IMAGE_NAME}" .
 }
 
-bo_dev_run_docker()
+bs_dev_run_docker()
 {
     local dev_path="${1:-}"
-    bo_dev_remove_docker
+    bs_dev_remove_docker
     docker_network_check
     if [[ -n "${dev_path}" ]]; then
-        echo "Exposed bot_orchestrator_application."
+        echo "Exposed bot_sanctuary_application."
         docker run -d \
-            --name "${CHATBOT_BOT_ORCHESTRATOR_DEV_CONTAINER_NAME}" \
+            --name "${CHATBOT_BOT_SANCTUARY_DEV_CONTAINER_NAME}" \
             --network "${CHATBOT_NETWORK_NAME}" \
             -e "Q_USER=${CHATBOT_RABBITMQ_USERNAME}" \
             -e "Q_PASSWORD=${CHATBOT_RABBITMQ_PASSWORD}" \
-            -v "${dev_path}/bot_orchestrator_application:/bot_orchestrator/bot_orchestrator_application" \
-            "${CHATBOT_BOT_ORCHESTRATOR_DEV_IMAGE_NAME}"
+            -e "LLM_TYPE=${CHATBOT_LLM_TYPE}" \
+            -e "LLM_OAUTH_TOKEN=${CHATBOT_LLM_OAUTH_TOKEN}" \
+            -v "${dev_path}/bot_sanctuary_application:/bot_sanctuary/bot_sanctuary_application" \
+            -v "${dev_path}/bot_directory:/home/bot_sanctuary_usr/.claude" \
+            "${CHATBOT_BOT_SANCTUARY_DEV_IMAGE_NAME}"
     else
         docker run -d \
-            --name "${CHATBOT_BOT_ORCHESTRATOR_DEV_CONTAINER_NAME}" \
+            --name "${CHATBOT_BOT_SANCTUARY_DEV_CONTAINER_NAME}" \
             --network "${CHATBOT_NETWORK_NAME}" \
             -e "Q_USER=${CHATBOT_RABBITMQ_USERNAME}" \
             -e "Q_PASSWORD=${CHATBOT_RABBITMQ_PASSWORD}" \
-            "${CHATBOT_BOT_ORCHESTRATOR_DEV_IMAGE_NAME}"
+            -e "LLM_TYPE=${CHATBOT_LLM_TYPE}" \
+            -e "LLM_OAUTH_TOKEN=${CHATBOT_LLM_OAUTH_TOKEN}" \
+            "${CHATBOT_BOT_SANCTUARY_DEV_IMAGE_NAME}"
     fi
 }
 
-bo_dev_remove_docker()
+bs_dev_remove_docker()
 {
-    stop_docker "${CHATBOT_BOT_ORCHESTRATOR_DEV_CONTAINER_NAME}"
-    if docker_check "${CHATBOT_BOT_ORCHESTRATOR_DEV_CONTAINER_NAME}"; then
-        docker rm "${CHATBOT_BOT_ORCHESTRATOR_DEV_CONTAINER_NAME}"
+    stop_docker "${CHATBOT_BOT_SANCTUARY_DEV_CONTAINER_NAME}"
+    if docker_check "${CHATBOT_BOT_SANCTUARY_DEV_CONTAINER_NAME}"; then
+        docker rm "${CHATBOT_BOT_SANCTUARY_DEV_CONTAINER_NAME}"
     fi
 }
 
-bo_dev_access_docker()
+bs_dev_access_docker()
 {
-    docker exec -it "${CHATBOT_BOT_ORCHESTRATOR_DEV_CONTAINER_NAME}" sh
+    docker exec -it "${CHATBOT_BOT_SANCTUARY_DEV_CONTAINER_NAME}" sh
 }
 
-bo_dev_show_menu()
+bs_dev_show_menu()
 {
     local dev_path="${1:-}"
     echo "Select an option:"
@@ -109,14 +114,14 @@ bo_dev_show_menu()
 
     case "${setup_select}" in
     1)
-        bo_dev_build_docker
-        bo_dev_run_docker "${dev_path}"
+        bs_dev_build_docker
+        bs_dev_run_docker "${dev_path}"
         ;;
     2)
-        bo_dev_remove_docker
+        bs_dev_remove_docker
         ;;
     3)
-        bo_dev_access_docker
+        bs_dev_access_docker
         ;;
     q|Q)
         exit 0
@@ -136,7 +141,7 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
         echo "NOTICE: ${script_dir}"
 
         source "${config_path}"
-        bo_dev_show_menu "${script_dir}"
+        bs_dev_show_menu "${script_dir}"
     else
         echo "NOTICE: ${config_path} not found."
     fi

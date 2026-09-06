@@ -25,15 +25,18 @@ services:
       - "chatbot-app-network"
     restart: unless-stopped
 
-  bot-orchestrator:
-    image: "${CHATBOT_BOT_ORCHESTRATOR_DEV_IMAGE_NAME}"
-    container_name: "${CHATBOT_BOT_ORCHESTRATOR_DEV_CONTAINER_NAME}"
+  bot-sanctuary:
+    image: "${CHATBOT_BOT_SANCTUARY_DEV_IMAGE_NAME}"
+    container_name: "${CHATBOT_BOT_SANCTUARY_DEV_CONTAINER_NAME}"
     environment:
       TZ: "Asia/Singapore"
       Q_USER: "${CHATBOT_RABBITMQ_USERNAME}"
       Q_PASSWORD: "${CHATBOT_RABBITMQ_PASSWORD}"
+      LLM_TYPE: "${CHATBOT_LLM_TYPE}"
+      LLM_OAUTH_TOKEN: "${CHATBOT_LLM_OAUTH_TOKEN}"
     volumes:
-      - "${DEV_PATH}/${CHATBOT_BOT_ORCHESTRATOR_PATH_NAME}/bot_orchestrator_application:/bot_orchestrator/bot_orchestrator_application"
+      - "${DEV_PATH}/${CHATBOT_BOT_SANCTUARY_PATH_NAME}/bot_sanctuary_application:/bot_sanctuary/bot_sanctuary_application"
+      - "${DEV_PATH}/${CHATBOT_BOT_SANCTUARY_PATH_NAME}/bot_directory:/home/bot_sanctuary_usr/.claude"
     depends_on:
       rabbitmq:
         condition: service_healthy
