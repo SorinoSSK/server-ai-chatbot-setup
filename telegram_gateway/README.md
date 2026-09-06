@@ -292,6 +292,10 @@ reset_session(chat_id)                         <- everything below keyed by the 
 | Variable | Purpose |
 |-----------|---------|
 | REDIS_HOST / REDIS_PORT / REDIS_DB | Redis connection target. |
+| REDIS_USERNAME / REDIS_PASSWORD | Redis credentials, if the server requires authentication. Empty by default (no auth). |
+| REDIS_SOCKET_CONNECT_TIMEOUT / REDIS_SOCKET_TIMEOUT | Bounds a Redis network-level stall so it fails fast into the existing retry logic instead of blocking indefinitely. |
+| REDIS_SOCKET_KEEPALIVE | Whether the Redis client keeps its TCP connection alive between operations. |
+| REDIS_HEALTH_CHECK_INTERVAL | How often the Redis client proactively pings the connection to detect a stale/dead socket. |
 | REDIS_TASK_RETRY_DELAY / REDIS_TASK_MAX_ATTEMPTS | Retry behaviour for Redis reads/writes. |
 | REDIS_TASK_MAPPING_TTL_SECONDS | Expiry for a `task_id` -> `chat_id`/`user_id` mapping. |
 
