@@ -18,6 +18,8 @@ import random
 import logging
 import threading
 
+from typing import Callable
+
 from ....config import settings
 from ..gateway_outbound import send_typing_action
 
@@ -31,7 +33,7 @@ _active_typing: dict[str, threading.Event] = {}
 
 # =============================================================================
 
-def _stop(task_id: str) -> None:
+def _deregister_typing(task_id: str) -> None:
     """
     Removes task_id from the active registry and signals its loop to stop, if present.
 
@@ -43,12 +45,13 @@ def _stop(task_id: str) -> None:
     """
     with _lock:
         stop_event = _active_typing.pop(task_id, None)
+        if stop_event is not None:
+            stop_event.set()
 
     if stop_event is not None:
-        stop_event.set()
         logger.info(f"Stopped typing indicator for task_id={task_id}.")
 
-def _typing_loop(task_id: str, chat_id: int, stop_event: threading.Event, on_giveup) -> None:
+def _typing_loop(task_id: str, chat_id: int, stop_event: threading.Event, on_giveup: Callable[[str, str], None] | None) -> None:
     """
     Background loop sustaining the typing indicator for a single task, until stopped or self-terminated.
 
@@ -77,15 +80,15 @@ def _typing_loop(task_id: str, chat_id: int, stop_event: threading.Event, on_giv
         pings_sent += 1
         if pings_sent >= max_pings:
             logger.info(f"Typing indicator for task_id={task_id} reached its ping cap ({max_pings}). Stopping.")
-            _stop(task_id)
+            _deregister_typing(task_id)
             if on_giveup is not None:
                 on_giveup(task_id, "ping_cap_reached")
             return
+        else:
+            interval = random.uniform(settings.TELEGRAM_TYPING_INTERVAL_MIN, settings.TELEGRAM_TYPING_INTERVAL_MAX)
+            stop_event.wait(interval)
 
-        interval = random.uniform(settings.TELEGRAM_TYPING_INTERVAL_MIN, settings.TELEGRAM_TYPING_INTERVAL_MAX)
-        stop_event.wait(interval)
-
-def start_typing(task_id: str, chat_id: int, on_giveup=None) -> None:
+def start_typing(task_id: str, chat_id: int, on_giveup: Callable[[str, str], None] | None = None) -> None:
     """
     Starts the typing indicator loop for a task, if one is not already running.
 
@@ -103,9 +106,9 @@ def start_typing(task_id: str, chat_id: int, on_giveup=None) -> None:
     with _lock:
         if task_id in _active_typing:
             return
-
-        stop_event = threading.Event()
-        _active_typing[task_id] = stop_event
+        else:
+            stop_event = threading.Event()
+            _active_typing[task_id] = stop_event
 
     threading.Thread(
         target=_typing_loop,
@@ -124,6 +127,6 @@ def stop_typing(task_id: str) -> None:
     Returns:
         None
     """
-    _stop(task_id)
+    _deregister_typing(task_id)
 
 # =============================================================================

@@ -31,7 +31,11 @@ from ....config import settings
 from ..gateway_outbound import send_message
 from .typing_indicator import start_typing, stop_typing
 from .button_prompt_handler import register_bot_button, send_message_with_buttons
-from ...utils_redis.database import delete_chat_draft, get_chat_draft, get_all_chat_draft_ids
+from ...utils_redis.database import (
+    delete_chat_draft,
+    get_chat_draft,
+    get_all_chat_draft_ids
+)
 
 # =============================================================================
 # G L O B A L   V A R I A B L E

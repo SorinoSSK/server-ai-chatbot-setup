@@ -23,8 +23,19 @@ import json
 import logging
 
 from ...config import settings
-from ..utils_redis.database import get_task_mapping, delete_task_mapping, create_poll_mapping
-from ..utils_telegram.gateway_outbound import send_message, send_poll, send_photo, send_video, send_media_group, send_document
+from ..utils_redis.database import (
+    get_task_mapping,
+    delete_task_mapping,
+    create_poll_mapping
+)
+from ..utils_telegram.gateway_outbound import (
+    send_message,
+    send_poll,
+    send_photo,
+    send_video,
+    send_media_group,
+    send_document
+)
 from ..utils_telegram.utilities.button_prompt_handler import register_bot_button, send_message_with_buttons
 from ..utils_telegram.utilities.typing_indicator import stop_typing
 from ..utils_telegram.utilities.poll_response_handler import start_poll_timer

@@ -64,13 +64,13 @@ def _classify_rejection(exc: requests.exceptions.RequestException) -> tuple[int 
     response = getattr(exc, "response", None)
     if response is None:
         return None, str(exc)
+    else:
+        try:
+            reason = response.json().get("description") or str(exc)
+        except ValueError:
+            reason = str(exc)
 
-    try:
-        reason = response.json().get("description") or str(exc)
-    except ValueError:
-        reason = str(exc)
-
-    return response.status_code, reason
+        return response.status_code, reason
 
 def _config_failure_reason(status_code: int | None) -> str | None:
     """
@@ -89,9 +89,10 @@ def _config_failure_reason(status_code: int | None) -> str | None:
     """
     if status_code == 401:
         return "unauthorized"
-    if status_code == 404:
+    elif status_code == 404:
         return "not_found"
-    return None
+    else:
+        return None
 
 def send_message(chat_id: int | str, text: str, parse_mode: str | None = None, reply_markup: dict | None = None) -> bool | dict:
     """
@@ -155,8 +156,9 @@ def send_message(chat_id: int | str, text: str, parse_mode: str | None = None, r
                 log_sanitised_exception(f"Failed to send message to Telegram - {config_failure}. Not retrying.")
                 record_send_failure(config_failure, status_code)
                 return False
-            log_sanitised_exception("Failed to send message to Telegram. Not retrying.")
-            return {"error": True, "status_code": status_code, "reason": reason}
+            else:
+                log_sanitised_exception("Failed to send message to Telegram. Not retrying.")
+                return {"error": True, "status_code": status_code, "reason": reason}
 
 def send_typing_action(chat_id: int | str) -> bool:
     """
@@ -250,10 +252,10 @@ def send_poll(chat_id: int | str, question: str, options: list, allows_multiple_
             if not poll_id or message_id is None:
                 logger.error(f"sendPoll response for chat_id={chat_id} is missing poll.id or message_id.")
                 return None
-
-            logger.info(f"Sent poll to chat_id={chat_id} (poll_id={poll_id}).")
-            record_send_success()
-            return {"poll_id": poll_id, "message_id": message_id}
+            else:
+                logger.info(f"Sent poll to chat_id={chat_id} (poll_id={poll_id}).")
+                record_send_success()
+                return {"poll_id": poll_id, "message_id": message_id}
         except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
             if attempt < settings.TELEGRAM_SEND_MAX_ATTEMPTS:
                 logger.warning(f"Failed to send poll to Telegram (attempt {attempt}/{settings.TELEGRAM_SEND_MAX_ATTEMPTS}). Retrying...")
@@ -269,8 +271,9 @@ def send_poll(chat_id: int | str, question: str, options: list, allows_multiple_
                 log_sanitised_exception(f"Failed to send poll to Telegram - {config_failure}. Not retrying.")
                 record_send_failure(config_failure, status_code)
                 return None
-            log_sanitised_exception("Failed to send poll to Telegram. Not retrying.")
-            return {"error": True, "status_code": status_code, "reason": reason}
+            else:
+                log_sanitised_exception("Failed to send poll to Telegram. Not retrying.")
+                return {"error": True, "status_code": status_code, "reason": reason}
 
 def stop_poll(chat_id: int | str, message_id: int) -> bool:
     """
@@ -322,8 +325,10 @@ def stop_poll(chat_id: int | str, message_id: int) -> bool:
             status_code, _ = _classify_rejection(exc)
             config_failure = _config_failure_reason(status_code)
             if config_failure:
+                log_sanitised_exception(f"Failed to stop poll on Telegram - {config_failure}. Not retrying.")
                 record_send_failure(config_failure, status_code)
-            log_sanitised_exception(f"Failed to stop poll on Telegram for chat_id={chat_id} - already closed, or another error. Not retrying.")
+            else:
+                log_sanitised_exception(f"Failed to stop poll on Telegram for chat_id={chat_id} - already closed, or another error. Not retrying.")
             return False
 
 def send_document(chat_id: int | str, url: str, caption: str | None = None) -> bool:
@@ -383,8 +388,9 @@ def send_document(chat_id: int | str, url: str, caption: str | None = None) -> b
                 log_sanitised_exception(f"Failed to send document to Telegram - {config_failure}. Not retrying.")
                 record_send_failure(config_failure, status_code)
                 return False
-            log_sanitised_exception("Failed to send document to Telegram. Not retrying.")
-            return {"error": True, "status_code": status_code, "reason": reason}
+            else:
+                log_sanitised_exception("Failed to send document to Telegram. Not retrying.")
+                return {"error": True, "status_code": status_code, "reason": reason}
 
 def send_photo(chat_id: int | str, url: str, caption: str | None = None) -> bool:
     """
@@ -440,8 +446,9 @@ def send_photo(chat_id: int | str, url: str, caption: str | None = None) -> bool
                 log_sanitised_exception(f"Failed to send photo to Telegram - {config_failure}. Not retrying.")
                 record_send_failure(config_failure, status_code)
                 return False
-            log_sanitised_exception("Failed to send photo to Telegram. Not retrying.")
-            return {"error": True, "status_code": status_code, "reason": reason}
+            else:
+                log_sanitised_exception("Failed to send photo to Telegram. Not retrying.")
+                return {"error": True, "status_code": status_code, "reason": reason}
 
 def send_video(chat_id: int | str, url: str, caption: str | None = None) -> bool:
     """
@@ -497,8 +504,9 @@ def send_video(chat_id: int | str, url: str, caption: str | None = None) -> bool
                 log_sanitised_exception(f"Failed to send video to Telegram - {config_failure}. Not retrying.")
                 record_send_failure(config_failure, status_code)
                 return False
-            log_sanitised_exception("Failed to send video to Telegram. Not retrying.")
-            return {"error": True, "status_code": status_code, "reason": reason}
+            else:
+                log_sanitised_exception("Failed to send video to Telegram. Not retrying.")
+                return {"error": True, "status_code": status_code, "reason": reason}
 
 def send_media_group(chat_id: int | str, items: list) -> bool:
     """
@@ -552,7 +560,8 @@ def send_media_group(chat_id: int | str, items: list) -> bool:
                 log_sanitised_exception(f"Failed to send album to Telegram - {config_failure}. Not retrying.")
                 record_send_failure(config_failure, status_code)
                 return False
-            log_sanitised_exception("Failed to send album to Telegram. Not retrying.")
-            return {"error": True, "status_code": status_code, "reason": reason}
+            else:
+                log_sanitised_exception("Failed to send album to Telegram. Not retrying.")
+                return {"error": True, "status_code": status_code, "reason": reason}
 
 # =============================================================================

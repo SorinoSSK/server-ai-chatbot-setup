@@ -24,7 +24,15 @@ import logging
 import threading
 
 from ...config import settings
-from ..utils_redis.database import has_open_tasks, set_pending_reset, get_pending_reset, clear_pending_reset, get_all_pending_resets, get_session_poll_ids, reset_session
+from ..utils_redis.database import (
+    has_open_tasks,
+    set_pending_reset,
+    get_pending_reset,
+    clear_pending_reset,
+    get_all_pending_resets,
+    get_session_poll_ids,
+    reset_session
+)
 from ..utils_telegram.gateway_outbound import send_message
 from ..utils_telegram.utilities.image_draft_handler import stop_draft_timer
 from ..utils_telegram.utilities.poll_response_handler import stop_poll_for_reset
