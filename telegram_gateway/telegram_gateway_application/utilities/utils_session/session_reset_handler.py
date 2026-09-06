@@ -43,8 +43,12 @@ from ..utils_telegram.utilities.poll_response_handler import stop_poll_for_reset
 logger = logging.getLogger(__name__)
 
 # Sent to a chat once its session has actually been reset - see _send_reset_notice().
-# Set directly here - not chosen/generated at send-time.
-RESET_NOTICE_MESSAGE: str = "Looks like Rukia got a little refresh... let's start fresh."
+# Set directly here - not chosen/generated at send-time. The persona name is interpolated from
+# settings.TELEGRAM_BOT_NAME at module import (same as every other user-facing string in the
+# codebase), not resolved per-send - so this remains a single fixed value, consistent with the
+# "not chosen/generated at send-time" intent above; only the persona name itself now tracks
+# CHATBOT_NAME instead of being a second hardcoded literal alongside it.
+RESET_NOTICE_MESSAGE: str = f"Looks like {settings.TELEGRAM_BOT_NAME} got a little refresh... let's start fresh."
 
 # Signals the background loop started by start_pending_reset_ceiling_sweep() to stop.
 _ceiling_sweep_stop_event = threading.Event()

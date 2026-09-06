@@ -71,18 +71,30 @@ tg_dev_run_docker()
         docker run -d \
             --name "${CHATBOT_TELEGRAM_GATEWAY_DEV_CONTAINER_NAME}" \
             --network "${CHATBOT_NETWORK_NAME}" \
+            -e "TZ=Asia/Singapore" \
             -e "TELEGRAM_BOT_TOKEN=${CHATBOT_TELEGRAM_BOT_TOKEN}" \
             -e "TELEGRAM_ALLOWED_CHAT_IDS=${CHATBOT_TELEGRAM_ALLOWED_CHAT_IDS}" \
             -e "SESSION_RESET_ALLOWED_CHAT_IDS=${CHATBOT_SESSION_RESET_ALLOWED_CHAT_IDS}" \
+            -e "TELEGRAM_BOT_NAME=${CHATBOT_NAME}" \
+            -e "Q_USER=${CHATBOT_RABBITMQ_USERNAME}" \
+            -e "Q_PASSWORD=${CHATBOT_RABBITMQ_PASSWORD}" \
+            -e "REDIS_USERNAME=${CHATBOT_REDIS_USERNAME}" \
+            -e "REDIS_PASSWORD=${CHATBOT_REDIS_PASSWORD}" \
             -v "${dev_path}/telegram_gateway_application:/telegram_gateway/telegram_gateway_application" \
             "${CHATBOT_TELEGRAM_GATEWAY_DEV_IMAGE_NAME}"
     else
         docker run -d \
             --name "${CHATBOT_TELEGRAM_GATEWAY_DEV_CONTAINER_NAME}" \
             --network "${CHATBOT_NETWORK_NAME}" \
+            -e "TZ=Asia/Singapore" \
             -e "TELEGRAM_BOT_TOKEN=${CHATBOT_TELEGRAM_BOT_TOKEN}" \
             -e "TELEGRAM_ALLOWED_CHAT_IDS=${CHATBOT_TELEGRAM_ALLOWED_CHAT_IDS}" \
             -e "SESSION_RESET_ALLOWED_CHAT_IDS=${CHATBOT_SESSION_RESET_ALLOWED_CHAT_IDS}" \
+            -e "TELEGRAM_BOT_NAME=${CHATBOT_NAME}" \
+            -e "Q_USER=${CHATBOT_RABBITMQ_USERNAME}" \
+            -e "Q_PASSWORD=${CHATBOT_RABBITMQ_PASSWORD}" \
+            -e "REDIS_USERNAME=${CHATBOT_REDIS_USERNAME}" \
+            -e "REDIS_PASSWORD=${CHATBOT_REDIS_PASSWORD}" \
             "${CHATBOT_TELEGRAM_GATEWAY_DEV_IMAGE_NAME}"
     fi
 }
