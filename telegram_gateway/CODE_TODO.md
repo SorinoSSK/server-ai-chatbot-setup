@@ -1,5 +1,24 @@
 # TODO Record for Telegram Gateway
 
+## Agent-call access tier — whitelist for `bot_sanctuary`
+
+Status: **Implemented, reusing `SESSION_RESET_ALLOWED_CHAT_IDS` rather than a new whitelist.** Cross-service follow-up flagged from `bot_sanctuary/CODE_TODO.md` — `bot_sanctuary`'s multi-agent "Call" model (Rukia + Architect/Coder/Review/Documentation) needs to know, per task, whether the requesting `chat_id` is allowed to reach any Call beyond Rukia. `telegram_gateway` is the right owner since it's the only component that knows chat_id identity — `bot_sanctuary` should not need its own whitelist lookup.
+
+### Goal
+
+Same precedent as `SESSION_RESET_ALLOWED_CHAT_IDS` (§7 above) — comma-separated env var → `set[int]` — but used to **tag**, not **gate**: a non-whitelisted `chat_id`'s task still proceeds normally, just scoped to Rukia only by `bot_sanctuary`. This is deliberately different from `SESSION_RESET_ALLOWED_CHAT_IDS`'s silent-drop behaviour — nothing here is rejected or logged-only; every chat_id gets a working conversation, just with a different agent-access tier.
+
+- [x] No new `config.py` setting added — **decided: reuse the existing `SESSION_RESET_ALLOWED_CHAT_IDS` whitelist** (§7 above) instead of introducing a separate `AGENT_CALL_ALLOWED_CHAT_IDS`. A `chat_id` permitted to trigger a `session_reset` is treated as the same tier permitted full agent-call access — one whitelist, two consumers, rather than two whitelists that would need to be kept in sync by hand. `config_sample.ini` needed no new key as a result.
+- [x] Stamped in `gateway_inbound.py::_push_task()` — the outbound task payload always carries:
+  ```python
+  "coding_allowed": chat_id in settings.SESSION_RESET_ALLOWED_CHAT_IDS
+  ```
+  Field name finalised as `coding_allowed` (not `full_access`, the placeholder above). Always present on every task payload — `True` if `chat_id` is whitelisted, `False` by default otherwise. See README.md's Task Queue Payload section.
+- [x] Scoped to the payload built in `_push_task()` only (plain text/finalised-draft tasks) — the poll-answer/poll-timed-out pushes (`poll_response_handler.py`) and the delivery-failure/gateway-alert events (`error_handling.py`) do not currently carry `coding_allowed`, since those call sites resolve only `task_id`→`session_id` and don't have `chat_id` on hand. Extending it there, if `bot_sanctuary` needs it on every payload type rather than just the initial task, is open follow-up work.
+- [x] No enforcement on this side beyond the tag itself — `bot_sanctuary` is the one that actually restricts which Calls a tagged-Rukia-only task can reach; `telegram_gateway`'s job here is purely to know and stamp identity, consistent with its existing "translate only, no downstream business logic" role.
+
+---
+
 ## Graceful `session_reset` (deferred reset + crash-resilient ack)
 
 Status: **§0-§8 implemented (§8: direction C - A + B).** The remaining open question (§8's UX consequence - an unsignalled reset landing immediately behind a single reply after a lull) is a conscious, separate, not-yet-decided call - see the "Open questions" section at the bottom.

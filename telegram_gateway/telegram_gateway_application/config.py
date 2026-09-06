@@ -41,7 +41,7 @@ class Settings:
         # Telegram Bot Connection
         # NOTE: placeholder values - update TELEGRAM_BOT_TOKEN via env/.env before running.
         DEFAULT_TELEGRAM_BOT_TOKEN                              = "REPLACE_WITH_BOT_TOKEN"
-        DEFAULT_TELEGRAM_BOT_NAME                               = "Rukia"
+        DEFAULT_TELEGRAM_BOT_NAME                               = ""
         DEFAULT_TELEGRAM_API_BASE_URL                           = "https://api.telegram.org"
         DEFAULT_TELEGRAM_POLL_TIMEOUT                           = 30
         DEFAULT_TELEGRAM_CLIENT_TIMEOUT                         = 10

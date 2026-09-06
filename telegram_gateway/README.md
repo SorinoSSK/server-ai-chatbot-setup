@@ -219,7 +219,7 @@ reset_session(chat_id)                         <- everything below keyed by the 
 | Variable | Purpose |
 |-----------|---------|
 | TELEGRAM_BOT_TOKEN | The bot's API token - must be set before running. |
-| TELEGRAM_BOT_NAME | Persona name used in user-facing reply text. |
+| TELEGRAM_BOT_NAME | Persona name used in user-facing reply text. Sourced from `config.ini`'s `CHATBOT_NAME` (`compose.dev.yml`/`setup.sh` map the container's `TELEGRAM_BOT_NAME` env var from it - the config.ini key and the container-side env var name deliberately differ, same convention as `TELEGRAM_BOT_TOKEN` from `CHATBOT_TELEGRAM_BOT_TOKEN`). |
 | TELEGRAM_API_BASE_URL | Base URL for the Telegram Bot API. |
 | TELEGRAM_POLL_TIMEOUT | How long a `getUpdates` call holds the connection open awaiting new updates. |
 | TELEGRAM_CLIENT_TIMEOUT | Request timeout applied on top of `TELEGRAM_POLL_TIMEOUT`/other API calls. |
@@ -311,7 +311,8 @@ Every task the gateway pushes to RabbitMQ (`Q_CHANNEL_OUT`) shares one shape, re
   "image_url": "...",
   "video_url": "...",
   "file_url": "...",
-  "poll_answer": [0, 2]
+  "poll_answer": [0, 2],
+  "coding_allowed": false
 }
 ```
 
@@ -323,6 +324,7 @@ Every task the gateway pushes to RabbitMQ (`Q_CHANNEL_OUT`) shares one shape, re
 - `poll_answer`: `null`/absent on a plain text/media task.
   Populated only on a poll answer push, with the responder's selected option indices (Telegram's `option_ids`, indices into the original poll's `options`).
   Carries no `user_id` - a poll only ever has one possible responder (this gateway's 1 user : 1 chat, private-chat-only model, where `chat_id` is itself the user's Telegram `user_id`), so `task_id` already resolves the poll back to its chat unambiguously.
+- `coding_allowed`: always present on this initial task payload - `true` if `chat_id` is in `SESSION_RESET_ALLOWED_CHAT_IDS`, `false` otherwise (default). Tags whether the requesting chat is permitted to reach beyond `bot_sanctuary`'s Rukia-only agent tier - the gateway only stamps this identity tag, it does not itself gate/reject anything based on it (see `CODE_TODO.md`'s "Agent-call access tier" entry). Not currently present on the poll-answer/poll-timed-out pushes below, or on the delivery-failure/gateway-alert events further down, as those call sites don't resolve `chat_id` directly.
 
 #### Pending drafts (media without an instruction yet)
 

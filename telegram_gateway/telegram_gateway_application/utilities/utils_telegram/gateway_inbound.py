@@ -296,6 +296,7 @@ def _push_task(chat_id: int, user_id: int, text: str, image_url: str = "", video
     Notes:
         - At most one of image_url/video_url/file_url is expected to be non-empty.
         - session_id is resolved/created via generate_session() and is mandatory on every outbound payload - see utils_redis/database.py.
+        - coding_allowed is always present on the payload - True if chat_id is in settings.SESSION_RESET_ALLOWED_CHAT_IDS, False otherwise (default).
         - start_typing() begins only after queue_push_task() succeeds.
     """
     task_id = create_task_mapping(chat_id, user_id)
@@ -322,7 +323,8 @@ def _push_task(chat_id: int, user_id: int, text: str, image_url: str = "", video
             "text": text or "",
             "image_url": image_url or "",
             "video_url": video_url or "",
-            "file_url": file_url or ""
+            "file_url": file_url or "",
+            "coding_allowed": chat_id in settings.SESSION_RESET_ALLOWED_CHAT_IDS
         }):
             logger.error(f"Failed to push task_id={task_id} to RabbitMQ for chat_id={chat_id}. Message dropped.")
             send_message(
