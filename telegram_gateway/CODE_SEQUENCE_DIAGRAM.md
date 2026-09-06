@@ -246,25 +246,30 @@ sequenceDiagram
 
     loop each cycle (DRAFT_CYCLE_SECONDS, up to DRAFT_CLOSE_SECONDS total)
         DraftLoop->>DraftLoop: silent wait
-        DraftLoop->>TG: sendChatAction(typing) [beat 1]
+        DraftLoop->>TG: sendChatAction(typing) (held for DRAFT_TYPING_LEAD_SECONDS)
         alt final cycle
             DraftLoop->>TG: sendMessage (final notice, no button)
         else non-final cycle
             DraftLoop->>Button: register_bot_button("give me a little while more")
             DraftLoop->>TG: send_message_with_buttons(cycle notice + inline keyboard)
         end
-        DraftLoop->>TG: sendChatAction(typing) [beat 2]
-        alt user presses continue button before cycle end
-            User->>TG: taps "give me a little while more"
-            TG-->>Gateway: update (callback_query, data=token)
-            Gateway->>Button: validate_bot_callback(token, chat_id)
-            Button-->>Gateway: {purpose: draft_continue}
-            Gateway->>DraftLoop: continue_draft_timer(chat_id)
-            DraftLoop->>TG: sendMessage (acceptance message)
-            DraftLoop->>DraftLoop: skip immediately to next cycle
-        else no response, not the final cycle
-            DraftLoop->>DraftLoop: fall through silently to next cycle
-        else no response, final cycle
+        DraftLoop->>DraftLoop: _wait_full_duration() - wait out this cycle's remaining time (DRAFT_CYCLE_NOTICE_LEAD_SECONDS)
+        opt user presses continue at any point during this wait (non-final cycle only)
+            loop for every press received before this cycle's wait elapses
+                User->>TG: taps "give me a little while more"
+                TG-->>Gateway: update (callback_query, data=token)
+                Gateway->>Button: validate_bot_callback(token, chat_id)
+                Button-->>Gateway: {purpose: draft_continue}
+                Gateway->>DraftLoop: continue_draft_timer(chat_id)
+                DraftLoop->>TG: sendMessage (acceptance message)
+                Note over DraftLoop: acknowledged immediately - does NOT shorten this cycle; the remaining wait still plays out in full before the loop advances
+            end
+        end
+        alt draft finalised elsewhere while this cycle's wait was still running
+            DraftLoop->>DraftLoop: stop signal received - exit loop immediately (no close message here - see §4.4)
+        else wait elapsed uninterrupted, pressed at least once this cycle (non-final only)
+            DraftLoop->>DraftLoop: "extended" - proceed to next scheduled cycle
+        else wait elapsed uninterrupted, never pressed this cycle (or this was the final cycle)
             DraftLoop->>TG: sendMessage ("doing other work for now" close message)
             DraftLoop->>Redis: delete_chat_draft(chat_id)
             DraftLoop->>DraftLoop: stop timer, exit loop
@@ -907,7 +912,7 @@ sequenceDiagram
             MQ-->>Caller: UnroutableError
             Caller->>Caller: log error, return False (not retried)
         else connection-level failure
-            MQ-->>Caller: AMQPConnectionError / StreamLostError / ChannelClosed
+            MQ-->>Caller: AMQPConnectionError / StreamLostError / ChannelWrongStateError / ChannelClosed
             Caller->>Caller: log warning, sleep(Q_PUSH_RETRY_DELAY), retry
         else success
             MQ-->>Caller: publish confirmed
@@ -927,7 +932,7 @@ sequenceDiagram
     loop while _consumer_running
         Consumer->>MQ: basic_consume() / start_consuming()
         alt connection lost
-            MQ-->>Consumer: AMQPConnectionError / StreamLostError
+            MQ-->>Consumer: AMQPConnectionError / StreamLostError / ChannelWrongStateError
             Consumer->>Consumer: log warning, sleep(Q_CONSUME_RETRY_DELAY)
             Consumer->>Consumer: loop -> reconnect
         else unexpected exception
