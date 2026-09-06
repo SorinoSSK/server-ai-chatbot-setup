@@ -2,7 +2,7 @@
 # File        : logging_setup.py
 # Description : Configures application logging, including console output, file rotation, retention policy, and log formatting.
 # Author      : SorinoSSK
-# Created On  : 2026-09-04
+# Created On  : 2026-09-06
 #
 # Features    :
 #   - Console and daily/size-based rotating file logging, with retention management.
@@ -10,6 +10,7 @@
 # Notes       :
 #   - Centralised logging configuration for the application.
 #   - Intended to be initialised once during application entry points on startup.
+#   - Named logging_setup.py (not logging.py) from the start, to avoid shadowing the standard library's logging module.
 # =============================================================================
 # I M P O R T   H E A D E R
 
