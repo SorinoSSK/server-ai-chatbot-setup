@@ -40,38 +40,44 @@ def initialise_redis_connection() -> None:
     """
     Opens the shared Redis connection, reused across the application.
 
+    Retries indefinitely, with a fixed delay between attempts, whenever Redis is not yet reachable - blocks the caller until a connection succeeds rather than giving up after a bounded number of attempts.
+
     Args:
         None
 
     Returns:
         None
 
-    Raises:
-        redis.exceptions.RedisError:
-            If the connection cannot be established.
+    Notes:
+        - Startup-only behaviour in practice: _client is only None before the first successful connection (or after close_redis_connection() during shutdown), so this retry loop is only ever entered from initialise.py::initialise_application(), and a transient Redis-not-up-yet race at container start does not crash-exit the whole application.
+        - Once connected, ongoing operations rely on their own bounded retry instead (REDIS_TASK_MAX_ATTEMPTS) - see _redis_read()/_redis_write()/_redis_delete() - this function is not on that path.
+        - Any exception other than redis.exceptions.RedisError still propagates immediately and is not retried.
     """
     global _client
     with _lock:
         if _client is None:
-            try:
-                _client = redis.Redis(
-                    host=settings.REDIS_HOST,
-                    port=settings.REDIS_PORT,
-                    db=settings.REDIS_DB,
-                    username=settings.REDIS_USERNAME,
-                    password=settings.REDIS_PASSWORD,
-                    socket_connect_timeout=settings.REDIS_SOCKET_CONNECT_TIMEOUT,
-                    socket_timeout=settings.REDIS_SOCKET_TIMEOUT,
-                    socket_keepalive=settings.REDIS_SOCKET_KEEPALIVE,
-                    health_check_interval=settings.REDIS_HEALTH_CHECK_INTERVAL,
-                    decode_responses=True
-                )
-                _client.ping()
-                logger.info("Redis connection initialised")
+            while True:
+                try:
+                    _client = redis.Redis(
+                        host=settings.REDIS_HOST,
+                        port=settings.REDIS_PORT,
+                        db=settings.REDIS_DB,
+                        username=settings.REDIS_USERNAME,
+                        password=settings.REDIS_PASSWORD,
+                        socket_connect_timeout=settings.REDIS_SOCKET_CONNECT_TIMEOUT,
+                        socket_timeout=settings.REDIS_SOCKET_TIMEOUT,
+                        socket_keepalive=settings.REDIS_SOCKET_KEEPALIVE,
+                        health_check_interval=settings.REDIS_HEALTH_CHECK_INTERVAL,
+                        decode_responses=True
+                    )
+                    _client.ping()
+                    logger.info("Redis connection initialised")
+                    return
 
-            except redis.exceptions.RedisError as e:
-                logger.critical(f"Failed to connect to Redis: {e}")
-                raise
+                except redis.exceptions.RedisError as e:
+                    _client = None
+                    logger.warning(f"Redis not reachable yet at startup: {e}. Retrying in {settings.REDIS_CONNECT_RETRY_DELAY_SECONDS}s...")
+                    time.sleep(settings.REDIS_CONNECT_RETRY_DELAY_SECONDS)
         else:
             logger.warning("Reinitialisation of Redis connection occured. No new Redis initialisation is made.")
 

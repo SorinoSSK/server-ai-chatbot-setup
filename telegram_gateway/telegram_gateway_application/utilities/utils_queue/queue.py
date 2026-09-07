@@ -127,18 +127,27 @@ def initialise_rabbitmq_connection() -> None:
     """
     Initialises both the publish and consume RabbitMQ connections.
 
+    Retries indefinitely, with a fixed delay between attempts, whenever RabbitMQ is not yet reachable - blocks the caller until both connections succeed rather than giving up after a bounded number of attempts.
+
     Args:
         None
 
     Returns:
         None
 
-    Raises:
-        pika.exceptions.AMQPConnectionError:
-            If either connection cannot be established.
+    Notes:
+        - Startup-only behaviour: intended for initialise.py::initialise_application(), so a transient RabbitMQ-not-up-yet race at container start does not crash-exit the whole application.
+        - Runtime reconnection (once the application is already up) goes through queue_push_task()'s own bounded retry or queue_consume_task()'s own reconnect loop instead - see their docstrings. Neither of those is affected by this function.
+        - Any exception other than pika.exceptions.AMQPConnectionError (e.g. a credential/vhost misconfiguration surfaced as a different pika exception type) still propagates immediately and is not retried.
     """
-    _initialise_rabbitmq_publish_connection()
-    _initialise_rabbitmq_consume_connection()
+    while True:
+        try:
+            _initialise_rabbitmq_publish_connection()
+            _initialise_rabbitmq_consume_connection()
+            return
+        except pika.exceptions.AMQPConnectionError as e:
+            logger.warning(f"RabbitMQ not reachable yet at startup: {e}. Retrying in {settings.Q_CONNECT_RETRY_DELAY_SECONDS}s...")
+            time.sleep(settings.Q_CONNECT_RETRY_DELAY_SECONDS)
 
 def close_rabbitmq_connection() -> None:
     """

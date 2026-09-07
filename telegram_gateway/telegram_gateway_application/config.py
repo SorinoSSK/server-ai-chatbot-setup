@@ -172,6 +172,7 @@ class Settings:
         DEFAULT_Q_BLOCKED_CONNECTION_TIMEOUT                    = 300
         DEFAULT_Q_CONSUME_RETRY_DELAY                           = 1
         DEFAULT_Q_CONSUME_MAX_ATTEMPTS                          = 5
+        DEFAULT_Q_CONNECT_RETRY_DELAY_SECONDS                   = 5      # delay between startup connection attempts while RabbitMQ is not yet reachable (see initialise_rabbitmq_connection())
         self.Q_HOST                                             = os.getenv("Q_HOST") or DEFAULT_Q_HOST
         self.Q_USER                                             = os.getenv("Q_USER") or DEFAULT_Q_USER
         self.Q_PASSWORD                                         = os.getenv("Q_PASSWORD") or DEFAULT_Q_PASSWORD
@@ -185,6 +186,7 @@ class Settings:
         self.Q_BLOCKED_CONNECTION_TIMEOUT                       = get_env_int("Q_BLOCKED_CONNECTION_TIMEOUT", DEFAULT_Q_BLOCKED_CONNECTION_TIMEOUT)
         self.Q_CONSUME_RETRY_DELAY                              = get_env_int("Q_CONSUME_RETRY_DELAY", DEFAULT_Q_CONSUME_RETRY_DELAY)
         self.Q_CONSUME_MAX_ATTEMPTS                             = get_env_int("Q_CONSUME_MAX_ATTEMPTS", DEFAULT_Q_CONSUME_MAX_ATTEMPTS)
+        self.Q_CONNECT_RETRY_DELAY_SECONDS                      = get_env_int("Q_CONNECT_RETRY_DELAY_SECONDS", DEFAULT_Q_CONNECT_RETRY_DELAY_SECONDS)
 
         # Redis Connection
         DEFAULT_REDIS_HOST                                      = "chatbot-redis"
@@ -199,6 +201,7 @@ class Settings:
         DEFAULT_REDIS_TASK_RETRY_DELAY                          = 1
         DEFAULT_REDIS_TASK_MAX_ATTEMPTS                         = 5
         DEFAULT_REDIS_TASK_MAPPING_TTL_SECONDS                  = 86400
+        DEFAULT_REDIS_CONNECT_RETRY_DELAY_SECONDS               = 5      # delay between startup connection attempts while Redis is not yet reachable (see initialise_redis_connection())
         self.REDIS_HOST                                         = os.getenv("REDIS_HOST") or DEFAULT_REDIS_HOST
         self.REDIS_PORT                                         = get_env_int("REDIS_PORT", DEFAULT_REDIS_PORT)
         self.REDIS_USERNAME                                     = os.getenv("REDIS_USERNAME") or DEFAULT_REDIS_USERNAME
@@ -211,6 +214,7 @@ class Settings:
         self.REDIS_TASK_RETRY_DELAY                             = get_env_int("REDIS_TASK_RETRY_DELAY", DEFAULT_REDIS_TASK_RETRY_DELAY)
         self.REDIS_TASK_MAX_ATTEMPTS                            = get_env_int("REDIS_TASK_MAX_ATTEMPTS", DEFAULT_REDIS_TASK_MAX_ATTEMPTS)
         self.REDIS_TASK_MAPPING_TTL_SECONDS                     = get_env_int("REDIS_TASK_MAPPING_TTL_SECONDS", DEFAULT_REDIS_TASK_MAPPING_TTL_SECONDS)
+        self.REDIS_CONNECT_RETRY_DELAY_SECONDS                  = get_env_int("REDIS_CONNECT_RETRY_DELAY_SECONDS", DEFAULT_REDIS_CONNECT_RETRY_DELAY_SECONDS)
 
 def get_env_int(name: str, default: int, minimum: int = 1) -> int:
         """

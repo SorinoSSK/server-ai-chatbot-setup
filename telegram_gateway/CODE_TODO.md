@@ -276,3 +276,33 @@ The "Give me a little while more" button (`continue_draft_timer()`, `utils_teleg
 
 - `telegram_gateway_application/utilities/utils_telegram/utilities/image_draft_handler.py`: `continue_draft_timer()`, `_draft_loop()`, `_consume_continue()`, module header comment.
 - `README.md`: "Pending drafts (media without an instruction yet)" section, the "Timeout, per draft..." paragraph describing the keep-alive cycle schedule.
+
+---
+
+## FIX — No retry on RabbitMQ/Redis startup connections, crashing the application
+
+Status: **Implemented.** `initialise_rabbitmq_publish_connection()`, `initialise_rabbitmq_consume_connection()`, and `initialise_redis_connection()` each made exactly one connection attempt at startup, raising immediately on failure with no retry loop; because `main.py::main()` calls `initialise_application()` with no `try`/`except` around it, a transient "dependency not up yet" race (a normal, expected condition in multi-container deployments without externally enforced startup ordering) crashed the whole application on launch.
+
+### Context
+
+`utils_queue/queue.py::_initialise_rabbitmq_publish_connection()`/`_initialise_rabbitmq_consume_connection()` and `utils_redis/database.py::initialise_redis_connection()` each opened their respective connection inside a `try`/`except` that logged `critical` and re-raised on the very first failure. `initialise_application()` calls these unguarded via `initialise_rabbitmq_connection()`/`initialise_redis_connection()`, and `main()` has no `try`/`except` around `initialise_application()` either — so RabbitMQ or Redis not yet being reachable at the exact moment the gateway container starts (a normal race, not a genuine fault) propagated straight out of `main()` and killed the process, rather than being retried.
+
+### Decisions
+
+- **Scoped the fix to the startup entry points only** (`initialise_rabbitmq_connection()`, `initialise_redis_connection()`), not the shared per-connection helpers (`_initialise_rabbitmq_publish_connection()`/`_initialise_rabbitmq_consume_connection()`) themselves — those two helpers are also reused at *runtime* to reacquire a dropped connection (`_get_rabbitmq_publish_channel()`/`_get_rabbitmq_consume_channel()`). `queue_push_task()` deliberately relies on a *bounded* retry (`Q_PUSH_MAX_ATTEMPTS`, since it runs on the request path and is expected to fail fast and return `False` rather than hang indefinitely), and `queue_consume_task()` already has its own infinite reconnect loop independent of this fix. Making the shared helpers themselves block forever would have silently turned `queue_push_task()`'s bounded-retry contract into an indefinite hang — not requested, and a behaviour change beyond what was asked. The infinite retry loop lives only in `initialise_rabbitmq_connection()`, wrapping calls to the (unchanged) single-attempt helpers.
+- `initialise_redis_connection()` was modified in place (not wrapped) — `_client` is only `None` before the first successful connection (or after `close_redis_connection()` during shutdown), so it has no equivalent runtime-reacquisition reuse to protect; safe to make it block-and-retry directly.
+- New settings `Q_CONNECT_RETRY_DELAY_SECONDS`/`REDIS_CONNECT_RETRY_DELAY_SECONDS` (both default 5s, env-overridable via `get_env_int()`).
+- Docstrings updated — `initialise_rabbitmq_connection()`, `initialise_redis_connection()`, and `initialise_application()` no longer claim a `Raises` contract for the transient-unavailability case; they now describe the indefinite-retry/blocks-until-connected behaviour instead.
+- **Accepted risk, decided by user:** the retry loops catch the whole `pika.exceptions.AMQPConnectionError` family (which includes `ProbableAuthenticationError`/`ProbableAccessDeniedError`) and, on the Redis side, the whole `redis.exceptions.RedisError` hierarchy, treating every instance as the transient "not up yet" case rather than distinguishing it from a permanent credential/vhost/db misconfiguration — so a bad credential would also retry forever at startup instead of failing fast. **User's explicit call: acceptable, in favour of stability over fail-fast diagnostics.** A failed authentication/connection attempt is still logged (warning, per attempt) on every retry cycle, so it remains straightforward to spot and resolve from the logs on startup — not silent. Not narrowed further; no bounded cap or exception-subtype distinction is planned.
+
+### Implementation Notes
+
+- `utils_queue/queue.py::initialise_rabbitmq_connection()`: now a `while True` loop calling the two existing single-attempt helpers, catching `pika.exceptions.AMQPConnectionError`, logging a warning, and sleeping `settings.Q_CONNECT_RETRY_DELAY_SECONDS` before retrying. Any other exception type still propagates immediately (fail-fast preserved for genuinely unexpected errors).
+- `utils_redis/database.py::initialise_redis_connection()`: the `try`/`except redis.exceptions.RedisError`/raise block became a `while True` loop with the same warning-log-and-sleep pattern, using `settings.REDIS_CONNECT_RETRY_DELAY_SECONDS`. `_client` is reset to `None` on a failed attempt before retrying, to keep "is `_client` actually connected" consistent for any other reader of that global.
+- `config.py`: `Q_CONNECT_RETRY_DELAY_SECONDS`/`REDIS_CONNECT_RETRY_DELAY_SECONDS` added alongside their respective existing Queue/Redis Connection blocks.
+- Runtime reconnection paths (`queue_push_task()`'s bounded retry, `queue_consume_task()`'s own infinite reconnect loop, and every Redis per-operation helper's `REDIS_TASK_MAX_ATTEMPTS`-bounded retry) were **not touched** — this fix is scoped to the startup race only, per the user's explicit ask.
+
+### Open Questions
+
+1. ~~Whether the retry loops should distinguish a transient "not up yet" failure from a permanent credential/config error (which would otherwise also retry forever).~~ **Decided: accepted risk, no change.** User prefers stability (never crash on startup) over fail-fast diagnostics here; a bad credential retrying indefinitely is acceptable given every attempt is still logged, making it straightforward to diagnose from the logs.
+2. Whether `CODE_NON_COMPLIANCE.md` in this repository should be updated to record this finding/fix formally as its own numbered entry is a call for whoever owns that document next — it's treated as an immutable compliance record here and was not modified as part of this session.

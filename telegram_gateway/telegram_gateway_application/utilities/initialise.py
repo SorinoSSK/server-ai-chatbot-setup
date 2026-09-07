@@ -53,12 +53,8 @@ def initialise_application() -> None:
     Returns:
         None
 
-    Raises:
-        redis.exceptions.RedisError:
-            If the Redis connection cannot be established.
-
-        pika.exceptions.AMQPConnectionError:
-            If a RabbitMQ connection cannot be established.
+    Notes:
+        - initialise_rabbitmq_connection() and initialise_redis_connection() each block, retrying indefinitely, until their respective connection succeeds - a RabbitMQ/Redis not yet up at container start does not crash-exit the application. See their own docstrings.
     """
 
     # Initialise RabbitMQ connections and start RabbitMQ consumer
