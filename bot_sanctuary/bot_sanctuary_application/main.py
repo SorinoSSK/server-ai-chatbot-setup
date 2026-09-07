@@ -8,10 +8,8 @@
 #   - Performs application startup/shutdown wiring (data directory, logging, signal handling).
 #
 # Notes       :
-#   - initialise_application() runs a one-off LLM_OAUTH_TOKEN startup smoke test (see
-#     utilities/initialise.py); RabbitMQ and the agent-call session pipeline are still wired in
-#     as their owning modules are built (see bot_sanctuary/CODE_TODO.md). terminate_application()
-#     remains a placeholder.
+#   - initialise_application() (see utilities/initialise.py) runs a one-off LLM_OAUTH_TOKEN startup smoke test, opens the RabbitMQ consume connection, and starts the background consumer thread.
+#   - The session-routing/agent-call pipeline is still a placeholder at the message-handling layer (see utilities/utils_queue/message_handler.py) - see bot_sanctuary/CODE_TODO.md §3.
 #
 # =============================================================================
 # I M P O R T   H E A D E R
@@ -40,9 +38,7 @@ def main():
         None
 
     Notes:
-        - Setup is performed here (rather than at module import time) so importing this
-          module has no filesystem/logging side effects - only running it as the
-          application entry point does.
+        - Setup is performed here (rather than at module import time) so importing this module has no filesystem/logging side effects - only running it as the application entry point does.
     """
     settings.DATA_DIR.mkdir(parents=True, exist_ok=True)
 

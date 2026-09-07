@@ -1,7 +1,6 @@
 # =============================================================================
 # File        : utilities.py
 # Description : Provides reusable utility functions/classes shared across the application.
-#
 # Author      : SorinoSSK
 # Created On  : 2026-09-06
 #
@@ -10,6 +9,7 @@
 #   - Intended for functions that are reused by multiple modules.
 #   - Avoid placing application-specific business logic in this file.
 #   - Avoid implementing functions that have dependencies on external files.
+#
 # =============================================================================
 # I M P O R T   H E A D E R
 

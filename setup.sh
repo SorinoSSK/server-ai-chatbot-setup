@@ -40,6 +40,12 @@ get_masked_config_variables()
     echo "CHATBOT_REDIS_PASSWORD"
     echo "CHATBOT_LLM_TYPE"
     echo "CHATBOT_LLM_OAUTH_TOKEN"
+    echo "CHATBOT_SMTP_FROM_EMAIL"
+    echo "CHATBOT_SMTP_TO_EMAIL"
+    echo "CHATBOT_SMTP_USERNAME"
+    echo "CHATBOT_SMTP_PASSWORD"
+    echo "CHATBOT_BOT_SANCTUARY_REDIS_USERNAME"
+    echo "CHATBOT_BOT_SANCTUARY_REDIS_PASSWORD"
 }
 
 generate_config_sample()

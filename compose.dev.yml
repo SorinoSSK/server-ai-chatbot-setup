@@ -34,11 +34,26 @@ services:
       Q_PASSWORD: "${CHATBOT_RABBITMQ_PASSWORD}"
       LLM_TYPE: "${CHATBOT_LLM_TYPE}"
       LLM_OAUTH_TOKEN: "${CHATBOT_LLM_OAUTH_TOKEN}"
+      TELEGRAM_BOT_NAME: "${CHATBOT_NAME}"
+      SMTP_ENABLE_MAILER: "${CHATBOT_SMTP_ENABLE_MAILER}"
+      SMTP_FORCE_SSL: "${CHATBOT_SMTP_FORCE_SSL}"
+      SMTP_AUTH_TYPE: "${CHATBOT_SMTP_AUTH_TYPE}"
+      SMTP_SKIP_TLS: "${CHATBOT_SMTP_SKIP_TLS}"
+      SMTP_HOST: "${CHATBOT_SMTP_HOST}"
+      SMTP_PORT: "${CHATBOT_SMTP_PORT}"
+      SMTP_FROM_EMAIL: "${CHATBOT_SMTP_FROM_EMAIL}"
+      SMTP_TO_EMAIL: "${CHATBOT_SMTP_TO_EMAIL}"
+      SMTP_USERNAME: "${CHATBOT_SMTP_USERNAME}"
+      SMTP_PASSWORD: "${CHATBOT_SMTP_PASSWORD}"
+      REDIS_USERNAME: "${CHATBOT_BOT_SANCTUARY_REDIS_USERNAME}"
+      REDIS_PASSWORD: "${CHATBOT_BOT_SANCTUARY_REDIS_PASSWORD}"
     volumes:
       - "${DEV_PATH}/${CHATBOT_BOT_SANCTUARY_PATH_NAME}/bot_sanctuary_application:/bot_sanctuary/bot_sanctuary_application"
       - "${DEV_PATH}/${CHATBOT_BOT_SANCTUARY_PATH_NAME}/bot_directory:/home/bot_sanctuary_usr/.claude"
     depends_on:
       rabbitmq:
+        condition: service_healthy
+      redis:
         condition: service_healthy
     networks:
       - "chatbot-app-network"
@@ -72,7 +87,8 @@ services:
         "--appendonly", "yes",
         "--appendfsync", "always",
         "--requirepass", "${CHATBOT_REDIS_PASSWORD}",
-        "--user", "${CHATBOT_REDIS_USERNAME}", "on", ">${CHATBOT_REDIS_PASSWORD}", "~*", "&*", "+@all"
+        "--user", "${CHATBOT_REDIS_USERNAME}", "on", ">${CHATBOT_REDIS_PASSWORD}", "~*", "&*", "+@all",
+        "--user", "${CHATBOT_BOT_SANCTUARY_REDIS_USERNAME}", "on", ">${CHATBOT_BOT_SANCTUARY_REDIS_PASSWORD}", "~bot_sanctuary:*", "&*", "+@all"
       ]
     # ports:
     #   - "${CHATBOT_REDIS_PORT}:6379"

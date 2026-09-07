@@ -73,6 +73,19 @@ bs_dev_run_docker()
             -e "Q_PASSWORD=${CHATBOT_RABBITMQ_PASSWORD}" \
             -e "LLM_TYPE=${CHATBOT_LLM_TYPE}" \
             -e "LLM_OAUTH_TOKEN=${CHATBOT_LLM_OAUTH_TOKEN}" \
+            -e "TELEGRAM_BOT_NAME=${CHATBOT_NAME}" \
+            -e "SMTP_ENABLE_MAILER=${CHATBOT_SMTP_ENABLE_MAILER}" \
+            -e "SMTP_FORCE_SSL=${CHATBOT_SMTP_FORCE_SSL}" \
+            -e "SMTP_AUTH_TYPE=${CHATBOT_SMTP_AUTH_TYPE}" \
+            -e "SMTP_SKIP_TLS=${CHATBOT_SMTP_SKIP_TLS}" \
+            -e "SMTP_HOST=${CHATBOT_SMTP_HOST}" \
+            -e "SMTP_PORT=${CHATBOT_SMTP_PORT}" \
+            -e "SMTP_FROM_EMAIL=${CHATBOT_SMTP_FROM_EMAIL}" \
+            -e "SMTP_TO_EMAIL=${CHATBOT_SMTP_TO_EMAIL}" \
+            -e "SMTP_USERNAME=${CHATBOT_SMTP_USERNAME}" \
+            -e "SMTP_PASSWORD=${CHATBOT_SMTP_PASSWORD}" \
+            -e "REDIS_USERNAME=${CHATBOT_BOT_SANCTUARY_REDIS_USERNAME}" \
+            -e "REDIS_PASSWORD=${CHATBOT_BOT_SANCTUARY_REDIS_PASSWORD}" \
             -v "${dev_path}/bot_sanctuary_application:/bot_sanctuary/bot_sanctuary_application" \
             -v "${dev_path}/bot_directory:/home/bot_sanctuary_usr/.claude" \
             "${CHATBOT_BOT_SANCTUARY_DEV_IMAGE_NAME}"
@@ -84,6 +97,19 @@ bs_dev_run_docker()
             -e "Q_PASSWORD=${CHATBOT_RABBITMQ_PASSWORD}" \
             -e "LLM_TYPE=${CHATBOT_LLM_TYPE}" \
             -e "LLM_OAUTH_TOKEN=${CHATBOT_LLM_OAUTH_TOKEN}" \
+            -e "TELEGRAM_BOT_NAME=${CHATBOT_NAME}" \
+            -e "SMTP_ENABLE_MAILER=${CHATBOT_SMTP_ENABLE_MAILER}" \
+            -e "SMTP_FORCE_SSL=${CHATBOT_SMTP_FORCE_SSL}" \
+            -e "SMTP_AUTH_TYPE=${CHATBOT_SMTP_AUTH_TYPE}" \
+            -e "SMTP_SKIP_TLS=${CHATBOT_SMTP_SKIP_TLS}" \
+            -e "SMTP_HOST=${CHATBOT_SMTP_HOST}" \
+            -e "SMTP_PORT=${CHATBOT_SMTP_PORT}" \
+            -e "SMTP_FROM_EMAIL=${CHATBOT_SMTP_FROM_EMAIL}" \
+            -e "SMTP_TO_EMAIL=${CHATBOT_SMTP_TO_EMAIL}" \
+            -e "SMTP_USERNAME=${CHATBOT_SMTP_USERNAME}" \
+            -e "SMTP_PASSWORD=${CHATBOT_SMTP_PASSWORD}" \
+            -e "REDIS_USERNAME=${CHATBOT_BOT_SANCTUARY_REDIS_USERNAME}" \
+            -e "REDIS_PASSWORD=${CHATBOT_BOT_SANCTUARY_REDIS_PASSWORD}" \
             "${CHATBOT_BOT_SANCTUARY_DEV_IMAGE_NAME}"
     fi
 }
