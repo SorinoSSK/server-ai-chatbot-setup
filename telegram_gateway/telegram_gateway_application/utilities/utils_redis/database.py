@@ -79,8 +79,9 @@ def initialise_redis_connection() -> None:
                     if not _should_redis_retry_infinite():
                         logger.warning(f"Redis not reachable at startup: {e}. REDIS_FORCE_INFINITE_RETRY is disabled - giving up.")
                         break
-                    logger.warning(f"Redis not reachable yet at startup: {e}. Retrying in {settings.REDIS_CONNECT_RETRY_DELAY_SECONDS}s...")
-                    time.sleep(settings.REDIS_CONNECT_RETRY_DELAY_SECONDS)
+                    else:
+                        logger.warning(f"Redis not reachable yet at startup: {e}. Retrying in {settings.REDIS_CONNECT_RETRY_DELAY_SECONDS}s...")
+                        time.sleep(settings.REDIS_CONNECT_RETRY_DELAY_SECONDS)
         else:
             logger.warning("Reinitialisation of Redis connection occured. No new Redis initialisation is made.")
 
@@ -139,7 +140,7 @@ def _should_redis_retry_infinite() -> bool:
 
 def _redis_write(key: str, value: str, ttl_seconds: int | None = None, nx: bool = False) -> bool:
     """
-    Writes a key-value pair to Redis, optionally with a TTL.
+    Writes a key-value pair to Redis, optionally with a TTL, retrying on a failed write (e.g. a connection issue).
 
     Args:
         key (str)
@@ -154,35 +155,49 @@ def _redis_write(key: str, value: str, ttl_seconds: int | None = None, nx: bool 
 
     Returns:
         bool:
-            True if written; otherwise False (including a no-op skip from nx=True).
+            True if written; otherwise False (including a no-op skip from nx=True, or exhausted retries).
 
     Notes:
         - Accepts str only - callers must serialise complex values first (e.g. json.dumps).
+        - Retries only a raised exception - an nx=True no-op skip (key already exists) is a legitimate outcome returned by Redis itself, not a failure, and returns immediately without retrying. Mirrors _redis_delete()'s retry shape.
     """
-    try:
-        client = _get_redis_client()
-        return bool(client.set(key, value, ex=ttl_seconds, nx=nx))
-    except Exception:
-        logger.exception("Failed to write to Redis.")
-        return False
+    for attempt in range(1, settings.REDIS_TASK_MAX_ATTEMPTS + 1):
+        try:
+            client = _get_redis_client()
+            return bool(client.set(key, value, ex=ttl_seconds, nx=nx))
+        except Exception:
+            if attempt < settings.REDIS_TASK_MAX_ATTEMPTS:
+                logger.warning(f"Failed to write key={key} to Redis (attempt {attempt}/{settings.REDIS_TASK_MAX_ATTEMPTS}). Retrying...")
+                time.sleep(settings.REDIS_TASK_RETRY_DELAY)
+            else:
+                logger.exception(f"Failed to write key={key} to Redis after {settings.REDIS_TASK_MAX_ATTEMPTS} attempts.")
+                return False
 
 def _redis_read(key: str) -> str | None:
     """
-    Reads a value from Redis.
+    Reads a value from Redis, retrying on a failed read (e.g. a connection issue).
 
     Args:
         key (str)
 
     Returns:
         str | None:
-            The stored value if found; otherwise None (including on failure).
+            The stored value if found; otherwise None (including a missing key, or exhausted retries).
+
+    Notes:
+        - Retries only a raised exception - a missing key is a legitimate outcome returned by Redis itself (None, no exception), not a failure, and returns immediately without retrying. Mirrors _redis_delete()'s retry shape.
     """
-    try:
-        client = _get_redis_client()
-        return client.get(key)
-    except Exception:
-        logger.exception("Failed to read from Redis.")
-        return None
+    for attempt in range(1, settings.REDIS_TASK_MAX_ATTEMPTS + 1):
+        try:
+            client = _get_redis_client()
+            return client.get(key)
+        except Exception:
+            if attempt < settings.REDIS_TASK_MAX_ATTEMPTS:
+                logger.warning(f"Failed to read key={key} from Redis (attempt {attempt}/{settings.REDIS_TASK_MAX_ATTEMPTS}). Retrying...")
+                time.sleep(settings.REDIS_TASK_RETRY_DELAY)
+            else:
+                logger.exception(f"Failed to read key={key} from Redis after {settings.REDIS_TASK_MAX_ATTEMPTS} attempts.")
+                return None
 
 def _redis_delete(key: str) -> bool:
     """
@@ -208,6 +223,119 @@ def _redis_delete(key: str) -> bool:
                 time.sleep(settings.REDIS_TASK_RETRY_DELAY)
             else:
                 logger.exception(f"Failed to delete key={key} from Redis after {settings.REDIS_TASK_MAX_ATTEMPTS} attempts.")
+                return False
+
+def _redis_sadd(key: str, member: str) -> bool:
+    """
+    Adds a member to a Redis SET, retrying on a failed write (e.g. a connection issue).
+
+    Args:
+        key (str)
+
+        member (str)
+
+    Returns:
+        bool:
+            True if the call succeeded (regardless of whether member was already present - SADD itself is idempotent); otherwise False once retries are exhausted.
+
+    Notes:
+        - Mirrors _redis_write()'s retry shape (REDIS_TASK_MAX_ATTEMPTS/REDIS_TASK_RETRY_DELAY).
+    """
+    for attempt in range(1, settings.REDIS_TASK_MAX_ATTEMPTS + 1):
+        try:
+            client = _get_redis_client()
+            client.sadd(key, member)
+            return True
+        except Exception:
+            if attempt < settings.REDIS_TASK_MAX_ATTEMPTS:
+                logger.warning(f"Failed to add member to Redis set key={key} (attempt {attempt}/{settings.REDIS_TASK_MAX_ATTEMPTS}). Retrying...")
+                time.sleep(settings.REDIS_TASK_RETRY_DELAY)
+            else:
+                logger.exception(f"Failed to add member to Redis set key={key} after {settings.REDIS_TASK_MAX_ATTEMPTS} attempts.")
+                return False
+
+def _redis_srem(key: str, member: str) -> bool:
+    """
+    Removes a member from a Redis SET, retrying on a failed write (e.g. a connection issue).
+
+    Args:
+        key (str)
+
+        member (str)
+
+    Returns:
+        bool:
+            True if the call succeeded (regardless of whether member was actually present); otherwise False once retries are exhausted.
+
+    Notes:
+        - Mirrors _redis_write()'s retry shape (REDIS_TASK_MAX_ATTEMPTS/REDIS_TASK_RETRY_DELAY).
+    """
+    for attempt in range(1, settings.REDIS_TASK_MAX_ATTEMPTS + 1):
+        try:
+            client = _get_redis_client()
+            client.srem(key, member)
+            return True
+        except Exception:
+            if attempt < settings.REDIS_TASK_MAX_ATTEMPTS:
+                logger.warning(f"Failed to remove member from Redis set key={key} (attempt {attempt}/{settings.REDIS_TASK_MAX_ATTEMPTS}). Retrying...")
+                time.sleep(settings.REDIS_TASK_RETRY_DELAY)
+            else:
+                logger.exception(f"Failed to remove member from Redis set key={key} after {settings.REDIS_TASK_MAX_ATTEMPTS} attempts.")
+                return False
+
+def _redis_smembers(key: str) -> set:
+    """
+    Retrieves every member of a Redis SET, retrying on a failed read (e.g. a connection issue).
+
+    Args:
+        key (str)
+
+    Returns:
+        set:
+            Every member currently in the set; empty set if the key doesn't exist, or once retries are exhausted.
+
+    Notes:
+        - Mirrors _redis_read()'s retry shape (REDIS_TASK_MAX_ATTEMPTS/REDIS_TASK_RETRY_DELAY).
+        - Does not distinguish "key doesn't exist" from "exhausted retries" in its return value - both come back as an empty set, same ambiguity already accepted elsewhere in this file (e.g. _redis_read() returning None for both a missing key and a failed read).
+    """
+    for attempt in range(1, settings.REDIS_TASK_MAX_ATTEMPTS + 1):
+        try:
+            client = _get_redis_client()
+            return client.smembers(key)
+        except Exception:
+            if attempt < settings.REDIS_TASK_MAX_ATTEMPTS:
+                logger.warning(f"Failed to read Redis set key={key} (attempt {attempt}/{settings.REDIS_TASK_MAX_ATTEMPTS}). Retrying...")
+                time.sleep(settings.REDIS_TASK_RETRY_DELAY)
+            else:
+                logger.exception(f"Failed to read Redis set key={key} after {settings.REDIS_TASK_MAX_ATTEMPTS} attempts.")
+                return set()
+
+def _redis_ping() -> bool:
+    """
+    Confirms Redis is reachable via PING, retrying the same way as _redis_write()/_redis_read()/_redis_delete().
+
+    Args:
+        None
+
+    Returns:
+        bool:
+            True if Redis responded; otherwise False once retries are exhausted.
+
+    Notes:
+        - Used as a cheap up-front connectivity check by the handful of functions whose actual Redis command isn't covered by any of _redis_write()/_redis_read()/_redis_delete()/_redis_sadd()/_redis_srem()/_redis_smembers() (SCAN-based sweeps, SCARD) - see each caller's own Notes.
+        - Does not retry the caller's own command - only confirms connectivity first. The caller's command still runs once, unretried, immediately after a successful ping.
+        - Deliberately returns a plain bool, not the exception it caught - the underlying exception is already logged here (logger.exception() below) before returning False. Each caller treats a False result exactly like any other failure it already handles - falling back to that same function's own pre-existing fallback value, not a new/distinct return - see get_all_chat_draft_ids()/get_all_poll_ids()/get_all_pending_resets()/has_open_tasks()/delete_poll_mapping()'s own Notes.
+    """
+    for attempt in range(1, settings.REDIS_TASK_MAX_ATTEMPTS + 1):
+        try:
+            _get_redis_client().ping()
+            return True
+        except Exception:
+            if attempt < settings.REDIS_TASK_MAX_ATTEMPTS:
+                logger.warning(f"Redis ping failed (attempt {attempt}/{settings.REDIS_TASK_MAX_ATTEMPTS}). Retrying...")
+                time.sleep(settings.REDIS_TASK_RETRY_DELAY)
+            else:
+                logger.exception(f"Redis ping failed after {settings.REDIS_TASK_MAX_ATTEMPTS} attempts.")
                 return False
 
 def _get_chat_lock(chat_id: int) -> threading.Lock:
@@ -246,22 +374,9 @@ def get_task_mapping(task_id: str) -> dict | None:
             {"chat_id": int, "user_id": int} if found and valid; otherwise None.
 
     Notes:
-        - Distinguishes (via logging only) a read failure (retried), a missing key (expired/unknown, not retried), and corrupt JSON (not retried) - all return None.
+        - Distinguishes (via logging only) a missing key (expired/unknown) and corrupt JSON - both return None. A connection-level read failure is retried inside _redis_read() itself - see its own Notes.
     """
-    value = None
-
-    for attempt in range(1, settings.REDIS_TASK_MAX_ATTEMPTS + 1):
-        try:
-            client = _get_redis_client()
-            value = client.get(f"task:{task_id}")
-            break
-        except Exception:
-            if attempt < settings.REDIS_TASK_MAX_ATTEMPTS:
-                logger.warning(f"Failed to read task mapping for task_id={task_id} (attempt {attempt}/{settings.REDIS_TASK_MAX_ATTEMPTS}). Retrying...")
-                time.sleep(settings.REDIS_TASK_RETRY_DELAY)
-            else:
-                logger.exception(f"Failed to read task mapping for task_id={task_id} from Redis after {settings.REDIS_TASK_MAX_ATTEMPTS} attempts.")
-                return None
+    value = _redis_read(f"task:{task_id}")
 
     if value is None:
         logger.warning(f"No task mapping found for task_id={task_id} (expired or unknown).")
@@ -298,10 +413,8 @@ def delete_task_mapping(task_id: str, chat_id: int | None = None) -> bool:
     deleted = _redis_delete(f"task:{task_id}")
 
     if chat_id is not None:
-        try:
-            _get_redis_client().srem(f"session_tasks:{chat_id}", task_id)
-        except Exception:
-            logger.exception(f"Failed to remove task_id={task_id} from session_tasks:{chat_id}.")
+        if not _redis_srem(f"session_tasks:{chat_id}", task_id):
+            logger.error(f"Failed to remove task_id={task_id} from session_tasks:{chat_id}.")
 
     return deleted
 
@@ -327,29 +440,24 @@ def create_task_mapping(
 
     Notes:
         - Stored as task:<task_id> -> json {"chat_id", "user_id"} - the only place identity is persisted.
-        - Writes with nx=True; a collision regenerates a new task_id rather than overwriting.
+        - Single attempt only - no retry/regeneration loop of its own. _redis_write() already retries a connection-level failure internally (REDIS_TASK_MAX_ATTEMPTS, REDIS_TASK_RETRY_DELAY) before ever returning False, so retrying again here on a False would only be retrying because _redis_write() failed, not because of a genuine nx=True collision - the two can't be told apart from its bool return alone. A uuid4() collision is a ~1-in-2^122 event, not worth a dedicated retry path, so a False here is treated as final.
         - Also indexes task_id under session_tasks:<chat_id> (a Redis SET) so reset_session() can find every task belonging to a chat without a full keyspace SCAN.
           Best-effort - a failure here is logged but does not fail task creation itself.
         - Holds chat_id's lock (see _get_chat_lock()) across the write+index step, serialised against a concurrent reset_session() for the same chat_id - see CCR-013 (NON_COMPLIANCE_REPORT.md).
     """
     value = json.dumps({"chat_id": chat_id, "user_id": user_id})
+    task_id = uuid.uuid4().hex
 
     with _get_chat_lock(chat_id):
-        for attempt in range(1, settings.REDIS_TASK_MAX_ATTEMPTS + 1):
-            task_id = uuid.uuid4().hex
-            if _redis_write(f"task:{task_id}", value, ttl_seconds, nx=True):
-                try:
-                    _get_redis_client().sadd(f"session_tasks:{chat_id}", task_id)
-                except Exception:
-                    logger.exception(f"Failed to index task_id={task_id} under session_tasks:{chat_id}. A future session reset may miss this task.")
+        if not _redis_write(f"task:{task_id}", value, ttl_seconds, nx=True):
+            logger.error(f"Failed to create task mapping for chat_id={chat_id} (task_id={task_id}).")
+            return None
+        else:
+            if not _redis_sadd(f"session_tasks:{chat_id}", task_id):
+                logger.error(f"Failed to index task_id={task_id} under session_tasks:{chat_id}. A future session reset may miss this task.")
 
-                logger.info(f"Created task mapping task_id={task_id} for chat_id={chat_id}.")
-                return task_id
-            elif attempt < settings.REDIS_TASK_MAX_ATTEMPTS:
-                time.sleep(settings.REDIS_TASK_RETRY_DELAY)
-            else:
-                logger.error(f"Failed to create task mapping after {settings.REDIS_TASK_MAX_ATTEMPTS} attempts.")
-                return None
+            logger.info(f"Created task mapping task_id={task_id} for chat_id={chat_id}.")
+            return task_id
 
 def get_chat_draft(chat_id: int) -> dict | None:
     """
@@ -363,22 +471,9 @@ def get_chat_draft(chat_id: int) -> dict | None:
             {"media_type", "media_url", "text", "has_caption"} if found and valid; otherwise None.
 
     Notes:
-        - Same read/retry/corruption handling as get_task_mapping().
+        - Same read/corruption handling as get_task_mapping() - a connection-level read failure is retried inside _redis_read() itself.
     """
-    value = None
-
-    for attempt in range(1, settings.REDIS_TASK_MAX_ATTEMPTS + 1):
-        try:
-            client = _get_redis_client()
-            value = client.get(f"draft:{chat_id}")
-            break
-        except Exception:
-            if attempt < settings.REDIS_TASK_MAX_ATTEMPTS:
-                logger.warning(f"Failed to read draft for chat_id={chat_id} (attempt {attempt}/{settings.REDIS_TASK_MAX_ATTEMPTS}). Retrying...")
-                time.sleep(settings.REDIS_TASK_RETRY_DELAY)
-            else:
-                logger.exception(f"Failed to read draft for chat_id={chat_id} from Redis after {settings.REDIS_TASK_MAX_ATTEMPTS} attempts.")
-                return None
+    value = _redis_read(f"draft:{chat_id}")
 
     if value is None:
         return None
@@ -411,25 +506,30 @@ def get_all_chat_draft_ids() -> list[int]:
 
     Returns:
         list[int]:
-            chat_ids with a draft:<chat_id> key present; empty list on failure.
+            chat_ids with a draft:<chat_id> key present; empty list on failure (including a failed ping - see Notes).
 
     Notes:
         - Used on startup to sweep up drafts whose in-memory keep-alive timer did not survive an application restart (see utils_telegram/utilities/image_draft_handler.py).
+        - Confirms connectivity via _redis_ping() first (SCAN has no dedicated retrying primitive of its own). A failed ping is treated exactly like any other failure here - same empty-list fallback, just skipping the SCAN itself rather than attempting and failing it.
         - Uses SCAN (not KEYS) so it doesn't block Redis on a large keyspace.
     """
-    try:
-        client = _get_redis_client()
-        chat_ids = []
-        for key in client.scan_iter(match="draft:*"):
-            try:
-                chat_ids.append(int(key.split(":", 1)[1]))
-            except (IndexError, ValueError):
-                logger.error(f"Skipped malformed draft key while sweeping Redis: {key}")
-
-        return chat_ids
-    except Exception:
-        logger.exception("Failed to sweep Redis for pending drafts.")
+    if not _redis_ping():
+        logger.error("Failed to sweep Redis for pending drafts - ping failed.")
         return []
+    else:
+        try:
+            client = _get_redis_client()
+            chat_ids = []
+            for key in client.scan_iter(match="draft:*"):
+                try:
+                    chat_ids.append(int(key.split(":", 1)[1]))
+                except (IndexError, ValueError):
+                    logger.error(f"Skipped malformed draft key while sweeping Redis: {key}")
+
+            return chat_ids
+        except Exception:
+            logger.exception("Failed to sweep Redis for pending drafts.")
+            return []
 
 def create_chat_draft(chat_id: int, media_type: str, media_url: str, text: str, has_caption: bool) -> bool:
     """
@@ -509,10 +609,8 @@ def create_poll_mapping(poll_id: str, chat_id: int, task_id: str, message_id: in
     with _get_chat_lock(chat_id):
         created = _redis_write(f"poll:{poll_id}", value, ttl_seconds=settings.POLL_MAPPING_TTL_SECONDS, nx=True)
         if created:
-            try:
-                _get_redis_client().sadd(f"session_polls:{chat_id}", poll_id)
-            except Exception:
-                logger.exception(f"Failed to index poll_id={poll_id} under session_polls:{chat_id}. A future session reset may miss this poll.")
+            if not _redis_sadd(f"session_polls:{chat_id}", poll_id):
+                logger.error(f"Failed to index poll_id={poll_id} under session_polls:{chat_id}. A future session reset may miss this poll.")
 
             logger.info(f"Created poll mapping poll_id={poll_id} for chat_id={chat_id} (task_id={task_id}).")
         else:
@@ -532,22 +630,9 @@ def get_poll_mapping(poll_id: str) -> dict | None:
             {"chat_id", "task_id", "message_id", "user_id", "option_ids"} if found and valid; otherwise None.
 
     Notes:
-        - Same read/retry/corruption handling as get_task_mapping().
+        - Same read/corruption handling as get_task_mapping() - a connection-level read failure is retried inside _redis_read() itself.
     """
-    value = None
-
-    for attempt in range(1, settings.REDIS_TASK_MAX_ATTEMPTS + 1):
-        try:
-            client = _get_redis_client()
-            value = client.get(f"poll:{poll_id}")
-            break
-        except Exception:
-            if attempt < settings.REDIS_TASK_MAX_ATTEMPTS:
-                logger.warning(f"Failed to read poll mapping for poll_id={poll_id} (attempt {attempt}/{settings.REDIS_TASK_MAX_ATTEMPTS}). Retrying...")
-                time.sleep(settings.REDIS_TASK_RETRY_DELAY)
-            else:
-                logger.exception(f"Failed to read poll mapping for poll_id={poll_id} from Redis after {settings.REDIS_TASK_MAX_ATTEMPTS} attempts.")
-                return None
+    value = _redis_read(f"poll:{poll_id}")
 
     if value is None:
         return None
@@ -605,6 +690,7 @@ def delete_poll_mapping(poll_id: str, chat_id: int | None = None) -> bool:
 
     Notes:
         - Keeps session_polls:<chat_id> (see create_poll_mapping()) in sync - best-effort, logged on failure, does not affect the return value.
+        - The primary poll:<poll_id> delete (_redis_delete()) already retries internally and always runs regardless; only the session_polls index step is guarded by _redis_ping() first, since SREM itself has no dedicated retrying primitive. A failed ping is treated exactly like any other failure here - logged, the index update skipped, falling straight through to the same return value.
     """
     if chat_id is None:
         mapping = get_poll_mapping(poll_id)
@@ -613,10 +699,13 @@ def delete_poll_mapping(poll_id: str, chat_id: int | None = None) -> bool:
     deleted = _redis_delete(f"poll:{poll_id}")
 
     if chat_id is not None:
-        try:
-            _get_redis_client().srem(f"session_polls:{chat_id}", poll_id)
-        except Exception:
-            logger.exception(f"Failed to remove poll_id={poll_id} from session_polls:{chat_id}.")
+        if not _redis_ping():
+            logger.error(f"Failed to remove poll_id={poll_id} from session_polls:{chat_id} - ping failed.")
+        else:
+            try:
+                _get_redis_client().srem(f"session_polls:{chat_id}", poll_id)
+            except Exception:
+                logger.exception(f"Failed to remove poll_id={poll_id} from session_polls:{chat_id}.")
 
     return deleted
 
@@ -629,17 +718,22 @@ def has_open_tasks(chat_id: int) -> bool:
 
     Returns:
         bool:
-            True if at least one task_id is indexed, or on a Redis failure (see Notes); otherwise False.
+            True if at least one task_id is indexed, or on a Redis failure including a failed ping (see Notes); otherwise False.
 
     Notes:
         - Used to decide whether a session_reset can apply immediately or must be deferred until every open task naturally completes - see utils_session/session_reset_handler.py.
-        - On a Redis failure, defaults to True (treated as still open) rather than False, so an uncertain read can only ever delay a reset, never force one through prematurely.
+        - Confirms connectivity via _redis_ping() first (SCARD has no dedicated retrying primitive of its own). A failed ping is treated exactly like any other failure here - same True/"still open" fallback, just skipping the SCARD itself rather than attempting and failing it.
+        - On a Redis failure (ping or SCARD), defaults to True (treated as still open) rather than False, so an uncertain read can only ever delay a reset, never force one through prematurely.
     """
-    try:
-        return _get_redis_client().scard(f"session_tasks:{chat_id}") > 0
-    except Exception:
-        logger.exception(f"Failed to check session_tasks for chat_id={chat_id}. Treating as still open (deferring).")
+    if not _redis_ping():
+        logger.error(f"Failed to check session_tasks for chat_id={chat_id} - ping failed. Treating as still open (deferring).")
         return True
+    else:
+        try:
+            return _get_redis_client().scard(f"session_tasks:{chat_id}") > 0
+        except Exception:
+            logger.exception(f"Failed to check session_tasks for chat_id={chat_id}. Treating as still open (deferring).")
+            return True
 
 def get_session_poll_ids(chat_id: int) -> list[str]:
     """
@@ -655,12 +749,9 @@ def get_session_poll_ids(chat_id: int) -> list[str]:
     Notes:
         - An open poll always has an open task_id, so it's only ever encountered on the deferred path (never the immediate-apply path) - see utils_session/session_reset_handler.py.
           The deferred path itself never force-closes anything while genuinely waiting; only its PENDING_RESET_MAX_WAIT_SECONDS force-through backstop (§8, TODO.md) calls this defensively before applying, in case a misconfigured ceiling ever forces through while a poll is still technically alive - see poll_response_handler.py::stop_poll_for_reset().
+        - Retried internally - see _redis_smembers().
     """
-    try:
-        return list(_get_redis_client().smembers(f"session_polls:{chat_id}"))
-    except Exception:
-        logger.exception(f"Failed to read session_polls for chat_id={chat_id}.")
-        return []
+    return list(_redis_smembers(f"session_polls:{chat_id}"))
 
 def _get_or_create_session(chat_id: int) -> str | None:
     """
@@ -755,19 +846,13 @@ def reset_session(chat_id: int) -> str | None:
         - Reads task_ids from session_tasks:<chat_id> (see create_task_mapping()) rather than a full keyspace SCAN.
         - Also deletes the chat's pending draft (see delete_chat_draft()) and, defensively, session_polls:<chat_id> - see CCR-012 (NON_COMPLIANCE_REPORT.md).
           Any open poll is expected to already be closed out (and its own poll:<poll_id>/session_polls entry removed) by the caller before this runs - see utils_queue/message_handler.py::_handle_session_reset() - this is just a final sweep of the index itself in case one was missed; it does not touch Telegram or any in-memory poll/draft timer, since this module has no visibility into either.
-        - Best-effort - a failure reading session_tasks is logged; whatever can still be deleted, is.
+        - The session_tasks read is retried internally - see _redis_smembers(). Its own docstring covers the remaining ambiguity (an empty result could mean "genuinely no open tasks" or "exhausted retries") - not distinguished further here.
         - Holds chat_id's lock (see _get_chat_lock()) across the read-then-delete sequence, serialised against a concurrent create_task_mapping() for the same chat_id - see CCR-013 (NON_COMPLIANCE_REPORT.md).
           Without this, a task written and indexed in the narrow window between this function's read and its delete of session_tasks:<chat_id> could escape deletion entirely while still losing its index entry.
     """
     with _get_chat_lock(chat_id):
         cleared_session_id = _redis_read(f"session:{chat_id}")
-
-        try:
-            client = _get_redis_client()
-            task_ids = client.smembers(f"session_tasks:{chat_id}")
-        except Exception:
-            logger.exception(f"Failed to read session_tasks for chat_id={chat_id}. Task mappings may be left behind.")
-            task_ids = set()
+        task_ids = _redis_smembers(f"session_tasks:{chat_id}")
 
         for task_id in task_ids:
             _redis_delete(f"task:{task_id}")
@@ -789,25 +874,30 @@ def get_all_poll_ids() -> list[str]:
 
     Returns:
         list[str]:
-            poll_ids with a poll:<poll_id> key present; empty list on failure.
+            poll_ids with a poll:<poll_id> key present; empty list on failure (including a failed ping - see Notes).
 
     Notes:
         - Used on startup to sweep up polls whose in-memory timer did not survive an application restart (see utils_telegram/utilities/poll_response_handler.py).
+        - Confirms connectivity via _redis_ping() first (SCAN has no dedicated retrying primitive of its own). A failed ping is treated exactly like any other failure here - same empty-list fallback, just skipping the SCAN itself rather than attempting and failing it.
         - Uses SCAN (not KEYS) so it doesn't block Redis on a large keyspace.
     """
-    try:
-        client = _get_redis_client()
-        poll_ids = []
-        for key in client.scan_iter(match="poll:*"):
-            try:
-                poll_ids.append(key.split(":", 1)[1])
-            except IndexError:
-                logger.error(f"Skipped malformed poll key while sweeping Redis: {key}")
-
-        return poll_ids
-    except Exception:
-        logger.exception("Failed to sweep Redis for open polls.")
+    if not _redis_ping():
+        logger.error("Failed to sweep Redis for open polls - ping failed.")
         return []
+    else:
+        try:
+            client = _get_redis_client()
+            poll_ids = []
+            for key in client.scan_iter(match="poll:*"):
+                try:
+                    poll_ids.append(key.split(":", 1)[1])
+                except IndexError:
+                    logger.error(f"Skipped malformed poll key while sweeping Redis: {key}")
+
+            return poll_ids
+        except Exception:
+            logger.exception("Failed to sweep Redis for open polls.")
+            return []
 
 def set_pending_reset(chat_id: int, task_id: str) -> bool:
     """
@@ -895,40 +985,79 @@ def get_all_pending_resets() -> list[tuple[int, str, float]]:
 
     Returns:
         list[tuple[int, str, float]]:
-            (chat_id, task_id, created_at) for every pending_reset:<chat_id> key present; empty list on failure.
+            (chat_id, task_id, created_at) for every pending_reset:<chat_id> key present; empty list on failure (including a failed ping - see Notes).
 
     Notes:
         - Used on startup to resync deferred resets that may have become resolvable while the gateway was down, and by the periodic PENDING_RESET_MAX_WAIT_SECONDS backstop sweep - see utils_session/session_reset_handler.py::resync_pending_resets()/_enforce_pending_reset_ceiling().
         - `created_at` is whatever was written by set_pending_reset() - used by the callers above to decide whether a pending reset has been waiting too long, not interpreted here.
+        - Confirms connectivity via _redis_ping() first (SCAN, and the raw per-key GET inside the loop below, have no dedicated retrying primitive of their own). A failed ping is treated exactly like any other failure here - same empty-list fallback, just skipping the sweep itself rather than attempting and failing it.
         - Uses SCAN (not KEYS) so it doesn't block Redis on a large keyspace.
     """
-    try:
-        client = _get_redis_client()
-        pending_resets = []
-        for key in client.scan_iter(match="pending_reset:*"):
-            try:
-                chat_id = int(key.split(":", 1)[1])
-            except (IndexError, ValueError):
-                logger.error(f"Skipped malformed pending_reset key while sweeping Redis: {key}")
-                continue
-
-            value = client.get(key)
-            if not value:
-                continue
-            else:
+    if not _redis_ping():
+        logger.error("Failed to sweep Redis for pending resets - ping failed.")
+        return []
+    else:
+        try:
+            client = _get_redis_client()
+            pending_resets = []
+            for key in client.scan_iter(match="pending_reset:*"):
                 try:
-                    info = json.loads(value)
-                    task_id = info["task_id"]
-                    created_at = info["created_at"]
-                except (json.JSONDecodeError, TypeError, KeyError):
-                    logger.error(f"Skipped pending_reset key with invalid JSON while sweeping Redis: {key}")
+                    chat_id = int(key.split(":", 1)[1])
+                except (IndexError, ValueError):
+                    logger.error(f"Skipped malformed pending_reset key while sweeping Redis: {key}")
                     continue
 
-            pending_resets.append((chat_id, task_id, created_at))
+                value = client.get(key)
+                if not value:
+                    continue
+                else:
+                    try:
+                        info = json.loads(value)
+                        task_id = info["task_id"]
+                        created_at = info["created_at"]
+                    except (json.JSONDecodeError, TypeError, KeyError):
+                        logger.error(f"Skipped pending_reset key with invalid JSON while sweeping Redis: {key}")
+                        continue
 
-        return pending_resets
-    except Exception:
-        logger.exception("Failed to sweep Redis for pending resets.")
-        return []
+                pending_resets.append((chat_id, task_id, created_at))
+
+            return pending_resets
+        except Exception:
+            logger.exception("Failed to sweep Redis for pending resets.")
+            return []
+
+def get_tier2_alert_armed() -> bool:
+    """
+    Retrieves whether Tier 2's gateway_alert is currently armed (no incident outstanding), persisted across restarts.
+
+    Args:
+        None
+
+    Returns:
+        bool:
+            True (armed - no incident outstanding) if the key is unset/missing or the read fails - matches the module-level default used before any incident has ever occurred.
+            False if a prior gateway_alert has not yet been closed out by a gateway_recover.
+
+    Notes:
+        - Stored as tier2_alert_armed -> "1" | "0", with no TTL - must outlive an unbounded outage; only set_tier2_alert_armed() resolves it.
+        - See utils_queue/error_handling.py::load_tier2_alert_state()/record_send_success()/record_send_failure() - added to close CCR-019 (CODE_NON_COMPLIANCE.md).
+    """
+    return _redis_read("tier2_alert_armed") != "0"
+
+def set_tier2_alert_armed(armed: bool) -> bool:
+    """
+    Persists whether Tier 2's gateway_alert is currently armed, so an outstanding incident survives a restart.
+
+    Args:
+        armed (bool)
+
+    Returns:
+        bool:
+            True if written successfully; otherwise False.
+
+    Notes:
+        - See get_tier2_alert_armed().
+    """
+    return _redis_write("tier2_alert_armed", "1" if armed else "0")
 
 # =============================================================================

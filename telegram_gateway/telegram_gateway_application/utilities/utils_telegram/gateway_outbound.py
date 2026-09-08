@@ -11,7 +11,7 @@
 #   - send_message/send_poll/stop_poll/send_document/send_photo/send_video/send_media_group all retry up to TELEGRAM_SEND_MAX_ATTEMPTS times (TELEGRAM_SEND_RETRY_DELAY apart) on connection failures/timeouts only; other failures are not retried.
 #   - On a rejected (non-retried) request, send_message/send_poll/send_photo/send_video/send_document/send_media_group return a {"error": True, "status_code", "reason"} dict instead of False/None (except a 401/404, which is Tier 2 - see below) - callers use this to report a Tier 1 delivery_failed event (see utils_queue/error_handling.py) so the backend can retry the same task differently.
 #     stop_poll/send_typing_action don't - see their own docstrings.
-#   - A connection-exhausted failure, or a 401/404 (see _config_failure_reason()), is reported to utils_queue/error_handling.py as a Tier 2 signal (record_send_failure()) regardless of which function it came from - a successful send re-arms it (record_send_success()).
+#   - A connection-exhausted failure, or a 401/404 (see _config_failure_reason()), is reported to utils_queue/error_handling.py as a Tier 2 signal (record_send_failure()) regardless of which function it came from - a successful send re-arms it (record_send_success(response.status_code)), which itself may push a gateway_recover event - see error_handling.py.
 #
 # =============================================================================
 # I M P O R T   H E A D E R
@@ -139,7 +139,7 @@ def send_message(chat_id: int | str, text: str, parse_mode: str | None = None, r
             )
             response.raise_for_status()
             logger.info(f"Sent message to chat_id={chat_id}.")
-            record_send_success()
+            record_send_success(response.status_code)
             return True
         except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
             if attempt < settings.TELEGRAM_SEND_MAX_ATTEMPTS:
@@ -189,7 +189,7 @@ def send_typing_action(chat_id: int | str) -> bool:
         )
         response.raise_for_status()
         logger.debug(f"Sent typing action to chat_id={chat_id}.")
-        record_send_success()
+        record_send_success(response.status_code)
         return True
     except requests.exceptions.RequestException as exc:
         status_code, _ = _classify_rejection(exc)
@@ -254,7 +254,7 @@ def send_poll(chat_id: int | str, question: str, options: list, allows_multiple_
                 return None
             else:
                 logger.info(f"Sent poll to chat_id={chat_id} (poll_id={poll_id}).")
-                record_send_success()
+                record_send_success(response.status_code)
                 return {"poll_id": poll_id, "message_id": message_id}
         except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
             if attempt < settings.TELEGRAM_SEND_MAX_ATTEMPTS:
@@ -311,7 +311,7 @@ def stop_poll(chat_id: int | str, message_id: int) -> bool:
             )
             response.raise_for_status()
             logger.info(f"Stopped poll for chat_id={chat_id} (message_id={message_id}).")
-            record_send_success()
+            record_send_success(response.status_code)
             return True
         except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
             if attempt < settings.TELEGRAM_SEND_MAX_ATTEMPTS:
@@ -371,7 +371,7 @@ def send_document(chat_id: int | str, url: str, caption: str | None = None) -> b
             )
             response.raise_for_status()
             logger.info(f"Sent document to chat_id={chat_id}.")
-            record_send_success()
+            record_send_success(response.status_code)
             return True
         except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
             if attempt < settings.TELEGRAM_SEND_MAX_ATTEMPTS:
@@ -429,7 +429,7 @@ def send_photo(chat_id: int | str, url: str, caption: str | None = None) -> bool
             )
             response.raise_for_status()
             logger.info(f"Sent photo to chat_id={chat_id}.")
-            record_send_success()
+            record_send_success(response.status_code)
             return True
         except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
             if attempt < settings.TELEGRAM_SEND_MAX_ATTEMPTS:
@@ -487,7 +487,7 @@ def send_video(chat_id: int | str, url: str, caption: str | None = None) -> bool
             )
             response.raise_for_status()
             logger.info(f"Sent video to chat_id={chat_id}.")
-            record_send_success()
+            record_send_success(response.status_code)
             return True
         except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
             if attempt < settings.TELEGRAM_SEND_MAX_ATTEMPTS:
@@ -543,7 +543,7 @@ def send_media_group(chat_id: int | str, items: list) -> bool:
             )
             response.raise_for_status()
             logger.info(f"Sent album ({len(items)} items) to chat_id={chat_id}.")
-            record_send_success()
+            record_send_success(response.status_code)
             return True
         except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
             if attempt < settings.TELEGRAM_SEND_MAX_ATTEMPTS:

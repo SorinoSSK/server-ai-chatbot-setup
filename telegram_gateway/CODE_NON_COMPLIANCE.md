@@ -13,7 +13,9 @@
 | **Third Follow-up Review Date** | 2026-09-05 — scoped to a behaviour change in `utils_telegram/utilities/image_draft_handler.py`'s draft keep-alive cycle (continue-button wait-preservation logic); CCR-016–CCR-018 new |
 | **Validation Date** | 2026-09-05 — "validate CCR 16, 17, and 18" (all three re-checked directly against current source) |
 | **Second Validation Date** | 2026-09-05 — "validate CCR 16, 17, and 18" repeated (all three found RESOLVED, not authored this session) |
-| **Review Depth** | 3 iterations (initial read, cross-file/context analysis, evidence validation); follow-up pass likewise 3 iterations (structural/data-flow read, cross-file/concurrency analysis, evidence re-validation); second follow-up pass likewise 3 iterations (checklist-vs-code trace, concurrency/lock-symmetry analysis, evidence re-validation); revalidation pass - direct source re-read of every open finding, no assumptions carried over from prior report text; third follow-up pass - full control-flow and cross-thread interleaving trace of the changed file against `README.md`'s documented spec and the structurally analogous `poll_response_handler.py` |
+| **Fourth Follow-up Review Date** | 2026-09-08 — scoped to `error_handling.py`'s new `record_send_success()`/`_push_tier2_gateway_recover()` addition (the `gateway_recover` Tier 2 feature); CCR-019–CCR-021 new |
+| **Fifth Follow-up Review Date** | 2026-09-08 — scoped to major changes in `utils_redis/database.py` and validation of CCR-019; CCR-019 confirmed RESOLVED, CCR-022 new |
+| **Review Depth** | 3 iterations (initial read, cross-file/context analysis, evidence validation); follow-up pass likewise 3 iterations (structural/data-flow read, cross-file/concurrency analysis, evidence re-validation); second follow-up pass likewise 3 iterations (checklist-vs-code trace, concurrency/lock-symmetry analysis, evidence re-validation); revalidation pass - direct source re-read of every open finding, no assumptions carried over from prior report text; third follow-up pass - full control-flow and cross-thread interleaving trace of the changed file against `README.md`'s documented spec and the structurally analogous `poll_response_handler.py`; fourth follow-up pass - traced the new call path (`record_send_success()` → `_push_tier2_gateway_recover()` → `queue_push_task()`) against `TODO.md`'s own stated design/decisions, `config.py`'s token-loading behaviour, and `queue.py`'s publish-connection threading model; fifth follow-up pass - full re-read of `database.py` against its prior state, cross-referenced against `CODE_TODO.md`'s newly-added fix entries, `initialise.py`'s call ordering, and every caller of every changed/added function for signature/behavioural regressions |
 
 ---
 
@@ -33,6 +35,10 @@
 **Additional files re-reviewed in the 2026-09-05 second follow-up pass (`TODO.md` `session_reset` implementation):** `utils_session/session_reset_handler.py` (new), `utils_redis/database.py`, `utils_queue/message_handler.py`, `utils_queue/error_handling.py`, `utilities/initialise.py`, `config.py`, `utils_telegram/utilities/poll_response_handler.py`, `utils_telegram/utilities/image_draft_handler.py`, `utils_telegram/gateway_inbound.py`, `utils_queue/queue.py`, `README.md`, `config_sample.ini`, `compose.dev.yml` — see CCR-012/CCR-013 (resolved), CCR-014 (re-confirmed open), CCR-015 (new), and the accompanying informational note.
 
 **Additional files re-reviewed in the 2026-09-05 third follow-up pass (`image_draft_handler.py` behaviour change):** `utils_telegram/utilities/image_draft_handler.py` (changed file), cross-referenced against `README.md` §"Pending drafts", `config.py` (`DRAFT_*` settings, `get_env_int()`), `utils_telegram/utilities/poll_response_handler.py` (structurally analogous control-dict/background-loop pattern), `utils_telegram/utilities/button_prompt_handler.py`, `utils_telegram/gateway_inbound.py`, `utils_redis/database.py::reset_session()`/`delete_chat_draft()` — see CCR-016–CCR-018 (new).
+
+**Additional files re-reviewed in the 2026-09-08 fourth follow-up pass (`error_handling.py`'s new `gateway_recover` Tier 2 feature):** `utils_queue/error_handling.py` (changed file — `record_send_success()`, `_push_tier2_gateway_recover()`, and their interaction with the pre-existing `record_send_failure()`/`_push_tier2_gateway_alert()`), `utils_telegram/gateway_outbound.py` (all 8 updated `record_send_success()` call sites), `utils_queue/queue.py` (`queue_push_task()`, `_get_rabbitmq_publish_channel()`, `_lock_publish`), `config.py` (`TELEGRAM_BOT_TOKEN` loading, `Q_PUSH_MAX_ATTEMPTS`/`Q_PUSH_RETRY_DELAY`), `utils_queue/message_handler.py`, `CODE_TODO.md` ("NEW — `gateway_recover`" section, the feature's own stated design decisions and open questions), `CODE_SEQUENCE_DIAGRAM.md` §10.1–10.4 — see CCR-019–CCR-021 (new).
+
+**Additional files re-reviewed in the 2026-09-08 fifth follow-up pass (major `database.py` changes; CCR-019 validation):** `utils_redis/database.py` (changed file, read in full — `_get_chat_lock()`, `_redis_write()`/`_redis_read()`/`_redis_delete()`/`_redis_sadd()`/`_redis_srem()`/`_redis_smembers()`/`_redis_ping()`, `create_task_mapping()`, `create_poll_mapping()`, `reset_session()`, `get_tier2_alert_armed()`/`set_tier2_alert_armed()` (new), `initialise_redis_connection()`/`_should_redis_retry_infinite()` (new)), `utils_queue/error_handling.py` (`load_tier2_alert_state()`, updated `record_send_success()`/`record_send_failure()`), `utilities/initialise.py` (call ordering), `config.py` (new `REDIS_FORCE_INFINITE_RETRY` setting), `utils_queue/queue.py` (comparison against `initialise_rabbitmq_connection()`), `utils_session/session_reset_handler.py` (`get_all_pending_resets()` 3-tuple unpacking, unchanged), `README.md` (Redis env var table), `CODE_TODO.md` ("FIX — CCR-019", "FIX — `_redis_write()`/`_redis_read()` had no retry", "FIX — remaining raw `sadd`/`srem`/`scard`/`smembers`/`scan_iter` calls" entries) — see CCR-019 (validated RESOLVED), CCR-020 (extended), CCR-022 (new).
 
 **Standards Evaluated:** PEP 8, PEP 257, OWASP Top 10, CWE mappings, Bandit-style secure coding guidance, general secure-scripting/reliability best practice.
 
@@ -66,7 +72,7 @@ As of this revalidation, only **CCR-005** (Low, accepted risk) and **CCR-011** (
 
 **Third Follow-up Review (2026-09-05, on request, "changes have been made to image_draft_handler.py including behaviour change, validate non-compliance" — scoped to a behaviour change in the draft keep-alive cycle's continue-button handling):** Re-read `utils_telegram/utilities/image_draft_handler.py` directly against current source, exhaustively tracing every control-flow path — including cross-thread interleaving between the per-chat background loop and the RabbitMQ/Telegram-polling thread invoking `continue_draft_timer()`/`stop_draft_timer()` — against `README.md`'s independently-maintained spec for this exact feature (§"Pending drafts") and `config.py`'s actual default values. The changed behaviour itself (a continue-button press now preserves the current cycle's remaining wait rather than cutting it short) was confirmed correctly and consistently implemented, matching `README.md` exactly at current defaults, with no reachable data-corruption, crash, or resource-leak path identified across every interleaving traced. At the user's explicit instruction, three findings arising from this review — one previously assessed as not independently reachable/no-action-required — are recorded below as open non-compliance findings: **CCR-016, CCR-017, CCR-018**.
 
-**Total Findings (cumulative):** 20 (1 High, 6 Medium, 8 Low, 5 Informational) - 18 numbered findings (CCR-001–CCR-018) plus 2 unnumbered informational notes (session-identifier retention, 2026-09-04; `RESET_NOTICE_MESSAGE` shipping blank, 2026-09-05).
+**Total Findings (cumulative):** 24 (2 High, 9 Medium, 8 Low, 5 Informational) - 22 numbered findings (CCR-001–CCR-022) plus 2 unnumbered informational notes (session-identifier retention, 2026-09-04; `RESET_NOTICE_MESSAGE` shipping blank, 2026-09-05).
 
 **Validation (2026-09-05, same day, on request "validate CCR 16, 17, and 18"):** All three findings were re-read directly against current source (not cached report text) rather than assumed still accurate from the prior pass. All three are **re-confirmed Open, substance unchanged**. One incidental, non-substantive change was found in the file in the interim: `_stop()` was renamed to `_stop_draft_loop()` (identical body/behaviour) — CCR-018's Location/Evidence has been corrected to reflect this; it does not affect CCR-016 or CCR-017. CCR-018's cross-file comparison against `poll_response_handler.py` was also independently re-checked and remains accurate (that file is unchanged).
 
@@ -77,7 +83,7 @@ As of this revalidation, only **CCR-005** (Low, accepted risk) and **CCR-011** (
 
 **Provenance:** none of these three fixes were made by me / not part of any edit in this session — validating current disk state only, consistent with the provenance caveat already applied to CCR-003/004/008/012–015 above.
 
-**Compliance Verdict: Mostly Compliant** (see updated rationale at the end of this document)
+**Compliance Verdict: Partially Compliant** (see updated rationale at the end of this document)
 
 ---
 
@@ -821,9 +827,230 @@ The module's own header Notes (line 15) now explicitly documents this: "`_lock` 
 
 ---
 
+### ~~CCR-019~~ — RESOLVED (validated 2026-09-08)
+
+**Severity:** Medium
+
+**Review Date:** 2026-09-08 (fourth follow-up pass — `error_handling.py`'s new `record_send_success()`/`_push_tier2_gateway_recover()` addition)
+
+**Location:**
+- `utilities/utils_queue/error_handling.py` — module-level globals `_alert_armed`/`_consecutive_failures` (lines 33–34), read/written by `record_send_success()` (lines 86–111) and `record_send_failure()` (lines 113–146)
+- `utilities/utils_telegram/gateway_outbound.py::_config_failure_reason()` (lines 75–95) — classifies a 401 as `"unauthorized"`, a 404 as `"not_found"`
+- `config.py`, line 66 — `self.TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or DEFAULT_TELEGRAM_BOT_TOKEN`, read exactly once at process start
+
+**Violated Standard:**
+- No single CWE cleanly captures "a paired monitoring signal whose own documented remediation path silently defeats the closing half of the pair" — the closest applicable references are OWASP A09:2021 (Security Logging and Monitoring Failures) and general observability/alerting best practice (an alert must reliably resolve, or the signal becomes untrustworthy). Stated as the closest applicable classification per this review's rule-attribution requirements, not as an invented CWE identifier.
+
+**Description:**
+`_alert_armed`/`_consecutive_failures` are plain in-memory globals, explicitly documented (this file's own module Notes, line 16) as resetting on every process restart — a design choice already accepted for the alert side ("acceptable, since a restart is itself a fresh start at reassessing whether Telegram is reachable"). The new `gateway_recover` feature (`record_send_success()`/`_push_tier2_gateway_recover()`) inherits this same reset behaviour, but its consequence is materially different for `record_send_failure()`'s two config-failure reasons: a 401 (`"unauthorized"`) or 404 (`"not_found"`) fires a `gateway_alert` immediately (bypassing the consecutive-failure threshold entirely), specifically because — per this file's own docstring and `TODO.md`'s design notes — these are "permanent, config-level failures... no number of retries fixes it," i.e. an invalid/revoked bot token. `TELEGRAM_BOT_TOKEN` is read exactly once, from the environment, in `config.py::Settings.__init__()`, with no runtime reload path anywhere in the codebase (confirmed via `grep` — `gateway_outbound.py`/`gateway_inbound.py` only ever read the already-resolved `settings.TELEGRAM_BOT_TOKEN`). Consequently, the realistic, and in practice near-universal, fix for a 401/404 alert is: update the `TELEGRAM_BOT_TOKEN` environment variable, then restart the container/process. That restart re-initialises `_alert_armed` back to `True` and `_consecutive_failures` back to `0` from a clean slate — so the very first successful send after the fix sees `was_alerted = not _alert_armed = False` and never calls `_push_tier2_gateway_recover()`. The orchestrator that received the original `gateway_alert` therefore never receives its closing `gateway_recover` for this specific, and most deterministic, class of Tier 2 incident — the one this feature's own worked example (a 401/404 config fix) is arguably the most likely trigger for in practice.
+
+**Evidence:**
+```python
+# error_handling.py module Notes
+# - Tier 2's counter/armed-state is in-memory only and resets on restart - acceptable, since a
+#   restart is itself a fresh start at reassessing whether Telegram is reachable.
+
+# record_send_failure() - 401/404 fires immediately, bypassing the threshold
+if reason in ("unauthorized", "not_found"):
+    with _lock:
+        should_fire = _alert_armed
+        _alert_armed = False
+```
+```python
+# config.py - TELEGRAM_BOT_TOKEN read exactly once, no reload path exists anywhere in the codebase
+self.TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or DEFAULT_TELEGRAM_BOT_TOKEN
+```
+A restart between the `gateway_alert` and the next successful send resets `_alert_armed` to `True` before that send ever runs, so `record_send_success()`'s `was_alerted` check can never observe the prior alert.
+
+**Impact:**
+An orchestrator/on-call process consuming `Q_CHANNEL_OUT` and treating `gateway_alert`/`gateway_recover` as a matched open/close pair (the design this feature exists to support — see `TODO.md`'s own stated goal, "push a `gateway_recover` event the first time a send succeeds again after a `gateway_alert` was fired") will be left with a permanently "open" incident for every 401/404 alert fixed via the normal restart path, even though the gateway itself is healthy again. This degrades trust in the signal over time — an operator who learns that `gateway_recover` "sometimes doesn't come" for the most common fix path may start ignoring or manually clearing alerts, undermining the monitoring feature's purpose. This is a reliability/observability gap, not a security vulnerability, and does not affect message delivery itself.
+
+**Recommended Remediation:**
+Persist `_alert_armed`/`_consecutive_failures` (or at minimum, "an alert is currently outstanding") somewhere that survives a restart — e.g. a Redis key, mirroring how session/task/draft/poll state already survives restarts in this codebase — and have startup initialisation check it, firing a `gateway_recover` on the first successful send after a restart if an alert was left outstanding beforehand. Alternatively, if in-memory-only is retained by deliberate choice (consistent with the existing accepted rationale for the alert side), explicitly document this specific consequence (401/404 fixed via restart will not receive a paired recover) as a disclosed limitation, so the orchestrator's consumer logic can be built to expect it (e.g. treat a fresh `gateway_alert` after a gap, with no intervening `gateway_recover`, as itself implying a resolved-and-reoccurred cycle, or as the gateway process having restarted).
+
+**Confidence:** Medium-High — the code path and its consequence are unambiguous facts, derived directly from the module's own documented restart-reset behaviour and the codebase's own confirmed absence of a token-reload path; the only source of uncertainty is that this has not been exercised end-to-end in live testing (the module's own docstring already discloses the whole feature is "not yet exercised in testing" — see `TODO.md`'s Open Questions).
+
+**Resolution Status:** RESOLVED (validated 2026-09-08, per `CODE_TODO.md`'s "FIX — CCR-019" entry; provenance not established as this session's own edit — validating current disk state against the finding's own described scenario)
+
+**Validation Result:**
+- `utils_redis/database.py` now has `get_tier2_alert_armed()`/`set_tier2_alert_armed(armed)` — a new Redis key `tier2_alert_armed` (`"1"`/`"0"`, no TTL, matching the module's own `pending_reset:<chat_id>` convention of "must outlive an unbounded outage, resolved only by an explicit write").
+- `utils_queue/error_handling.py` now has `load_tier2_alert_state()`, called once from `initialise.py::initialise_application()` immediately after `initialise_redis_connection()` (confirmed by direct read of both files) — loads `_alert_armed` from Redis at startup instead of unconditionally defaulting to `True`.
+- `record_send_success()`/`record_send_failure()` now each call `set_tier2_alert_armed()` on their respective transition (armed→disarmed or disarmed→armed), confirmed directly in the current source (lines 136 and 174 respectively) — matching the "written only on the actual transition" design intent.
+- **Confirmed this closes the specific scenario the finding described**: a 401/404 `gateway_alert` fixed by updating `TELEGRAM_BOT_TOKEN` and restarting the container will now have `_alert_armed` loaded back as `False` (disarmed) from Redis at the new process's startup, so the first successful send after the fix correctly observes `was_alerted = True` and fires the paired `gateway_recover` — the exact gap this finding identified no longer exists for this scenario.
+- **Scope explicitly not widened to CCR-020/CCR-021** — `CODE_TODO.md`'s own decision log states this directly: "Does not address CCR-020 or CCR-021. The persist call (`set_tier2_alert_armed()`) is itself added outside `_lock` alongside the existing `_push_tier2_gateway_*()` calls, same ordering shape CCR-020 already flags — this fix does not widen or narrow that gap, it was explicitly scoped to CCR-019 only." This review concurs: the new `set_tier2_alert_armed()` call sites are additional instances of CCR-020's already-tracked, still-open pattern, not a new/separate defect — CCR-020's own Location/Evidence has been extended below to reference them, rather than raising a duplicate finding.
+- **Residual caveat, not a flaw in this fix's own logic**: if Redis itself is unreachable at the exact moment `load_tier2_alert_state()` runs during startup, `get_tier2_alert_armed()` falls back to `True` (armed) per its own documented default — meaning a genuinely still-outstanding disarmed state persisted before the restart would be silently missed on that specific startup. This was always a theoretical possibility, but is now materially more reachable given the new default Redis startup behaviour introduced alongside this same batch of changes — see **CCR-022** below.
+
+**Classification:** The underlying gap (a restart via the realistic 401/404 fix path silently orphaning the paired `gateway_recover`) is resolved for the scenario this finding described. The already-known, separately-tracked ordering race (CCR-020) is correctly left open rather than being incorrectly claimed as fixed.
+
+**Confidence:** High — verified directly against current source (`database.py`, `error_handling.py`, `initialise.py`) and cross-referenced against `CODE_TODO.md`'s own contemporaneous decision record for this exact fix.
+
+---
+
+### CCR-020 — Unsynchronised state-transition-to-publish window can reorder `gateway_alert`/`gateway_recover` relative to each other
+
+**Severity:** Medium
+
+**Review Date:** 2026-09-08 (fourth follow-up pass — `error_handling.py`'s new `record_send_success()`/`_push_tier2_gateway_recover()` addition)
+
+**Location:**
+- `utilities/utils_queue/error_handling.py::record_send_success()` (lines 128–138) and `record_send_failure()` (lines 160–175) — both release `_lock` before calling their respective `_push_tier2_gateway_*()` function
+- **Update, 2026-09-08:** the same two functions also now call `set_tier2_alert_armed()` (`utils_redis/database.py`) immediately after releasing `_lock`, added by the CCR-019 fix — an additional instance of this exact same unsynchronised-window pattern, explicitly acknowledged as such in `CODE_TODO.md`'s own decision log for that fix ("Does not address CCR-020 or CCR-021... same ordering shape CCR-020 already flags"). Not a new/separate defect — recorded here rather than as a duplicate finding.
+- Called concurrently from many independent threads via `utilities/utils_telegram/gateway_outbound.py`'s `send_*`/`stop_poll` functions: the Telegram long-polling thread (`gateway_inbound.py::poll_updates()`), the RabbitMQ consumer thread (`message_handler.py`, via `queue_consume_task()`), and every per-chat/per-poll background thread (`typing_indicator.py::_typing_loop()`, `image_draft_handler.py::_draft_loop()`, `poll_response_handler.py::_poll_loop()`, `session_reset_handler.py::send_reset_notice()`)
+
+**Violated Standard:**
+- CWE-362: Concurrent Execution using Shared Resource with Improper Synchronization ('Race Condition') — the same class of defect already identified and resolved elsewhere in this codebase for Redis state (CCR-013/CCR-015), applied here to the newly-added Tier 2 alert/recover signalling pair.
+
+**Description:**
+Both `record_send_success()` and `record_send_failure()` follow the same pattern: mutate the shared `_alert_armed`/`_consecutive_failures` state atomically under `_lock`, decide `should_fire`/`was_alerted` from that atomic snapshot, then release `_lock` and only afterwards call `_push_tier2_gateway_alert()`/`_push_tier2_gateway_recover()` — each of which performs its own, independent, potentially slow (`Q_PUSH_MAX_ATTEMPTS` retries, up to ~30s by default) call into `queue_push_task()`. Because the lock is released before the corresponding queue push begins, two calls on two different threads that both decide `should_fire`/`was_alerted = True` at nearly the same moment (fully possible in this application, since `send_*`/`stop_poll` are invoked concurrently from at least five independent thread classes, all sharing this same global Tier 2 state) are not serialised relative to each other beyond that shared state mutation — the actual publish to `Q_CHANNEL_OUT` can happen in either order, independent of which state transition logically happened first. Neither the `gateway_alert` nor `gateway_recover` payload carries a timestamp, sequence number, or any other ordering/correlation field (both are `{task_id: null, session_id: null, tier: 2, ...}`), so a consumer has no way to detect or correct for a reordering even if it does occur.
+
+**Evidence:**
+```python
+# record_send_success() - lock released, THEN the (slow, retried) push happens
+with _lock:
+    was_alerted = not _alert_armed
+    _consecutive_failures = 0
+    _alert_armed = True
+if was_alerted:
+    logger.info(...)
+    _push_tier2_gateway_recover(status_code)   # queue_push_task() - up to ~30s of retries
+
+# record_send_failure() - same pattern, same gap
+with _lock:
+    ...
+    if should_fire:
+        _alert_armed = False
+if should_fire:
+    _push_tier2_gateway_alert(reason, status_code)   # queue_push_task() - up to ~30s of retries
+```
+Neither payload (`_push_tier2_gateway_alert`/`_push_tier2_gateway_recover`) carries a timestamp or sequence field to allow a consumer to reconstruct true ordering after the fact.
+
+**Impact:**
+An orchestrator relying on strict `gateway_alert` → `gateway_recover` ordering to drive an on-call paging/auto-resolve workflow could, in a narrow but genuinely reachable timing window, observe a `gateway_recover` arrive before (or without an immediately preceding) its `gateway_alert` — e.g. if the alert-firing thread's `queue_push_task()` call is delayed by a concurrent RabbitMQ retry while a different thread's near-simultaneous recovery publish succeeds first. This could cause a monitoring system to either miss the alert entirely (treating the lone `gateway_recover` as noise) or, worse, receive the alert afterwards and treat an already-resolved incident as newly opened. **Update, 2026-09-08:** the same unsynchronised window now also applies to `set_tier2_alert_armed()`'s Redis write (added by the CCR-019 fix), so the same race could, in principle, leave the *persisted* `tier2_alert_armed` value itself out of sync with the true final in-memory state — a stale value that would then be read back as ground truth by `load_tier2_alert_state()` on a subsequent restart. This is a plausible extension of this finding's existing impact, not independently verified via testing.
+
+**Recommended Remediation:**
+Either serialise the state-transition-and-publish sequence as a single critical section (e.g. widen `_lock`'s scope to cover the `queue_push_task()` call itself, accepting that this blocks other callers of `record_send_success()`/`record_send_failure()` for the duration of the publish), or add a monotonic sequence number/timestamp to both `gateway_alert` and `gateway_recover` payloads so a consumer can independently detect and correct for out-of-order delivery.
+
+**Confidence:** Medium — the absence of synchronisation between the state mutation and the publish call, and the absence of any ordering field in the payload, are both confirmed facts in the code; actual occurrence depends on precise multi-threaded timing overlap that cannot be proven exhaustively from static analysis alone (same epistemic caveat already applied to CCR-013).
+
+**Status / Decision:** Open
+
+---
+
+### CCR-021 — Shared RabbitMQ publish connection/channel is used concurrently across threads without synchronisation around the actual publish call
+
+**Severity:** High
+
+**Review Date:** 2026-09-08 (fourth follow-up pass — surfaced while tracing `record_send_success()`'s new call path into `queue_push_task()`; root cause predates this specific change and is not itself part of the reviewed diff)
+
+**Location:**
+- `utilities/utils_queue/queue.py::_get_rabbitmq_publish_channel()` (lines 182–202) and `queue_push_task()` (lines 226–268) — the shared module-level `_connection_publish`/`_channel_publish` pika `BlockingConnection`/`BlockingChannel`
+- Exercised concurrently by every caller of `queue_push_task()`, including the newly-added `error_handling.py::_push_tier2_gateway_recover()` (called from `record_send_success()`, itself called from every `send_*`/`stop_poll` function in `gateway_outbound.py` across at least five independent thread classes — see CCR-020's Location list)
+
+**Violated Standard:**
+- CWE-362: Concurrent Execution using Shared Resource with Improper Synchronization ('Race Condition')
+- CWE-667: Improper Locking (closest secondary mapping — the lock that exists protects only channel *acquisition*, not channel *use*)
+
+**Description:**
+`queue.py`'s own module header states, as a documented invariant: "Publish and consume each use their own dedicated connection, confined to their own thread (publish: caller's thread, consume: `_consumer_thread`), since a pika `BlockingConnection` must not be shared or used concurrently across threads." In practice, however, the *publish* connection is not confined to a single thread at all — `_get_rabbitmq_publish_channel()` acquires `_lock_publish` only long enough to lazily (re)initialise `_channel_publish` if needed, then returns the shared channel object and releases the lock. `queue_push_task()` then calls `channel.queue_declare(...)` and `channel.basic_publish(...)` directly on that shared object with **no lock held at all** during those calls. Since `queue_push_task()` is invoked from many independently-running threads in this application (the Telegram long-polling thread, the RabbitMQ consumer thread, and every per-chat/per-poll/per-task background thread — see CCR-020's Location list, all of which now reach it via `record_send_success()`/`record_send_failure()`, `push_tier1_delivery_failed()`, `push_session_cleared()`, and the poll/session-reset modules' own direct calls), two of those threads can genuinely call `channel.basic_publish()`/`channel.queue_declare()` on the same pika `BlockingChannel` at the same time — precisely the scenario the module's own header comment says must not happen.
+
+**Evidence:**
+```python
+# queue.py module header (self-documented invariant)
+# - Always use the helper functions in this file to enqueue and dequeue tasks.
+# Publish and consume each use their own dedicated connection, confined to their own thread
+# (publish: caller's thread, consume: _consumer_thread), since a pika BlockingConnection must
+# not be shared or used concurrently across threads.
+
+def _get_rabbitmq_publish_channel():
+    with _lock_publish:
+        if _connection_publish is None or _connection_publish.is_closed:
+            _initialise_rabbitmq_publish_connection()
+        return _channel_publish   # lock released here - channel handed out unprotected
+
+def queue_push_task(payload):
+    for attempt in range(1, settings.Q_PUSH_MAX_ATTEMPTS + 1):
+        channel = _get_rabbitmq_publish_channel()
+        channel.queue_declare(queue=settings.Q_CHANNEL_OUT, durable=True)   # no lock held
+        channel.basic_publish(...)                                          # no lock held
+```
+`_lock_publish` is an `RLock` guarding only the `if _connection_publish is None or ...: _initialise_rabbitmq_publish_connection()` branch — it does not extend over `queue_declare()`/`basic_publish()`, which is where the actual, non-thread-safe pika I/O happens.
+
+**Impact:**
+This is a pre-existing structural gap in `queue.py`, not something introduced by the `error_handling.py` change reviewed here — but this review's own scope (tracing `record_send_success()`'s new call into `_push_tier2_gateway_recover()` → `queue_push_task()`) is what surfaced it, and this specific change measurably widens its exposure: previously, a publish from the Tier 2 path only occurred on a failure/alert transition (relatively rare); now, `record_send_success()` can also trigger a publish on the far more frequent *success* path (any send that happens to close out a prior incident), increasing the odds of two publish-triggering call sites overlapping in time across the application's several concurrent threads. Per pika's own documented threading contract (echoed by this codebase's own module comment), concurrent use of a single `BlockingConnection`/`BlockingChannel` from multiple threads is unsupported and can produce corrupted AMQP frames, unexpected/misleading exceptions, or an unexpectedly closed connection — potentially affecting **every** outbound message on `Q_CHANNEL_OUT` (Tier 1 `delivery_failed`, Tier 2 `gateway_alert`/`gateway_recover`, `session_cleared`, `poll_answer`/`poll_timed_out`), not just the newly-added recovery event.
+
+**Recommended Remediation:**
+Widen `_lock_publish`'s scope in `queue_push_task()` to cover the entire `queue_declare()`/`basic_publish()` sequence (and the retry loop around it), so only one thread at a time ever touches `_channel_publish`/`_connection_publish` — consistent with the module's own stated design intent, just not currently enforced by the code. Alternatively, give each calling thread its own dedicated publish connection (more consistent with pika's per-thread ownership model, at the cost of more open connections to RabbitMQ).
+
+**Confidence:** Medium — the absence of any lock around the actual `basic_publish()`/`queue_declare()` calls is an unambiguous, directly-observed fact in the code, confirmed against the module's own documented invariant; whether this has already manifested as a real production defect (a corrupted frame, a dropped connection) cannot be confirmed from static analysis alone, and no test evidence either way was available for this review.
+
+**Status / Decision:** Open
+
+---
+
+### CCR-022 — Redis startup connection silently reverts to "give up after one attempt" by default, undocumented in the project's own decision log and inconsistent with RabbitMQ's startup behaviour
+
+**Severity:** Medium
+
+**Review Date:** 2026-09-08 (fifth follow-up pass — surfaced while reviewing the "major changes" to `database.py` and validating CCR-019)
+
+**Location:**
+- `utilities/utils_redis/database.py::initialise_redis_connection()` (lines 39–86) and the new `_should_redis_retry_infinite()` helper (lines 127–139)
+- `config.py`, lines 205/219 — new `DEFAULT_REDIS_FORCE_INFINITE_RETRY = False` / `self.REDIS_FORCE_INFINITE_RETRY`
+- Compare against `utilities/utils_queue/queue.py::initialise_rabbitmq_connection()` (lines 126–150), which has no equivalent flag and always retries indefinitely, unconditionally
+
+**Violated Standard:**
+- PEP 257 / general docstring-accuracy best practice — `initialise_redis_connection()`'s own docstring is materially inconsistent with its current default behaviour.
+- No CWE cleanly captures "a previously-implemented and recorded reliability fix silently reversed by a new default, undocumented in the project's own change log" — recorded as a reliability/documentation-governance concern rather than an invented CWE identifier.
+
+**Description:**
+`initialise_redis_connection()`'s docstring states, unconditionally: "Retries indefinitely, with a fixed delay between attempts, whenever Redis is not yet reachable - blocks the caller until a connection succeeds rather than giving up after a bounded number of attempts." This is no longer accurate for the function's actual default behaviour. The function now checks a new `_should_redis_retry_infinite()` helper (`settings.REDIS_FORCE_INFINITE_RETRY`, defaulting to `False`) inside its retry loop; when `False` (the default, confirmed in both `config.py` and `README.md`'s own variable table — "gives up after one attempt \[...\] (`false`, default)"), a single failed connection attempt at startup causes the function to log a warning and `break` out of the loop, returning normally with `_client` left as `None`, rather than continuing to retry. This directly reverses the previously-implemented and explicitly recorded fix in `CODE_TODO.md`'s "FIX — No retry on RabbitMQ/Redis startup connections, crashing the application" entry (Status: Implemented), whose entire stated purpose was that "a transient 'dependency not up yet' race... crashed the whole application on launch" and needed unconditional indefinite retry to avoid it. `CODE_TODO.md`'s own decision log — which meticulously records every other design choice in this same batch of changes, including explicitly scoping the CCR-019 fix away from CCR-020/CCR-021 — contains no entry at all discussing this new setting, its default, or its interaction with the earlier fix it partially reverses. RabbitMQ's structurally equivalent `initialise_rabbitmq_connection()` was left untouched and still retries indefinitely, unconditionally, with no equivalent opt-out — creating an inconsistency between the two dependencies' startup resilience behaviour for no stated reason.
+
+**Evidence:**
+```python
+# database.py::initialise_redis_connection() docstring (unconditional claim, now inaccurate by default)
+"""
+Retries indefinitely, with a fixed delay between attempts, whenever Redis is not yet reachable -
+blocks the caller until a connection succeeds rather than giving up after a bounded number of attempts.
+"""
+...
+except redis.exceptions.RedisError as e:
+    _client = None
+    if not _should_redis_retry_infinite():
+        logger.warning(f"Redis not reachable at startup: {e}. REDIS_FORCE_INFINITE_RETRY is disabled - giving up.")
+        break                      # <-- returns without connecting and without raising, by default
+    else:
+        logger.warning(...)
+        time.sleep(...)
+```
+```python
+# config.py
+DEFAULT_REDIS_FORCE_INFINITE_RETRY = False   # default reverses the previously-implemented fix
+```
+```python
+# queue.py::initialise_rabbitmq_connection() - unchanged, always retries indefinitely, no equivalent flag
+while True:
+    try:
+        ...
+    except pika.exceptions.AMQPConnectionError as e:
+        logger.warning(...)
+        time.sleep(settings.Q_CONNECT_RETRY_DELAY_SECONDS)
+```
+
+**Impact:**
+Under the default configuration, a transient "Redis not up yet" race at container start — the exact scenario the earlier fix was built to survive — now causes `initialise_redis_connection()` to give up after one attempt rather than blocking. `main()` does not crash (the function returns normally rather than raising), but `initialise_application()` proceeds to run `load_tier2_alert_state()`, `close_orphaned_drafts()`, `close_orphaned_polls()`, and `resync_pending_resets()` against a Redis client that is still `None`/disconnected on that first pass — each of these falls back to its own pre-existing "ping failed" default (an empty sweep, or `_alert_armed` defaulting to armed) rather than performing the startup recovery/resync work it exists to do, per this review's earlier analysis of `get_tier2_alert_armed()`'s failure-mode default (see CCR-019's Validation Result above). The application does self-heal on the very next Redis-dependent operation (each of `_redis_write()`/`_redis_read()`/etc. calls `_get_redis_client()` fresh, which will attempt to reconnect again), so this is a narrow startup-window degradation rather than a permanent outage — but it is a genuine, silent reduction in startup robustness compared to the previously-implemented and recorded fix, and the stale docstring means a future maintainer reading `initialise_redis_connection()` in isolation would not realise this is the current default behaviour at all.
+
+**Recommended Remediation:**
+Update `initialise_redis_connection()`'s docstring to accurately describe the conditional behaviour (retries indefinitely only if `REDIS_FORCE_INFINITE_RETRY` is set). Separately, confirm with the maintainer whether reverting the default startup-resilience behaviour for Redis (while leaving RabbitMQ's equivalent path unconditionally infinite) is an intentional, permanent decision or an oversight — if intentional, record the rationale in `CODE_TODO.md` alongside the other decisions in this same batch of changes, consistent with the project's own established documentation discipline; if not, consider defaulting `REDIS_FORCE_INFINITE_RETRY` to `True` to restore parity with RabbitMQ's startup behaviour and the originally-recorded fix.
+
+**Confidence:** High — the docstring/behaviour mismatch, the new default, and the inconsistency with RabbitMQ's unconditional retry are all directly observed, unambiguous facts in the current source and `README.md`; the operational-impact assessment (self-healing on the next Redis operation) is a reasoned deduction from the code's own structure, not independently verified via live testing.
+
+**Status / Decision:** Open
+
+---
+
 ## Compliance Verdict
 
-**Verdict: Mostly Compliant** (improved from the pre-remediation baseline of the same rating — as of the 2026-09-05 revalidation, no Critical/High/Medium-severity findings remain open; exactly one Low-severity item is genuinely outstanding, alongside one Low-severity accepted risk)
+**Verdict: Partially Compliant** (revised down from the 2026-09-05 "Mostly Compliant" rating — the fourth follow-up review, 2026-09-08, identified one new High-severity and two new Medium-severity findings; the fifth follow-up review, same day, confirmed one of those Medium findings (CCR-019) RESOLVED but identified one further new Medium-severity finding (CCR-022), leaving the High-severity CCR-021 as the primary remaining blocker)
 
 **Rationale:**
 The codebase reflects a disciplined, well-documented engineering standard — consistent timeout/retry handling, tiered failure reporting, thread-safety comments backed by correct locking, and thoughtful edge-case handling (album dedupe, orphan sweeps, debounced poll closing). No injection, broken-access-control, or memory-safety issues were identified, and existing HTML-injection risk (`parse_mode="HTML"`) is correctly mitigated at both call sites that use it.
@@ -838,9 +1065,19 @@ A subsequent revalidation (2026-09-05, same day, on request "revalidate all open
 
 A third follow-up review (2026-09-05, same day, on request "changes have been made to image_draft_handler.py including behaviour change, validate non-compliance") examined a subsequent behaviour change to the draft keep-alive cycle's continue-button handling in `image_draft_handler.py`. The changed behaviour itself was confirmed correctly and consistently implemented against `README.md`'s spec, with no exploitable defect identified across an exhaustive cross-thread interleaving trace. At the user's explicit instruction, three findings from this review are recorded as open non-compliance items — **CCR-016** (Low, an implicit rather than explicit state check with a future-maintenance fragility risk), **CCR-017** (Informational, default-value-hardcoded comments that could go stale under reconfiguration), and **CCR-018** (Informational, unsynchronized in-memory control-dict field mutation across threads — a pattern already present elsewhere in the codebase, not unique to this change, but logged as open rather than closed per instruction).
 
+A fourth follow-up review (2026-09-08, on request, "review the modification to error_handling.py — mainly the addition of `_push_tier2_gateway_recover()` and `record_send_success()` — for weaknesses") examined the new `gateway_recover` (Tier 2) counterpart-confirmation feature documented in `TODO.md`'s "NEW — `gateway_recover`" section. `utilities/utils_queue/error_handling.py` (the changed file), `utilities/utils_telegram/gateway_outbound.py` (all 8 updated `record_send_success()` call sites), `utilities/utils_queue/queue.py`, `config.py`, `utilities/utils_queue/message_handler.py`, `CODE_TODO.md`, and `CODE_SEQUENCE_DIAGRAM.md` §10.1–10.4 were read directly against current source, cross-referencing the feature's own stated design intent and open questions. The feature is implemented consistently with its own documented design (once-per-incident firing, correct payload shape, correct `_alert_armed` re-arming) — no defect was found in the core once-per-incident logic itself. Three new findings were identified and are recorded as Open: **CCR-019** (Medium — a process restart, the realistic fix path for the 401/404 alerts this feature is most deterministically triggered by, silently resets the in-memory Tier 2 state and orphans the corresponding `gateway_recover`), **CCR-020** (Medium — the state-transition-to-publish window is unsynchronised across the many independent threads that call into `gateway_outbound.py`'s send functions, allowing `gateway_alert`/`gateway_recover` to be published out of order relative to each other, with no ordering field in either payload to detect this), and **CCR-021** (High — surfaced while tracing this same call path: `queue.py`'s shared RabbitMQ publish `BlockingConnection`/`BlockingChannel` is used concurrently across threads with no lock held around the actual `basic_publish()`/`queue_declare()` calls, directly contradicting the module's own documented single-thread-per-connection invariant; a pre-existing gap in `queue.py`, not introduced by this diff, but materially more exposed now that a success — not just a failure — can trigger a publish). No fixes were applied this pass (review-only; not instructed to enter Fix Mode).
+
+A fifth follow-up review (2026-09-08, same day, on request, "major changes have been made to database.py and also validate ccr-019 — verify for regression") re-read `utilities/utils_redis/database.py` in full against its previous state, cross-referenced against `utilities/utils_queue/error_handling.py`, `utilities/initialise.py`, `config.py`, `README.md`, and `CODE_TODO.md`'s newly-added "FIX — CCR-019", "FIX — `_redis_write()`/`_redis_read()` had no retry", and "FIX — remaining raw `sadd`/`srem`/`scard`/`smembers`/`scan_iter` calls" entries. **CCR-019 is confirmed RESOLVED** for the exact scenario it described — `get_tier2_alert_armed()`/`set_tier2_alert_armed()` (new, `database.py`) and `load_tier2_alert_state()` (new, `error_handling.py`, called from `initialise_application()`) correctly persist and restore the armed/disarmed flag across a restart, closing the gap where a 401/404 alert fixed via restart never received its paired `gateway_recover`. `CODE_TODO.md`'s own decision log explicitly and correctly scopes this fix away from CCR-020/CCR-021 (disclosing, not hiding, that the new `set_tier2_alert_armed()` call shares CCR-020's existing unsynchronised-window pattern) — this review concurs and has extended CCR-020's own Location/Evidence to reference the new call site rather than raising a duplicate finding. The broader retry-hardening changes in `database.py` (`_redis_write()`/`_redis_read()` gaining retry, `_redis_sadd()`/`_redis_srem()`/`_redis_smembers()`/`_redis_ping()` added, `create_task_mapping()`'s retry loop corrected) were traced against every caller and found to be safe, backward-compatible refactors with no signature changes and no regression in the CCR-012/013/015 per-`chat_id` locking they sit alongside. One new Medium-severity finding was identified and is recorded as Open: **CCR-022** — a new `REDIS_FORCE_INFINITE_RETRY` setting (default `False`, disclosed in `README.md` but absent from `CODE_TODO.md`'s otherwise-thorough decision log) silently reverses the previously-implemented and recorded "retry indefinitely at startup" fix for Redis specifically, leaves `initialise_redis_connection()`'s own docstring materially inaccurate for the new default, and creates an unexplained inconsistency with RabbitMQ's structurally equivalent startup path (still unconditionally infinite). No fixes were applied this pass (review-only; not instructed to enter Fix Mode).
+
 **Remaining Blockers to a "Compliant" Verdict:**
-1. CCR-005 (Low) — RabbitMQ/Redis connections lack TLS in transit; unchanged, re-confirmed still open on revalidation (2026-09-05). Treated as a low-severity, network-topology-dependent accepted risk under the same closed-host deployment context validated for CCR-003, rather than a hard blocker.
-2. CCR-011 (Low) — `_registered_callbacks` has no hard size cap; re-confirmed still open on revalidation (2026-09-05). **[Skipped at the user's request during the 2026-09-03 remediation pass; not examined again since]**
+1. CCR-021 (High) — `queue.py`'s shared RabbitMQ publish connection/channel is used concurrently across threads with no lock held around the actual publish call, contradicting the module's own documented invariant; open, newly identified 2026-09-08.
+2. CCR-020 (Medium) — `gateway_alert`/`gateway_recover` publishes (and, as of 2026-09-08, the new `set_tier2_alert_armed()` Redis persistence call) are not serialised relative to each other across threads and carry no ordering field; open, unchanged.
+3. CCR-022 (Medium) — Redis's startup connection now gives up after one attempt by default, undocumented in `CODE_TODO.md`'s own decision log and inconsistent with RabbitMQ's unconditional-retry startup path; open, newly identified 2026-09-08.
+4. CCR-005 (Low) — RabbitMQ/Redis connections lack TLS in transit; unchanged, re-confirmed still open on revalidation (2026-09-05). Treated as a low-severity, network-topology-dependent accepted risk under the same closed-host deployment context validated for CCR-003, rather than a hard blocker.
+5. CCR-011 (Low) — `_registered_callbacks` has no hard size cap; re-confirmed still open on revalidation (2026-09-05). **[Skipped at the user's request during the 2026-09-03 remediation pass; not examined again since]**
+
+**Resolved / no longer blocking (2026-09-08 fifth follow-up pass):**
+- ~~CCR-019~~ (Medium → n/a) — RESOLVED (validated 2026-09-08). `get_tier2_alert_armed()`/`set_tier2_alert_armed()`/`load_tier2_alert_state()` now persist and restore Tier 2's armed/disarmed flag across a restart, closing the 401/404-via-restart gap this finding described.
 
 **Resolved / no longer blocking (this pass):**
 - ~~CCR-016~~ (Low → n/a) — RESOLVED (validated 2026-09-05, second validation pass, not authored this session). `_wait_full_duration()` now explicitly checks `control["action"]` for both `"continue"` and `"stop"`, with a logged, defensive fallback for any unrecognised value.
@@ -856,7 +1093,9 @@ A third follow-up review (2026-09-05, same day, on request "changes have been ma
 - ~~CCR-014~~ (Low → n/a) — RESOLVED (validated 2026-09-05, revalidation pass). Unused `user_id` assignment removed from `message_handler.py::process_message()`.
 - ~~CCR-015~~ (Low → n/a) — RESOLVED (validated 2026-09-05, revalidation pass). `create_poll_mapping()` now holds `_get_chat_lock(chat_id)` across its write+index step, mirroring `create_task_mapping()`.
 
-No Critical/High/Medium-severity findings remain open in this report as of 2026-09-05. Exactly two Low-severity items remain open (CCR-005, an accepted risk; CCR-011, unaddressed/skipped) - neither requires a behavioural/architectural rewrite. CCR-016, CCR-017, and CCR-018 (identified and validated as still-open earlier the same day) were re-validated once more on request and found to have all been resolved in the interim, outside this session's own edits - none remain open.
+As of the 2026-09-05 revalidation, no Critical/High/Medium-severity findings remained open, with only two Low-severity items outstanding (CCR-005, an accepted risk; CCR-011, unaddressed/skipped). CCR-016, CCR-017, and CCR-018 (identified and validated as still-open earlier the same day) were re-validated once more on request and found to have all been resolved in the interim, outside this session's own edits.
+
+**This position changed with the fourth follow-up review (2026-09-08):** one High-severity finding (CCR-021) and two Medium-severity findings (CCR-019, CCR-020) were newly identified in the `gateway_recover` (Tier 2) feature and its underlying RabbitMQ publish path, all currently Open. This is the reason the overall verdict is revised from "Mostly Compliant" to "Partially Compliant" below.
 
 ---
 
@@ -884,6 +1123,10 @@ No Critical/High/Medium-severity findings remain open in this report as of 2026-
 | ~~CCR-016~~ | Low | Reliability / Maintainability | utils_telegram/utilities/image_draft_handler.py::_wait_full_duration | CWE-670 (closest) | **RESOLVED** (validated 2026-09-05, second validation pass, not authored this session) |
 | ~~CCR-017~~ | Informational | Maintainability | utils_telegram/utilities/image_draft_handler.py::_draft_loop | None (comment accuracy) | **RESOLVED** (validated 2026-09-05, second validation pass, not authored this session) |
 | ~~CCR-018~~ | Informational | Reliability | utils_telegram/utilities/image_draft_handler.py (control dict mutation) | CWE-362 (closest) | **RESOLVED** (validated 2026-09-05, second validation pass, not authored this session) |
+| ~~CCR-019~~ | Medium | Reliability / Governance | utils_queue/error_handling.py, utils_redis/database.py, initialise.py | OWASP A09:2021 (closest) | **RESOLVED** (validated 2026-09-08, not authored this session) |
+| CCR-020 | Medium | Reliability | utils_queue/error_handling.py (record_send_success/record_send_failure) vs. gateway_outbound.py's concurrent callers | CWE-362 | Open (new, 2026-09-08) |
+| CCR-021 | High | Reliability | utils_queue/queue.py (_get_rabbitmq_publish_channel, queue_push_task) | CWE-362, CWE-667 | Open (new, 2026-09-08, root cause pre-existing) |
+| CCR-022 | Medium | Reliability / Maintainability | utils_redis/database.py::initialise_redis_connection, config.py, queue.py (comparison) | None formally (docstring accuracy / reliability regression) | Open (new, 2026-09-08) |
 
 ---
 

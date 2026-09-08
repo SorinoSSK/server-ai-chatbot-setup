@@ -437,6 +437,26 @@ No per-task retry or different tool fixes either - human intervention is the onl
 - `unreachable` only fires once `GATEWAY_ALERT_FAILURE_THRESHOLD` (5 by default) consecutive send failures have accumulated across *all* sends - a single blip is expected noise, not a systemic signal.
 - Either way, fires **once per incident**: a successful send afterwards re-arms it, so an ongoing outage doesn't spam one alert per failed message.
 - Always logged at `CRITICAL` first, regardless of whether the push to `Q_CHANNEL_OUT` itself succeeds - so the alert stays visible via infra/log-based monitoring even if RabbitMQ is part of what's broken.
+- The armed/disarmed flag (whether an incident is currently outstanding) is persisted to Redis and reloaded at startup - so a `gateway_alert` resolved via a restart (e.g. a 401/404 fixed by updating `TELEGRAM_BOT_TOKEN`) still receives its paired `gateway_recover`. The consecutive-failure counter itself still resets to 0 on every restart, deliberately - only the armed flag survives.
+
+#### `gateway_recover` (Tier 2 - systemic, not tied to any task)
+
+Pushed once a send succeeds again after a `gateway_alert` was fired - the counterpart confirmation that Telegram is reachable/authorised again.
+
+```json
+{
+  "task_id": null,
+  "session_id": null,
+  "type": "gateway_recover",
+  "tier": 2,
+  "reason": "recovered",
+  "status_code": 200
+}
+```
+- `task_id` / `session_id`: always `null`, same as `gateway_alert`.
+- `reason`: always `"recovered"` - fixed, unlike `gateway_alert`'s `reason`, which reflects what actually failed.
+- `status_code`: Telegram's HTTP status code from the successful response that triggered the recovery (typically `200`).
+- Fires **once per incident**, same as `gateway_alert` - only the first success after an alert triggers this; every ordinary successful send otherwise stays silent.
 
 **Out of scope:** disk/hardware-level failures (a true application-layer gap) are not detected or reported here - they rely on infrastructure-level restart policies/monitoring instead.
 

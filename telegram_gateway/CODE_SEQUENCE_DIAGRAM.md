@@ -13,7 +13,7 @@ Sequence diagrams for every use case scenario identified in the Telegram Gateway
 7. [Poll Answer Collection](#7-poll-answer-collection)
 8. [Session Reset Flow](#8-session-reset-flow)
 9. [Typing Indicator](#9-typing-indicator)
-10. [Error Handling / Delivery Failure Tiers](#10-error-handling--delivery-failure-tiers)
+10. [Error Handling / Delivery Failure Tiers](#10-error-handling--delivery-failure-tiers) (incl. §10.6 Tier 2 state restore, CCR-019 fix)
 11. [Connection & Infrastructure Resilience](#11-connection--infrastructure-resilience)
 12. [Security / Data Hygiene](#12-security--data-hygiene)
 
@@ -30,6 +30,7 @@ sequenceDiagram
     participant Init as initialise.py
     participant MQ as RabbitMQ
     participant Redis as Redis
+    participant ErrorMod as error_handling.py
     participant Draft as image_draft_handler
     participant Poll as poll_response_handler
     participant Session as session_reset_handler
@@ -42,6 +43,8 @@ sequenceDiagram
     Init->>MQ: initialise_rabbitmq_connection() (publish + consume)
     Init->>MQ: start_queue_consumer() (background thread)
     Init->>Redis: initialise_redis_connection()
+    Init->>ErrorMod: load_tier2_alert_state()
+    Note over ErrorMod,Redis: see §10.6 - restores Tier 2's armed/disarmed flag so a restart doesn't orphan a pending gateway_recover
     Init->>Draft: close_orphaned_drafts()
     Note over Draft,Redis: see §4.9 for detail
     Init->>Poll: close_orphaned_polls()
@@ -838,19 +841,27 @@ sequenceDiagram
     participant SendFn as gateway_outbound.send_*()
     participant TG as Telegram Bot API
     participant ErrorMod as error_handling.py
+    participant Redis as Redis
     participant MQ as RabbitMQ
 
     SendFn->>TG: POST (any Telegram Bot API call)
     alt success
         TG-->>SendFn: 200 OK
-        SendFn->>ErrorMod: record_send_success()
+        SendFn->>ErrorMod: record_send_success(status_code)
         ErrorMod->>ErrorMod: consecutive_failures = 0; re-arm alert
+        alt was disarmed (prior alert active)
+            ErrorMod->>Redis: set_tier2_alert_armed(True)
+            ErrorMod->>MQ: push {type: gateway_recover, tier: 2, reason: "recovered", status_code}
+        else was already armed (no prior alert)
+            ErrorMod->>ErrorMod: no-op (ordinary success, nothing to report)
+        end
     else 401 Unauthorized / 404 Not Found
         TG-->>SendFn: 401 / 404
         SendFn->>ErrorMod: record_send_failure("unauthorized"/"not_found", status_code)
         alt alert currently armed
-            ErrorMod->>MQ: push {type: gateway_alert, tier: 2} (fires immediately)
             ErrorMod->>ErrorMod: disarm alert
+            ErrorMod->>Redis: set_tier2_alert_armed(False)
+            ErrorMod->>MQ: push {type: gateway_alert, tier: 2} (fires immediately)
         else already disarmed (prior incident still active)
             ErrorMod->>ErrorMod: no-op
         end
@@ -859,8 +870,9 @@ sequenceDiagram
         SendFn->>ErrorMod: record_send_failure("unreachable")
         ErrorMod->>ErrorMod: consecutive_failures += 1
         alt consecutive_failures >= GATEWAY_ALERT_FAILURE_THRESHOLD and armed
-            ErrorMod->>MQ: push {type: gateway_alert, tier: 2}
             ErrorMod->>ErrorMod: disarm alert
+            ErrorMod->>Redis: set_tier2_alert_armed(False)
+            ErrorMod->>MQ: push {type: gateway_alert, tier: 2}
         else below threshold or already disarmed
             ErrorMod->>ErrorMod: no-op
         end
@@ -892,6 +904,31 @@ sequenceDiagram
             MQ-->>ErrorMod: False
             ErrorMod->>ErrorMod: log error, event dropped
         end
+    end
+```
+
+### 10.6 Tier 2 armed/disarmed state — startup restore (CCR-019 fix)
+
+```mermaid
+sequenceDiagram
+    participant Init as initialise_application()
+    participant ErrorMod as error_handling.py
+    participant Redis
+
+    Init->>ErrorMod: load_tier2_alert_state()
+    ErrorMod->>Redis: get_tier2_alert_armed()
+    alt key missing / read fails
+        Redis-->>ErrorMod: default True (armed)
+    else key present
+        Redis-->>ErrorMod: True | False
+    end
+    ErrorMod->>ErrorMod: _alert_armed = <loaded value>
+    Note over ErrorMod: consecutive_failures is NOT restored - always starts at 0, by design (see §10.1-10.4 module Notes)
+    alt loaded as disarmed
+        ErrorMod->>ErrorMod: log warning - incident left outstanding by a prior run
+        Note over ErrorMod: the next successful send now correctly fires gateway_recover (§10.1-10.4), closing CCR-019
+    else loaded as armed
+        ErrorMod->>ErrorMod: log info - no incident outstanding
     end
 ```
 

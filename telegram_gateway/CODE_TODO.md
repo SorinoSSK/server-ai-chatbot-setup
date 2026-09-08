@@ -306,3 +306,131 @@ Status: **Implemented.** `initialise_rabbitmq_publish_connection()`, `initialise
 
 1. ~~Whether the retry loops should distinguish a transient "not up yet" failure from a permanent credential/config error (which would otherwise also retry forever).~~ **Decided: accepted risk, no change.** User prefers stability (never crash on startup) over fail-fast diagnostics here; a bad credential retrying indefinitely is acceptable given every attempt is still logged, making it straightforward to diagnose from the logs.
 2. Whether `CODE_NON_COMPLIANCE.md` in this repository should be updated to record this finding/fix formally as its own numbered entry is a call for whoever owns that document next — it's treated as an immutable compliance record here and was not modified as part of this session.
+
+---
+
+## NEW — `gateway_recover` (Tier 2) — counterpart confirmation to `gateway_alert`
+
+Status: **Implemented, not yet exercised in testing.** `gateway_alert` (Tier 2) had no counterpart signal for "the incident it warned about is now over" — the orchestrator/backend had no way to know from `Q_CHANNEL_OUT` alone whether Telegram had recovered, short of inferring it from the absence of further alerts.
+
+### Goal
+
+Push a `gateway_recover` event the first time a send succeeds again after a `gateway_alert` was fired — mirroring `_push_tier2_gateway_alert()`'s payload shape exactly, so consumers already parsing Tier 2 events don't need a second, differently-shaped message type to handle.
+
+### Decisions
+
+- `_push_tier2_gateway_recover(status_code)` (`utils_queue/error_handling.py`) builds a payload identical in shape to `_push_tier2_gateway_alert()`'s (`task_id`/`session_id` both `None`, `tier: 2`) — only `type` (`"gateway_recover"`) and `reason` (always `"recovered"`, fixed rather than derived from what previously failed) differ.
+- **Fires once per incident, not on every successful send.** `record_send_success()` already tracks `_alert_armed` — before resetting it, the function now captures whether it was `False` (i.e. a `gateway_alert` had already fired and hadn't yet been closed out). Only that transition triggers `_push_tier2_gateway_recover()`; an ordinary success with no prior alert is a no-op, same restraint `record_send_failure()` already applies to `gateway_alert` itself.
+- **`status_code` is passed through from the response, not fixed to `None`.** `record_send_success()` gained a `status_code: int | None = None` parameter, and all 8 call sites in `gateway_outbound.py` (`send_message`, `send_typing_action`, `send_poll`, `stop_poll`, `send_document`, `send_photo`, `send_video`, `send_media_group`) now pass `response.status_code` in. Since this feature hadn't been deployed/tested yet at the time of this change, every call site was updated directly rather than defaulting the parameter to preserve old call sites unchanged.
+- **The recovery-transition log line lives in `record_send_success()`, not `_push_tier2_gateway_recover()`** — explicit user request, so the fact that a recovery is happening is always visible in the logs regardless of whether the subsequent queue push itself succeeds. `_push_tier2_gateway_recover()` still logs its own push outcome (success/failure), same convention as every other queue-push helper in this file (`push_tier1_delivery_failed()`, `_push_tier2_gateway_alert()`) — kept for consistency rather than requested outright; flagged here in case the user wants that trimmed further.
+- `_push_tier2_gateway_recover()` returns `None` (not `bool`, unlike `_push_tier2_gateway_alert()`) — explicit user request; nothing currently needs to branch on whether the recovery push itself succeeded.
+
+### Implementation Notes
+
+- `utils_queue/error_handling.py`: `record_send_success(status_code)`, new `_push_tier2_gateway_recover(status_code)`, module header Notes updated.
+- `utils_telegram/gateway_outbound.py`: all 8 `record_send_success()` call sites updated to `record_send_success(response.status_code)`; module header Notes updated.
+- `README.md`: new `gateway_recover` subsection added under "Error/Alert Events", alongside the existing `delivery_failed`/`gateway_alert` documentation.
+- `CODE_SEQUENCE_DIAGRAM.md` §10.1–10.4 updated to show the recovery branch.
+
+### Open Questions
+
+1. `type: "gateway_recover"` was chosen to parallel `gateway_alert` — not yet confirmed against whatever the backend/orchestrator consumer expects to see on `Q_CHANNEL_OUT`. Worth a quick check before/while wiring up the consumer side.
+2. Not yet exercised against a real `gateway_alert` → recovery cycle in testing (per user, this is the reason the recovery-transition log line was placed where it is) — worth a manual pass (force a 401/unreachable state, then let a send succeed again) once RabbitMQ/consumer wiring is available to confirm the once-per-incident behaviour holds end-to-end.
+
+---
+
+## FIX — CCR-019: restart silently orphaned the `gateway_recover` counterpart for a 401/404 `gateway_alert`
+
+Status: **Implemented.** Fixes the Medium-severity finding identified in the fourth follow-up compliance review (2026-09-08) of the `gateway_recover` feature above — see `CODE_NON_COMPLIANCE.md`.
+
+### Context
+
+`_alert_armed`/`_consecutive_failures` (`utils_queue/error_handling.py`) were plain in-memory globals, reset on every process restart. For the two Tier 2 reasons that fire immediately (`"unauthorized"`/`"not_found"`, i.e. a 401/404), the realistic and near-universal fix is updating `TELEGRAM_BOT_TOKEN` and restarting the container — `TELEGRAM_BOT_TOKEN` is read exactly once at `config.py::Settings.__init__()`, with no runtime reload path anywhere in the codebase. That restart reset `_alert_armed` back to `True` before the first post-fix send ever ran, so `record_send_success()`'s `was_alerted = not _alert_armed` check could never observe the prior alert — the orchestrator was left with a permanently "open" incident for the single most deterministic Tier 2 trigger, even though the gateway was healthy again.
+
+### Decisions
+
+- **Persisted only the armed/disarmed flag, not the consecutive-failure counter.** `_consecutive_failures` resetting to `0` on restart is separate, already-accepted behaviour (per the module's own pre-existing Notes: "a restart is itself a fresh start at reassessing whether Telegram is reachable") — CCR-019 was specifically about the armed flag orphaning `gateway_recover`, not about the counter. Widening the fix to persist the counter too was considered and rejected as scope creep beyond what the finding actually described.
+- **New Redis key `tier2_alert_armed`** (`"1"`/`"0"`, no TTL) — same rationale as `pending_reset:<chat_id>`: must outlive an unbounded outage, resolved only by an explicit write, never by expiry.
+- **Written only on the actual transition**, not on every send/failure — mirrors the existing once-per-incident restraint already governing `_push_tier2_gateway_alert()`/`_push_tier2_gateway_recover()`, and keeps the added Redis write volume proportional to genuine incidents rather than every message.
+- **Loaded once at startup** via a new `load_tier2_alert_state()`, called from `initialise_application()` right after `initialise_redis_connection()` — chosen over relying on `_get_redis_client()`'s incidental lazy-init (which would technically also work, since `start_queue_consumer()` runs before Redis is explicitly initialised) for consistency with every other restart-relevant state sweep in this file (`close_orphaned_drafts()`, `close_orphaned_polls()`, `resync_pending_resets()`).
+- **`get_tier2_alert_armed()` defaults to `True` (armed)** on a missing key or a Redis read failure — matches the module's own pre-existing in-memory default, so an unwritten/unreadable key behaves exactly as "no incident on record" rather than fabricating a false alert.
+- **Does not address CCR-020 or CCR-021.** The persist call (`set_tier2_alert_armed()`) is itself added outside `_lock` alongside the existing `_push_tier2_gateway_*()` calls, same ordering shape CCR-020 already flags — this fix does not widen or narrow that gap, it was explicitly scoped to CCR-019 only.
+
+### Implementation Notes
+
+- `utils_redis/database.py`: new `get_tier2_alert_armed()` / `set_tier2_alert_armed(armed)`.
+- `utils_queue/error_handling.py`: new `load_tier2_alert_state()`; `record_send_success()` and `record_send_failure()` each call `set_tier2_alert_armed()` on their respective transition; module header Notes updated.
+- `utilities/initialise.py`: imports and calls `load_tier2_alert_state()` after `initialise_redis_connection()`; module header Notes updated.
+- `README.md`: `gateway_alert` section notes the armed flag now survives a restart.
+- `CODE_SEQUENCE_DIAGRAM.md`: §1.1-1.3 cold start updated with the new startup call; §10.1-10.4 updated with the persist calls; new §10.6 added for the startup restore path.
+
+### Open Questions
+
+1. Whether `CODE_NON_COMPLIANCE.md` should be updated to mark CCR-019 Resolved is a call for whoever owns that document next — it's treated as an immutable compliance record here and was not modified as part of this session.
+2. Same caveat as the `gateway_recover` feature itself — not yet exercised end-to-end (kill the process mid-incident, restart, confirm the next successful send fires `gateway_recover`) since RabbitMQ/consumer wiring for manual testing wasn't available in this session.
+
+---
+
+## FIX — `_redis_write()`/`_redis_read()` had no retry, unlike their sibling `_redis_delete()`
+
+Status: **Implemented.** Surfaced while adding `get_tier2_alert_armed()`/`set_tier2_alert_armed()` for the CCR-019 fix above — those two were pointed out as missing retry, which led to auditing every function in `utils_redis/database.py` for the same gap.
+
+### Context
+
+`_redis_delete()` has always retried a raised exception up to `REDIS_TASK_MAX_ATTEMPTS` times. `_redis_write()`/`_redis_read()` — the two most-reused primitives in the file — never did; a single attempt, any exception caught and swallowed into `False`/`None`. Every function built directly on top of them (rather than hand-rolling its own retry loop the way `get_task_mapping()`/`get_chat_draft()`/`get_poll_mapping()` did) silently inherited that gap. A full audit of every function in the file was given to the user directly (not reproduced here) before this fix; this entry only records the fix itself.
+
+### Decisions
+
+- **Retry ownership moved into `_redis_write()`/`_redis_read()` themselves**, mirroring `_redis_delete()`'s existing shape exactly (bounded loop, `REDIS_TASK_MAX_ATTEMPTS`/`REDIS_TASK_RETRY_DELAY`, warn-and-retry then exception-log-and-return on exhaustion) — rather than adding a retry loop to each individual caller, per explicit instruction.
+- **`get_task_mapping()`, `get_chat_draft()`, `get_poll_mapping()` had their own duplicate hand-rolled retry loop removed**, now a single call to `_redis_read()` — retry ownership moved to the primitive, not left duplicated in both places (which would have meant a nested-retry budget for these three specifically, on top of being redundant code).
+- **No change to functions that already call `_redis_write()`/`_redis_read()` directly with no loop of their own** (`create_chat_draft()`, `update_poll_answer()`, `_get_or_create_session()`, `generate_session()`'s session read, `set_pending_reset()`, `_get_pending_reset_info()`/`get_pending_reset()`, `reset_session()`'s initial read, `get_tier2_alert_armed()`/`set_tier2_alert_armed()`) — these all gain retry automatically now, with zero code changes needed, since they were already delegating to the primitives.
+- **`create_task_mapping()` — its retry/regeneration loop was removed entirely (follow-up, same session, corrected after an intermediate fix left the underlying problem in place).** An first attempt at this only removed the loop's own `time.sleep(REDIS_TASK_RETRY_DELAY)`, but left the loop itself regenerating a new `task_id` and calling `_redis_write()` again on *any* `False` — which is still "retrying because `_redis_write()` failed," just without the sleep, since `_redis_write()`'s own internal retry and an `nx=True` collision are indistinguishable from its `bool` return alone. Corrected to a single attempt: one `uuid4().hex`, one `_redis_write()` call, `False` treated as final. `_redis_write()` already retries a connection-level failure internally before ever returning `False`, so there is nothing left for this function to usefully retry; a `uuid4()` collision is a ~1-in-2^122 event, not worth a dedicated retry path on its own. `_redis_write()` still can't distinguish a collision from an exhausted write failure — moot now, since neither case is retried here anymore.
+- **`create_poll_mapping()`'s primary write** (previously a single, non-retried `_redis_write()` call — the inconsistency flagged against `create_task_mapping()` in the earlier audit) **now retries for free**, with no code change of its own needed, since it already called `_redis_write()` directly.
+- **Raw `client.X()` calls that bypass `_redis_write()`/`_redis_read()`/`_redis_delete()` entirely were left untouched** — the `sadd`/`srem` index-maintenance calls (documented best-effort elsewhere in this file), `scard()`/`smembers()` reads (`has_open_tasks()`, `get_session_poll_ids()`, `reset_session()`'s task-id read), and the `scan_iter()`-based startup sweeps (`get_all_chat_draft_ids()`, `get_all_poll_ids()`, `get_all_pending_resets()`). Out of scope for this change, which was specifically about `_redis_write()`/`_redis_read()`.
+
+### Implementation Notes
+
+- `utils_redis/database.py`: `_redis_write()`, `_redis_read()` — added retry loop, docstrings updated. `get_task_mapping()`, `get_chat_draft()`, `get_poll_mapping()` — own retry loop removed, now delegate to `_redis_read()`, docstrings updated.
+- **Minor logging precision trade-off, accepted, not fixed further**: `get_task_mapping()` logs `"No task mapping found ... (expired or unknown)"` whenever `_redis_read()` returns `None` — which is now also true after retries are exhausted on a genuine connection failure (previously that case returned early from within the loop, before this log line, with its own distinct exception log instead). A real outage now logs both an accurate `ERROR`-level `_redis_read()` exhaustion message and a slightly misleading `WARNING`-level "expired or unknown" line immediately after. Cosmetic, not a correctness issue (both cases still correctly return `None`) — flagged rather than silently left unmentioned.
+
+### Open Questions
+
+1. ~~Whether to also route the `sadd`/`srem`/`scard`/`smembers`/`scan_iter` raw calls through retrying helpers is a separate, broader change.~~ **Done — see the follow-up entry below.**
+
+---
+
+## FIX — remaining raw `sadd`/`srem`/`scard`/`smembers`/`scan_iter` calls given retry (High/Medium) or a ping-first, exception-surfacing guard (Low)
+
+Status: **Implemented.** Closes the open question above. Follows directly from a per-call-site risk analysis given to the user first (not reproduced in full here — see chat history): each of the 10 remaining raw call sites was ranked High/Medium/Low by what actually breaks downstream if it silently fails, not just "is it retried today."
+
+### Context
+
+After `_redis_write()`/`_redis_read()`/`_redis_delete()` gained retry, 10 call sites across 8 functions still used the raw Redis client directly for operations those three primitives don't cover - SET membership (`sadd`/`srem`/`scard`/`smembers`) and keyspace sweeps (`scan_iter`). Each was single-attempt, catch-and-swallow.
+
+### Decisions
+
+- **High priority (real gap, undermines a documented safety guarantee) - given a proper retrying primitive:**
+  - `create_task_mapping()`'s `sadd` (session_tasks index) - a failed index write here can make `has_open_tasks()` wrongly report a chat as fully idle while a task is still genuinely open, letting a `session_reset` apply immediately when it should defer - the exact scenario the deferred-reset feature exists to prevent.
+  - `reset_session()`'s `smembers` (session_tasks read) - a failed read here means `reset_session()` still wipes `session_tasks:<chat_id>`/`session:<chat_id>` regardless, silently orphaning whatever task_ids it couldn't read, which undermines the function's own documented guarantee that a stale task_id is dropped after a reset.
+- **Medium priority (real gap, but backstopped or narrower blast radius) - given the same retrying primitive treatment as High:**
+  - `delete_task_mapping()`'s `srem` - a ghost `session_tasks` entry is already backstopped by `PENDING_RESET_MAX_WAIT_SECONDS` (TODO.md §8).
+  - `create_poll_mapping()`'s `sadd` - a poll always has an open `task_id` tracked separately, so this only affects the defensive force-through poll-stop sweep, not deferred-reset correctness itself.
+  - `get_session_poll_ids()`'s `smembers` - same narrower consequence as above (one poll possibly left open on Telegram's side after a forced reset), not a safety break.
+  - New primitives added: `_redis_sadd()`, `_redis_srem()`, `_redis_smembers()` (`utils_redis/database.py`), mirroring `_redis_write()`/`_redis_read()`/`_redis_delete()`'s exact retry shape (`REDIS_TASK_MAX_ATTEMPTS`/`REDIS_TASK_RETRY_DELAY`). All 5 call sites above now go through one of these instead of a raw `_get_redis_client().sadd(...)`/`.srem(...)`/`.smembers(...)` call.
+- **Low priority (already fine as-is, per the earlier analysis) - given a cheaper treatment instead, per explicit instruction: a `_redis_ping()` pre-check (same retry shape) before the raw command, with a failed ping treated exactly like any other failure that function already handles - same existing fallback value, no new return type:**
+  - `delete_poll_mapping()`'s `srem` - a ghost entry here is already absorbed gracefully downstream by `stop_poll_for_reset()`'s existing no-op-on-unknown-poll_id handling.
+  - `has_open_tasks()`'s `scard` - already had a deliberate fail-safe (`True`, "still open") that a retry would just delay reaching.
+  - `get_all_chat_draft_ids()`/`get_all_poll_ids()`'s `scan_iter` - startup-only, run right after Redis is confirmed reachable, each record backstopped by its own TTL.
+  - `get_all_pending_resets()`'s `scan_iter` + raw `client.get()` - also runs periodically (the ceiling sweep), so a single failed cycle self-heals on the next tick.
+  - New `_redis_ping()` added (`utils_redis/database.py`), same retry shape as the other primitives, returning a plain `bool` (like every other primitive in the file) - logs the underlying exception itself before returning `False`, same as the rest.
+  - **Went through two incorrect intermediate versions before landing here** - first `_redis_ping()` itself returned the caught exception (rejected: coupled every caller to `_redis_ping()`'s internal exception type); then each of the 5 callers built and returned a *new*, function-specific `Exception` instance on a failed ping (rejected: not what was asked - see below). **Corrected, final design**: `if not _redis_ping():` in each of the 5 functions logs an error and returns/falls through to that same function's own pre-existing failure fallback (`get_all_chat_draft_ids()`/`get_all_poll_ids()`/`get_all_pending_resets()` → `[]`; `has_open_tasks()` → `True`; `delete_poll_mapping()` → skips the `srem` attempt and falls through to its unrelated `deleted` return value, unchanged). **No return type of any of the 5 functions changed** - each keeps its original signature (`list[int]`, `list[str]`, `list[tuple[...]]`, `bool`, `bool`) exactly as it was before this whole `_redis_ping()` change, since a ping failure is no longer a distinguishable case at all from any other failure that function already tolerated.
+- **No caller changes needed anywhere** - since none of the 5 functions' return contracts changed, `image_draft_handler.py::close_orphaned_drafts()`, `poll_response_handler.py::close_orphaned_polls()`, and `session_reset_handler.py::resync_pending_resets()`/`_enforce_pending_reset_ceiling()` are all back to their original, untouched form (an earlier intermediate version had added `isinstance(result, Exception)` guards to these; removed once the return-type change itself was reverted).
+
+### Implementation Notes
+
+- `utils_redis/database.py`: `_redis_sadd()`, `_redis_srem()`, `_redis_smembers()`, `_redis_ping()` added. `create_task_mapping()`, `delete_task_mapping()`, `create_poll_mapping()`, `get_session_poll_ids()`, `reset_session()` updated to use the new High/Medium primitives. `has_open_tasks()`, `get_all_chat_draft_ids()`, `get_all_poll_ids()`, `get_all_pending_resets()`, `delete_poll_mapping()` updated with the ping-first guard, each falling back to its own pre-existing failure value on a failed ping - no signature changes.
+
+### Open Questions
+
+1. `get_all_pending_resets()`'s raw `client.get(key)` inside its `scan_iter` loop still bypasses `_redis_read()` even after this change - covered by the same up-front `_redis_ping()` guard as the `scan_iter` call itself, but not given its own dedicated retry. Consistent with treating this function's Low-tier ranking as a whole, not fixed further.
+2. Whether `CODE_NON_COMPLIANCE.md` should be revisited given this closes most of the retry gaps identified in the earlier audit is a call for whoever owns that document next - not modified as part of this session.

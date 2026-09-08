@@ -119,6 +119,10 @@ class Settings:
         # utils_redis/database.py) - a gateway_alert notification email fires at most once per this many
         # seconds (default 24h), no matter how many gateway_alert events arrive in between. Every
         # occurrence is still counted in Redis regardless of whether an email is actually sent for it.
+        # Also used as a fixed (non-renewed) Redis TTL on both the occurrence counter and the notification
+        # cooldown - see utils_redis/database.py's module Notes for why it is deliberately NOT refreshed on
+        # every occurrence (a sliding/renewed TTL could never expire if occurrences never stopped arriving,
+        # which would make the fallback reset impossible).
         DEFAULT_GATEWAY_ALERT_NOTIFY_COOLDOWN_SECONDS           = 86400
         self.GATEWAY_ALERT_NOTIFY_COOLDOWN_SECONDS              = get_env_int("GATEWAY_ALERT_NOTIFY_COOLDOWN_SECONDS", DEFAULT_GATEWAY_ALERT_NOTIFY_COOLDOWN_SECONDS)
 

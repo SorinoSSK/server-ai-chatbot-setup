@@ -118,6 +118,7 @@ Exits `0` on success, `1` on failure - check the container logs (`data/logs/bot_
 - **SMTP credentials are never logged in full** - `SMTP_FROM_EMAIL`/`SMTP_USERNAME`/`SMTP_PASSWORD` are only ever logged as `<set>`/`<unset>`, never any part of the actual value.
 - **A separate Redis ACL user for this application** - `REDIS_USERNAME`/`REDIS_PASSWORD` are a distinct login from `telegram_gateway`'s own Redis credentials, scoped (via Redis ACL, `~bot_sanctuary:*`) to only this application's own keys, even though both share the same Redis container.
 - **The `gateway_alert` throttle fails open on a Redis outage** - if Redis is unreachable, a notification is still allowed to send rather than being silently suppressed. Missing the throttle occasionally (an over-notification) is judged less harmful than a total alerting blackout on the one path that exists specifically to warn a human something else is broken.
+- **The occurrence counter and notification cooldown both carry a fixed, guaranteed `GATEWAY_ALERT_NOTIFY_COOLDOWN_SECONDS` (default 24h) fallback expiry, via Redis TTL, not a `telegram_gateway` signal** - `bot_sanctuary:gateway_alert:count` gets its TTL applied once, the first time it's created for a fresh window; `bot_sanctuary:gateway_alert:last_notified_at` gets its TTL set on every write (i.e. every successful notification). Neither TTL is refreshed/extended by a later occurrence - deliberately: a TTL renewed on every occurrence could never expire for as long as occurrences kept arriving, which would make the fallback reset impossible during a sustained incident. Both keys therefore always self-clear exactly `GATEWAY_ALERT_NOTIFY_COOLDOWN_SECONDS` after being written, regardless of how much more data shows up in between - entirely self-contained to this application, no `telegram_gateway` signal required.
 
 ### Limitations
 - The session-routing/per-session worker pipeline (the actual agent Call pipeline this application exists to run) is not implemented yet - every consumed RabbitMQ message that would route to a session is currently logged and dropped. See `CODE_TODO.md` §3.
@@ -172,7 +173,7 @@ Exits `0` on success, `1` on failure - check the container logs (`data/logs/bot_
 #### gateway_alert Throttle
 | Variable | Purpose |
 |---------|---------|
-| GATEWAY_ALERT_NOTIFY_COOLDOWN_SECONDS | Minimum time between `gateway_alert` notification emails (default 86400 = 24h) - every occurrence is still counted regardless. |
+| GATEWAY_ALERT_NOTIFY_COOLDOWN_SECONDS | Minimum time between `gateway_alert` notification emails (default 86400 = 24h) - every occurrence is still counted regardless. Also the fixed, non-renewed Redis TTL fallback on both the occurrence counter and the notification cooldown - see Design Decisions above. |
 
 #### Redis Connection (gateway_alert throttle only)
 | Variable | Purpose |
@@ -219,7 +220,7 @@ flowchart TD
     GA -.-> GA1
 
     subgraph GAFlow["_handle_gateway_alert() (message_handler.py)"]
-        GA1["record_gateway_alert_occurrence() - Redis counter, always"] --> GA2{"should_notify_gateway_alert()? (Redis cooldown, fails open)"}
+        GA1["record_gateway_alert_occurrence() - Redis counter, always - fixed TTL set once per fresh window"] --> GA2{"should_notify_gateway_alert()? (Redis cooldown, fails open)"}
         GA2 -- no --> GA3["log INFO - suppressed"]
         GA2 -- yes --> GA4["send_mail() to SMTP_TO_EMAIL"]
         GA4 -- sent --> GA5["mark_gateway_alert_notified()"]

@@ -7,6 +7,7 @@
 # Features    :
 #   - RabbitMQ queue initialisation.
 #   - Redis connection initialisation.
+#   - Loads Tier 2's armed/disarmed alert state from Redis, so a gateway_alert left outstanding by a prior run still receives its paired gateway_recover (see CCR-019, CODE_NON_COMPLIANCE.md).
 #   - Closes out drafts and polls orphaned by a previous run before polling resumes.
 #   - Resyncs any deferred session_reset that became resolvable while the gateway was down, and starts the periodic backstop that force-applies one that's been pending too long regardless.
 #
@@ -27,6 +28,7 @@ from .utils_queue.queue import (
     close_rabbitmq_connection
 )
 from .utils_redis.database import initialise_redis_connection, close_redis_connection
+from .utils_queue.error_handling import load_tier2_alert_state
 from .utils_telegram.gateway_inbound import poll_updates, stop_polling
 from .utils_telegram.utilities.image_draft_handler import close_orphaned_drafts
 from .utils_telegram.utilities.poll_response_handler import close_orphaned_polls
@@ -62,6 +64,7 @@ def initialise_application() -> None:
     start_queue_consumer()
 
     initialise_redis_connection()
+    load_tier2_alert_state()
     close_orphaned_drafts()
     close_orphaned_polls()
 
