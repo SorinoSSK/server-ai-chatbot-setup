@@ -298,6 +298,7 @@ reset_session(chat_id)                         <- everything below keyed by the 
 | REDIS_HEALTH_CHECK_INTERVAL | How often the Redis client proactively pings the connection to detect a stale/dead socket. |
 | REDIS_TASK_RETRY_DELAY / REDIS_TASK_MAX_ATTEMPTS | Retry behaviour for Redis reads/writes. |
 | REDIS_TASK_MAPPING_TTL_SECONDS | Expiry for a `task_id` -> `chat_id`/`user_id` mapping. |
+| REDIS_FORCE_INFINITE_RETRY | Whether `initialise_redis_connection()` retries the startup connection indefinitely (`true`) or gives up after one attempt (`false`, default). |
 
 ### Task Queue Payload (gateway -> backend)
 

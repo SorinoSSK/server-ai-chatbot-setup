@@ -76,6 +76,9 @@ def initialise_redis_connection() -> None:
 
                 except redis.exceptions.RedisError as e:
                     _client = None
+                    if not _should_redis_retry_infinite():
+                        logger.warning(f"Redis not reachable at startup: {e}. REDIS_FORCE_INFINITE_RETRY is disabled - giving up.")
+                        break
                     logger.warning(f"Redis not reachable yet at startup: {e}. Retrying in {settings.REDIS_CONNECT_RETRY_DELAY_SECONDS}s...")
                     time.sleep(settings.REDIS_CONNECT_RETRY_DELAY_SECONDS)
         else:
@@ -119,6 +122,20 @@ def close_redis_connection() -> None:
             _client.close()
             _client = None
             logger.info("Redis connection has been closed.")
+
+def _should_redis_retry_infinite() -> bool:
+    """
+    Checks whether a Redis operation should retry indefinitely instead of giving up after a bounded number of
+    attempts.
+
+    Args:
+        None
+
+    Returns:
+        bool:
+            settings.REDIS_FORCE_INFINITE_RETRY - see module Notes for the trade-off this represents.
+    """
+    return settings.REDIS_FORCE_INFINITE_RETRY
 
 def _redis_write(key: str, value: str, ttl_seconds: int | None = None, nx: bool = False) -> bool:
     """

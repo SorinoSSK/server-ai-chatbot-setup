@@ -202,6 +202,7 @@ class Settings:
         DEFAULT_REDIS_TASK_MAX_ATTEMPTS                         = 5
         DEFAULT_REDIS_TASK_MAPPING_TTL_SECONDS                  = 86400
         DEFAULT_REDIS_CONNECT_RETRY_DELAY_SECONDS               = 5      # delay between startup connection attempts while Redis is not yet reachable (see initialise_redis_connection())
+        DEFAULT_REDIS_FORCE_INFINITE_RETRY                      = False
         self.REDIS_HOST                                         = os.getenv("REDIS_HOST") or DEFAULT_REDIS_HOST
         self.REDIS_PORT                                         = get_env_int("REDIS_PORT", DEFAULT_REDIS_PORT)
         self.REDIS_USERNAME                                     = os.getenv("REDIS_USERNAME") or DEFAULT_REDIS_USERNAME
@@ -215,6 +216,7 @@ class Settings:
         self.REDIS_TASK_MAX_ATTEMPTS                            = get_env_int("REDIS_TASK_MAX_ATTEMPTS", DEFAULT_REDIS_TASK_MAX_ATTEMPTS)
         self.REDIS_TASK_MAPPING_TTL_SECONDS                     = get_env_int("REDIS_TASK_MAPPING_TTL_SECONDS", DEFAULT_REDIS_TASK_MAPPING_TTL_SECONDS)
         self.REDIS_CONNECT_RETRY_DELAY_SECONDS                  = get_env_int("REDIS_CONNECT_RETRY_DELAY_SECONDS", DEFAULT_REDIS_CONNECT_RETRY_DELAY_SECONDS)
+        self.REDIS_FORCE_INFINITE_RETRY                         = get_env_bool("REDIS_FORCE_INFINITE_RETRY", DEFAULT_REDIS_FORCE_INFINITE_RETRY)
 
 def get_env_int(name: str, default: int, minimum: int = 1) -> int:
         """
