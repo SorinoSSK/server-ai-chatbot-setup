@@ -14,7 +14,8 @@ bot_sanctuary/bot_sanctuary_application
 - Python 3.12 (`python:3.12.4-slim` base image)
 - Runs as a Docker container on the project's isolated bridge network (`chatbot-app-network`)
 - Depends on RabbitMQ for internal messaging (see `utilities/utils_queue/queue.py`)
-- Depends on the Claude Agent SDK (`LLM_OAUTH_TOKEN`) for the agent pipeline
+- Depends on the Claude Agent SDK for the agent pipeline
+- All four LLM providers are wired (see `utilities/utils_agents/`), each with its own per-provider credential (`LLM_CLAUDE_*`/`LLM_CODEX_*`/`LLM_DEEPSEEK_*`/`LLM_QWEN_*` - see Environment Variables below) - more than one can be configured at once: `claude` via the Claude Agent SDK, `codex` via shelling out to its own CLI's `codex exec` non-interactive mode (no OpenAI/Codex Python SDK dependency exists), and `deepseek`/`qwen` via a direct REST call to their own OpenAI-compatible chat completions endpoint (stdlib `urllib`, no SDK dependency either). `claude`/`codex` CLIs are both also installed natively in the image (see "LLM Provider CLI Login" below) for their OAuth login flows. `deepseek`/`qwen` are API-key-only - neither has an OAuth mechanism today (DeepSeek never has; Qwen's free OAuth tier was discontinued 2026-04-15) - so no CLI/login step applies to either.
 - Optionally depends on an SMTP relay for Tier 2 (`gateway_alert`) alerting (see `utilities/utils_smtp/smtp_handler.py`) - inert until explicitly configured
 - Optionally depends on Redis, for a durable, once-per-day throttle on `gateway_alert` notification emails (see `utilities/utils_redis/database.py`) - not a hard startup dependency; connects lazily and fails open if unreachable
 
@@ -24,6 +25,7 @@ bot_sanctuary/bot_sanctuary_application
 - `utilities/initialise.py` - startup/shutdown orchestration (`initialise_application()` / `terminate_application()`).
 - `utilities/logging_setup.py` - console and rotating file logging configuration.
 - `utilities/utilities.py` - shared, dependency-free helpers (e.g. `ShutdownSignal`).
+- `utilities/utils_agents/` - `agent_interface.py::query_llm(llm_type, prompt)` dispatches to an explicitly-named provider (no single global "current" provider), plus one `<provider>_interface.py` per provider: `claude_interface.py` (Claude Agent SDK), `codex_interface.py` (shells out to the `codex` CLI), `deepseek_interface.py`/`qwen_interface.py` (direct REST call to each provider's own OpenAI-compatible endpoint, stdlib `urllib`, no SDK dependency). Each exposes `query_via_oauth(prompt, token)`/`query_via_api(prompt, token)` - a pure function of its arguments, not global config state - `deepseek`/`qwen`'s own `query_via_oauth()` is a "not supported" stub, since neither provider has an OAuth mechanism (see their own module Notes).
 - `utilities/utils_queue/` - RabbitMQ connection lifecycle (single shared consume connection, per-thread `RabbitMQPublisher`) and inbound message dispatch.
 - `utilities/utils_smtp/` - SMTP send/test capability for Tier 2 alerting.
 - `utilities/utils_redis/` - Redis-backed `gateway_alert` notification throttle (occurrence count + last-notified timestamp), plus a durable, crash-recovery active-task record (see `utilities/utils_session/`).
@@ -37,7 +39,7 @@ bot_sanctuary/bot_sanctuary_application
 1. Ensures `DATA_DIR` exists and configures logging (`setup_logging()`).
 2. Registers `SIGINT`/`SIGTERM` handlers against a shared `ShutdownSignal`.
 3. Calls `initialise_application()` (`utilities/initialise.py`), which:
-   - Runs a one-off `LLM_OAUTH_TOKEN` startup smoke test (`test_llm_oauth_token()`) - logged, never crashes startup on failure.
+   - Runs a one-off startup smoke test (`test_llm_tokens()`) for every LLM provider that has a credential configured - logged, never crashes startup on failure.
    - Opens the RabbitMQ consume connection (retrying indefinitely if not yet reachable - see "Design Decisions" below).
    - Runs the crash-recovery sweep (`resync_orphaned_sessions()`) - see "Crash recovery" below - **before** starting the consumer thread, so no new task can race it.
    - Starts the background consumer thread.
@@ -99,6 +101,23 @@ docker stop <docker-container-name>
 docker restart <docker-container-name>
 ```
 
+#### LLM Provider CLI Login
+The `claude` and `codex` CLIs are both installed natively into the image (see Dockerfile). Each persists its own login/session state to its own subfolder of a single bind-mounted host directory, `bot_directory` (`bot_directory/claude` → `~/.claude`, `bot_directory/codex` → `~/.codex` - see `compose.dev.yml`/`setup.sh`), so a login survives a container recreation. `bot_directory/qwen`/`bot_directory/deepseek` are provisioned the same way (one subfolder per provider) but have no CLI login step of their own - `qwen`/`deepseek` are API-key-only (see Infrastructure above), no CLI is installed for either, and neither subfolder is actually read from at runtime; `deepseek`'s in particular is kept purely as a placeholder, since DeepSeek has no official CLI at all. Each provider now has its own independent access type/credential pair (`LLM_<PROVIDER>_ACCESS_TYPE`/`LLM_<PROVIDER>_TOKEN` - see Environment Variables below) - more than one provider can be configured (and startup-tested) at once. With a given provider's own `ACCESS_TYPE="OAUTH"` (`claude`/`codex` only), its persisted login session is what's actually used at runtime; with `ACCESS_TYPE="API"` (the only supported value for `deepseek`/`qwen`), that provider's own `TOKEN` (an API key) is used instead and no login is required.
+
+**Claude** - generates the long-lived token the application uses when `LLM_CLAUDE_ACCESS_TYPE="OAUTH"` (see Environment Variables below):
+```bash
+docker exec -it <container_name> claude setup-token
+```
+Complete the printed browser step, then copy the resulting token into `config.ini`'s `CHATBOT_LLM_CLAUDE_TOKEN` (with `CHATBOT_LLM_CLAUDE_ACCESS_TYPE="OAUTH"`) and restart the container. `setup-token` is used deliberately over `claude login` - its token is long-lived (about a year) and avoids a documented refresh bug affecting `--print`/headless login flows.
+
+**Codex** (OpenAI) - installed alongside `claude`, same OAuth login pattern:
+```bash
+docker exec -it <container_name> codex login
+```
+Complete the printed browser step. Credentials land in `~/.codex/auth.json`, inside the persisted `bot_directory/codex` mount. With `LLM_CODEX_ACCESS_TYPE="OAUTH"`, `codex_interface.py` shells out to `codex exec` with no `OPENAI_API_KEY` set, so this logged-in session is what's actually used - no `LLM_CODEX_TOKEN` needed in that case. With `LLM_CODEX_ACCESS_TYPE="API"` instead, `LLM_CODEX_TOKEN` (an OpenAI API key) is bridged into `OPENAI_API_KEY` for that call instead, and this login step isn't needed.
+
+**DeepSeek** / **Qwen** - no CLI, no login step. Set `LLM_DEEPSEEK_ACCESS_TYPE`/`LLM_QWEN_ACCESS_TYPE` to `"API"` (the only value either supports - the default already), and `LLM_DEEPSEEK_TOKEN`/`LLM_QWEN_TOKEN` to that provider's own API key (a DeepSeek platform key, or a DashScope/OpenAI-compatible key for Qwen). `deepseek_interface.py`/`qwen_interface.py` call each provider's own OpenAI-compatible REST endpoint directly with that key - no OAuth path exists for either.
+
 #### Testing SMTP Configuration
 Once `SMTP_ENABLE_MAILER=true` and the other `SMTP_*` settings are configured (see Environment Variables below), verify the configuration actually works end-to-end - without waiting for a real `gateway_alert` to happen - by triggering the test function manually:
 ```bash
@@ -142,6 +161,9 @@ Exits `0` on success, `1` on failure - check the container logs (`data/logs/bot_
 - The crash-recovery startup sweep (`resync_orphaned_sessions()`) currently over-triggers: since the agent Call pipeline doesn't yet reliably mark every task complete, it requests a `session_reset` for every chat with unresolved history on *every* restart, not just a genuine crash. Accepted for now, per explicit instruction - see `CODE_TODO.md` §3.
 - The `gateway_alert` throttle window is a rolling cooldown from the last notification, not a calendar-day reset - two notifications could still land close together either side of local midnight.
 - Requires RabbitMQ to be reachable at startup (retries indefinitely rather than failing). Redis is not required at startup - see Design Decisions above.
+- `codex_interface.py` shells out to the `codex` CLI (`codex exec`) rather than using a Python SDK - there is no OpenAI/Codex Python SDK dependency installed.
+- `config.py`'s `LLM_CHAT_TYPE` is forward-declared groundwork only - nothing calls it yet, since the pipeline it's meant to feed (the multi-agent "Call" model, `CODE_TODO.md` §5) isn't built. Per-Call provider routing (each named Call using its own provider) was proposed and is explicitly on hold until that pipeline exists - see `CODE_TODO.md` §2.
+- `qwen_interface.py`'s DashScope endpoint/model (`_API_URL`/`_MODEL`) are unconfirmed assumptions, not verified against a real account - DashScope publishes region-specific base URLs and this defaults to the international one; the model name is a reasonable-guess default. See `CODE_TODO.md` §2 before relying on this in a real deployment.
 
 ### Environment Variables
 
@@ -153,10 +175,17 @@ Exits `0` on success, `1` on failure - check the container logs (`data/logs/bot_
 | LOG_RETENTION_DAYS | Number of rotated log files kept before deletion. |
 
 #### LLM Provider
+More than one provider's credentials can be configured (and startup-tested) at once - there is no single "current" provider. `utilities/utils_agents/agent_interface.py::query_llm(llm_type, prompt)` takes `llm_type` as an explicit argument per call, rather than reading one global setting.
+
 | Variable | Purpose |
 |---------|---------|
-| LLM_TYPE | LLM provider identity - only `"claude"` is currently supported by the startup smoke test. |
-| LLM_OAUTH_TOKEN | Claude Agent SDK OAuth credential, bridged into `CLAUDE_CODE_OAUTH_TOKEN` at the one call site that needs it. |
+| LLM_CHAT_TYPE | Which provider the (not yet implemented) chat pipeline itself would use - `"claude"`, `"codex"`, `"deepseek"`, or `"qwen"`. **Forward-declared groundwork only - nothing reads this yet**, since the pipeline it's meant to feed (`CODE_TODO.md` §5) isn't built. Per-Call provider routing (each named Call using its own provider) is on hold until then - see `CODE_TODO.md` §2. |
+| LLM_CLAUDE_ACCESS_TYPE / LLM_CLAUDE_TOKEN | Claude's own access type (`"OAUTH"` or `"API"`) and credential. Bridged into `CLAUDE_CODE_OAUTH_TOKEN`/`ANTHROPIC_API_KEY` respectively (`claude_interface.py`). |
+| LLM_CODEX_ACCESS_TYPE / LLM_CODEX_TOKEN | Codex's own access type (`"OAUTH"` or `"API"`) and credential. `"API"` bridges the token into `OPENAI_API_KEY` for that `codex exec` call only (`codex_interface.py`); `"OAUTH"` ignores the token entirely and relies on the CLI's own persisted login session. |
+| LLM_DEEPSEEK_ACCESS_TYPE / LLM_DEEPSEEK_TOKEN | DeepSeek's own access type (defaults to `"API"`, the only value it supports) and API key, sent as a plain `Authorization: Bearer` header (`deepseek_interface.py`). |
+| LLM_QWEN_ACCESS_TYPE / LLM_QWEN_TOKEN | Qwen's own access type (defaults to `"API"`, the only value it supports today) and API key, sent as a plain `Authorization: Bearer` header (`qwen_interface.py`). |
+
+`"OAUTH"` only actually works for `claude`/`codex` - setting `LLM_DEEPSEEK_ACCESS_TYPE`/`LLM_QWEN_ACCESS_TYPE` to `"OAUTH"` reaches that module's own `query_via_oauth()` stub, which logs a warning and returns `None` rather than doing anything, since neither provider has an OAuth mechanism today.
 
 #### Bot Identity
 | Variable | Purpose |
@@ -221,7 +250,7 @@ flowchart TD
     Signals --> Init["initialise_application()"]
 
     subgraph INIT["Startup (initialise.py)"]
-        Init --> LLMTest["test_llm_oauth_token() - one-off smoke test, logged, never blocks startup"]
+        Init --> LLMTest["test_llm_tokens() - one-off smoke test per configured provider, logged, never blocks startup"]
         LLMTest --> RMQ["initialise_rabbitmq_connection() - retries indefinitely until reachable"]
         RMQ --> Resync["resync_orphaned_sessions() - group active-task record by session_id, request session_reset per session, mark_task_complete() on success"]
         Resync --> Consumer["start_queue_consumer() - spawn background thread"]
@@ -276,7 +305,7 @@ flowchart TD
     S3 --> Exit(["Process exit"])
 
     RMQ -.->|depends on| RabbitMQ[("RabbitMQ\nchatbot-rabbitmq")]
-    LLMTest -.->|depends on| Claude[("Claude Agent SDK\nLLM_OAUTH_TOKEN")]
+    LLMTest -.->|depends on| Claude[("Claude Agent SDK\nLLM_CLAUDE_ACCESS_TYPE/TOKEN")]
     GA4 -.->|depends on, optional| SMTP[("SMTP relay")]
     GA1 -.->|depends on, optional/lazy| Redis[("Redis\nchatbot-redis")]
 ```

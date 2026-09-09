@@ -23,6 +23,15 @@ USER bot_sanctuary_usr
 # bot_sanctuary_usr's own home (run after the USER switch above) so both the
 # app and an administrator's `docker exec` land on the same installation.
 RUN curl -fsSL https://claude.ai/install.sh | bash
+
+# Native codex CLI (OpenAI) - same installation shape as the claude CLI above: a Node-free,
+# architecture-detecting installer, run after the USER switch, symlinking into the same
+# ~/.local/bin already added to PATH below. Used both for OAuth login (`codex login`, via
+# `docker exec`) and, once logged in, invoked programmatically via `codex exec` (no OpenAI/Codex
+# Python SDK dependency - see bot_sanctuary_application/utilities/utils_agents/codex_interface.py
+# and bot_sanctuary/CODE_TODO.md §2).
+RUN curl -fsSL https://chatgpt.com/codex/install.sh | sh
+
 ENV PATH="/home/bot_sanctuary_usr/.local/bin:${PATH}"
 
 CMD ["python", "-m", "bot_sanctuary_application.main"]

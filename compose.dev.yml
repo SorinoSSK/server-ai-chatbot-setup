@@ -32,8 +32,19 @@ services:
       TZ: "Asia/Singapore"
       Q_USER: "${CHATBOT_RABBITMQ_USERNAME}"
       Q_PASSWORD: "${CHATBOT_RABBITMQ_PASSWORD}"
-      LLM_TYPE: "${CHATBOT_LLM_TYPE}"
-      LLM_OAUTH_TOKEN: "${CHATBOT_LLM_OAUTH_TOKEN}"
+      LLM_CHAT_TYPE: "${CHATBOT_LLM_CHAT_TYPE}"
+      LLM_ARCHITECT_TYPE: "${CHATBOT_LLM_ARCHITECT_TYPE}"
+      LLM_CODER_TYPE: "${CHATBOT_LLM_CODER_TYPE}"
+      LLM_REVIEW_TYPE: "${CHATBOT_LLM_REVIEW_TYPE}"
+      LLM_DOCUMENTATION_TYPE: "${CHATBOT_LLM_DOCUMENTATION_TYPE}"
+      LLM_CLAUDE_ACCESS_TYPE: "${CHATBOT_LLM_CLAUDE_ACCESS_TYPE}"
+      LLM_CLAUDE_TOKEN: "${CHATBOT_LLM_CLAUDE_TOKEN}"
+      LLM_CODEX_ACCESS_TYPE: "${CHATBOT_LLM_CODEX_ACCESS_TYPE}"
+      LLM_CODEX_TOKEN: "${CHATBOT_LLM_CODEX_TOKEN}"
+      LLM_DEEPSEEK_ACCESS_TYPE: "${CHATBOT_LLM_DEEPSEEK_ACCESS_TYPE}"
+      LLM_DEEPSEEK_TOKEN: "${CHATBOT_LLM_DEEPSEEK_TOKEN}"
+      LLM_QWEN_ACCESS_TYPE: "${CHATBOT_LLM_QWEN_ACCESS_TYPE}"
+      LLM_QWEN_TOKEN: "${CHATBOT_LLM_QWEN_TOKEN}"
       TELEGRAM_BOT_NAME: "${CHATBOT_NAME}"
       SMTP_ENABLE_MAILER: "${CHATBOT_SMTP_ENABLE_MAILER}"
       SMTP_FORCE_SSL: "${CHATBOT_SMTP_FORCE_SSL}"
@@ -49,7 +60,10 @@ services:
       REDIS_PASSWORD: "${CHATBOT_BOT_SANCTUARY_REDIS_PASSWORD}"
     volumes:
       - "${DEV_PATH}/${CHATBOT_BOT_SANCTUARY_PATH_NAME}/bot_sanctuary_application:/bot_sanctuary/bot_sanctuary_application"
-      - "${DEV_PATH}/${CHATBOT_BOT_SANCTUARY_PATH_NAME}/bot_directory:/home/bot_sanctuary_usr/.claude"
+      - "${DEV_PATH}/${CHATBOT_BOT_SANCTUARY_PATH_NAME}/bot_directory/claude:/home/bot_sanctuary_usr/.claude"
+      - "${DEV_PATH}/${CHATBOT_BOT_SANCTUARY_PATH_NAME}/bot_directory/codex:/home/bot_sanctuary_usr/.codex"
+      - "${DEV_PATH}/${CHATBOT_BOT_SANCTUARY_PATH_NAME}/bot_directory/qwen:/home/bot_sanctuary_usr/.qwen"
+      - "${DEV_PATH}/${CHATBOT_BOT_SANCTUARY_PATH_NAME}/bot_directory/deepseek:/home/bot_sanctuary_usr/.deepseek"
     depends_on:
       rabbitmq:
         condition: service_healthy

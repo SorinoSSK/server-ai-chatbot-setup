@@ -7,16 +7,33 @@
 # Features    :
 #   - SessionWorker - one long-lived worker per session_id, coalescing queued messages into combined turns.
 #   - Session registry management via get_or_create_session_worker() / remove_session_worker().
+#   - Per-session on-disk directory lifecycle - created per SessionWorker, removed via clear_session_directory().
 #   - Startup crash-recovery sweep requesting a session reset for sessions left dangling by a prior run.
 #   - Graceful, application-wide shutdown that drains and finishes each worker's outstanding work.
 #
 # Notes       :
 #   - stop() abandons whatever remains queued; shutdown() drains it fully - see each method's own docstring.
 #   - See README.md for the full coalescing, crash-recovery, and shutdown design rationale.
+#   - Each SessionWorker's self.session_dir (settings.SESSION_DIR/<session_id>/<generation>) is a fresh,
+#     randomly-named "generation" subfolder created every time a SessionWorker instance is constructed -
+#     not just settings.SESSION_DIR/<session_id> directly. This matters: a future Claude Agent SDK
+#     session-resume feature (bot_sanctuary/CODE_TODO.md §5) would use this path as cwd, and Claude's own
+#     session transcript storage is keyed by the *absolute path string*, in a separate location
+#     (~/.claude/projects/<encoded-cwd>/) that reusing the same directory path would NOT clear just by
+#     deleting and recreating it - a stale prior conversation could still resurface. Giving every generation
+#     its own fresh random path guarantees a brand-new, never-before-seen cwd each time a session restarts,
+#     with no dependency on Claude's own (undocumented, internal) path-encoding scheme. No cwd is actually
+#     passed to any LLM call yet - this is lifecycle scaffolding only, ahead of that wiring.
+#   - No conversation history is written to session_dir today, per explicit instruction ("I do not intend
+#     to keep sessions for now") - clear_session_directory() removes the entire per-session_id folder (all
+#     generations) on session_cleared, and a brand new generation is created the next time that session_id
+#     is used, via get_or_create_session_worker() constructing a fresh SessionWorker.
 #
 # =============================================================================
 # I M P O R T   H E A D E R
 
+import uuid
+import shutil
 import logging
 import queue
 import threading
@@ -57,6 +74,35 @@ def get_or_create_session_worker(session_id: str) -> "SessionWorker":
             logger.debug(f"Reusing existing SessionWorker for session_id={session_id}.")
 
         return worker
+
+def clear_session_directory(session_id: str) -> None:
+    """
+    Removes session_id's entire on-disk session directory (every generation), if one exists.
+
+    Args:
+        session_id (str):
+            Session identifier whose on-disk directory (settings.SESSION_DIR/<session_id>) should be removed.
+
+    Returns:
+        None
+
+    Notes:
+        - Intended to be called from message_handler.py::_handle_session_cleared(), alongside
+          remove_session_worker() - the next message for this session_id builds a brand new SessionWorker
+          (and therefore a brand new generation subfolder) from scratch via get_or_create_session_worker().
+        - Best-effort - a failure is logged but non-fatal, consistent with this module's existing fail-open
+          conventions (e.g. utils_redis/database.py). A stale directory left behind on failure has no
+          functional impact today, since nothing reads from session_dir yet.
+    """
+    session_root = settings.SESSION_DIR / session_id
+    try:
+        shutil.rmtree(session_root)
+    except FileNotFoundError:
+        logger.debug(f"No on-disk session directory existed for session_id={session_id} - nothing to remove.")
+    except Exception:
+        logger.exception(f"Failed to remove on-disk session directory for session_id={session_id} - it may be left behind, with no functional impact today.")
+    else:
+        logger.info(f"Removed on-disk session directory for session_id={session_id}.")
 
 def remove_session_worker(session_id: str) -> "SessionWorker | None":
     """
@@ -203,6 +249,8 @@ class SessionWorker:
         from ..utils_queue.queue import RabbitMQPublisher
 
         self.session_id = session_id
+        self.session_dir = settings.SESSION_DIR / session_id / uuid.uuid4().hex
+        self.session_dir.mkdir(parents=True, exist_ok=True)
         self.inbox: queue.Queue = queue.Queue(maxsize=settings.SESSION_INBOX_MAX_SIZE)
         self._publisher = RabbitMQPublisher()
         self._stop_event = threading.Event()

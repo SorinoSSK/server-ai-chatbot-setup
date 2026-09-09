@@ -13,16 +13,17 @@
 # Notes       :
 #   - Intended to be invoked once during application startup and once during shutdown.
 #   - Initialisation order follows each dependency's own startup requirements.
+#   - The LLM credential smoke test itself (test_llm_tokens()) lives in utils_agents/agent_interface.py,
+#     not here - this module only invokes it, keeping every LLM-facing call in one place. It now tests
+#     every configured LLM provider in turn, not just one - see agent_interface.py's own Notes.
 #   - See README.md for the full startup/shutdown sequence and design rationale.
 #
 # =============================================================================
 # I M P O R T   H E A D E R
 
-import os
-import asyncio
 import logging
 
-from ..config import settings
+from .utils_agents.agent_interface import test_llm_tokens
 from .utils_queue.queue import (
     initialise_rabbitmq_connection,
     start_queue_consumer,
@@ -38,56 +39,6 @@ from .utils_session.session_worker import resync_orphaned_sessions, shutdown_all
 logger = logging.getLogger(__name__)
 
 # =============================================================================
-
-async def _send_llm_test_prompt() -> None:
-    """
-    Sends a single test prompt through the Claude Agent SDK, logging the assistant's reply.
-
-    Used to confirm that LLM_OAUTH_TOKEN is valid and the LLM endpoint is reachable during startup.
-
-    Args:
-        None
-
-    Returns:
-        None
-
-    Notes:
-        - Any failure is caught and logged rather than raised, so a failed test never crashes application startup.
-    """
-    from claude_agent_sdk import AssistantMessage, TextBlock, query
-
-    os.environ["CLAUDE_CODE_OAUTH_TOKEN"] = settings.LLM_OAUTH_TOKEN
-
-    try:
-        async for message in query(prompt="Hello Claude - this is a startup connectivity test. Reply with a short acknowledgement."):
-            if isinstance(message, AssistantMessage):
-                for block in message.content:
-                    if isinstance(block, TextBlock):
-                        logger.info(f"LLM_OAUTH_TOKEN test response: {block.text}")
-    except Exception:
-        logger.exception("LLM_OAUTH_TOKEN test failed - credential may be invalid/expired, or the LLM endpoint is unreachable.")
-
-def test_llm_oauth_token() -> None:
-    """
-    Runs a one-off startup smoke test of LLM_OAUTH_TOKEN, logging the outcome.
-
-    Args:
-        None
-
-    Returns:
-        None
-
-    Notes:
-        - Skipped, with a warning logged, if no credential is configured or the configured provider is not yet supported.
-    """
-    if not settings.LLM_OAUTH_TOKEN:
-        logger.warning("LLM_OAUTH_TOKEN is unset - skipping startup LLM credential test.")
-        return
-    elif settings.LLM_TYPE != "claude":
-        logger.warning(f"LLM_TYPE={settings.LLM_TYPE!r} is not a supported provider for the startup LLM credential test yet - skipping.")
-        return
-    else:
-        asyncio.run(_send_llm_test_prompt())
 
 def initialise_application() -> None:
     """
@@ -105,7 +56,7 @@ def initialise_application() -> None:
         - The crash-recovery sweep runs before the consumer thread starts, so no new task can be accepted while it is in progress.
         - See README.md for the full startup sequence and its design rationale.
     """
-    test_llm_oauth_token()
+    test_llm_tokens()
 
     initialise_rabbitmq_connection()
     resync_orphaned_sessions()

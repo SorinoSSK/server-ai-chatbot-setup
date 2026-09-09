@@ -8,7 +8,8 @@
 #   - Message type resolution and routing for every message consumed from RabbitMQ.
 #   - Systemic gateway_alert/gateway_recover notification handling, throttled and Redis-backed.
 #   - Session-scoped message routing to the owning per-session worker.
-#   - Session teardown handling on session_cleared.
+#   - Session teardown handling on session_cleared - stops the owning SessionWorker (if any) and removes
+#     that session_id's on-disk session directory (see utils_session/session_worker.py).
 #
 # Notes       :
 #   - Owns its own JSON parsing so a malformed payload is logged and dropped rather than requeued forever.
@@ -28,7 +29,7 @@ from ..utils_redis.database import (
     mark_gateway_alert_notified,
     reset_gateway_alert_throttle
 )
-from ..utils_session.session_worker import get_or_create_session_worker, remove_session_worker
+from ..utils_session.session_worker import clear_session_directory, get_or_create_session_worker, remove_session_worker
 
 # =============================================================================
 # G L O B A L   V A R I A B L E
@@ -122,7 +123,8 @@ def _handle_gateway_recover(data: dict) -> None:
 
 def _handle_session_cleared(data: dict) -> None:
     """
-    Handles a session_cleared acknowledgement, stopping any worker owning the named session.
+    Handles a session_cleared acknowledgement, stopping any worker owning the named session and removing
+    its on-disk session directory.
 
     Args:
         data (dict):
@@ -133,14 +135,24 @@ def _handle_session_cleared(data: dict) -> None:
 
     Notes:
         - No active worker for the named session is a normal, expected case, and is logged at INFO rather than as a warning.
+        - clear_session_directory() is called unconditionally (even if no worker was found) - a session's
+          on-disk directory can outlive its SessionWorker (e.g. after a prior stop() without a matching
+          clear), so this does not skip cleanup just because nothing was currently active. The next message
+          for this session_id builds a brand new SessionWorker (and a fresh generation subfolder) from
+          scratch - see utils_session/session_worker.py's own Notes on why a fresh generation matters.
     """
     session_id = data.get("session_id")
-    worker = remove_session_worker(session_id) if session_id else None
-    if worker is not None:
-        worker.stop()
-        logger.info(f"Stopped SessionWorker for session_id={session_id} following session_cleared (chat_id={data.get('chat_id')}).")
+    if not session_id:
+        logger.error(f"Received session_cleared with missing session_id. Message dropped: {data}")
     else:
-        logger.info(f"Received session_cleared for session_id={session_id} (chat_id={data.get('chat_id')}) - no active SessionWorker found, nothing to stop.")
+        worker = remove_session_worker(session_id)
+        if worker is not None:
+            worker.stop()
+            logger.info(f"Stopped SessionWorker for session_id={session_id} following session_cleared (chat_id={data.get('chat_id')}).")
+        else:
+            logger.info(f"Received session_cleared for session_id={session_id} (chat_id={data.get('chat_id')}) - no active SessionWorker found, nothing to stop.")
+
+        clear_session_directory(session_id)
 
 def _dispatch_to_session(data: dict) -> None:
     """

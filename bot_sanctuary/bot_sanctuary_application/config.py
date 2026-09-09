@@ -43,10 +43,55 @@ class Settings:
         self.LOG_RETENTION_DAYS                                 = get_env_int("LOG_RETENTION_DAYS", DEFAULT_LOG_RETENTION_DAYS)
 
         # LLM Provider (see bot_sanctuary/CODE_TODO.md - Authentication)
-        DEFAULT_LLM_TYPE                                        = ""
-        DEFAULT_LLM_OAUTH_TOKEN                                 = ""
-        self.LLM_TYPE                                           = os.getenv("LLM_TYPE") or DEFAULT_LLM_TYPE
-        self.LLM_OAUTH_TOKEN                                    = os.getenv("LLM_OAUTH_TOKEN") or DEFAULT_LLM_OAUTH_TOKEN
+        # More than one provider's credentials can be configured at once (see the per-provider settings
+        # below) - there is no longer a single "current" provider/credential pair. All four LLM_TYPE values
+        # ("claude", "codex", "deepseek", "qwen") are wired programmatically (utils_agents/claude_interface.py,
+        # codex_interface.py, deepseek_interface.py, qwen_interface.py), each dispatched by an explicit
+        # llm_type argument (utils_agents/agent_interface.py::query_llm()), not a single global setting.
+        #
+        # LLM_CHAT_TYPE selects which provider the Chat Call (utils_calls/chat_call.py - entry/default,
+        # conversation & routing only, persona "Rukia") uses. Also the fallback for every other named
+        # Call's own LLM_<CALL>_TYPE below, when that Call's own setting is left unset - so a deployment
+        # only needs to configure LLM_CHAT_TYPE and every Call defaults to using the same provider, unless
+        # deliberately overridden per Call.
+        #
+        # LLM_ARCHITECT_TYPE/LLM_CODER_TYPE/LLM_REVIEW_TYPE/LLM_DOCUMENTATION_TYPE - one setting per
+        # remaining named Call (see bot_sanctuary/CODE_TODO.md §5), each falling back to LLM_CHAT_TYPE if
+        # unset. This is what "on hold" per-Call provider routing (previously deferred, see §2/§5's history)
+        # actually looks like now that the Call pipeline itself has real scaffolding to attach it to -
+        # each Call can be pointed at a different provider (e.g. Coder=claude, Review=qwen), or left to
+        # inherit LLM_CHAT_TYPE by leaving its own setting unset.
+        #
+        # LLM_<PROVIDER>_ACCESS_TYPE/LLM_<PROVIDER>_TOKEN - one credential pair per provider, since the
+        # startup smoke test (utils_agents/agent_interface.py::test_llm_tokens()) now tests every provider
+        # that has a token configured, not just one. "OAUTH" (a Claude Code OAuth token/Codex CLI login
+        # session) only means anything for "claude"/"codex" - "deepseek"/"qwen" are API-key-only (DeepSeek
+        # has no OAuth mechanism at all; Qwen's free OAuth login tier was discontinued 2026-04-15), so their
+        # own ACCESS_TYPE defaults straight to "API" rather than requiring it be set explicitly.
+        DEFAULT_LLM_CHAT_TYPE                                   = ""
+        self.LLM_CHAT_TYPE                                      = os.getenv("LLM_CHAT_TYPE") or DEFAULT_LLM_CHAT_TYPE
+
+        self.LLM_ARCHITECT_TYPE                                 = os.getenv("LLM_ARCHITECT_TYPE") or self.LLM_CHAT_TYPE
+        self.LLM_CODER_TYPE                                     = os.getenv("LLM_CODER_TYPE") or self.LLM_CHAT_TYPE
+        self.LLM_REVIEW_TYPE                                    = os.getenv("LLM_REVIEW_TYPE") or self.LLM_CHAT_TYPE
+        self.LLM_DOCUMENTATION_TYPE                             = os.getenv("LLM_DOCUMENTATION_TYPE") or self.LLM_CHAT_TYPE
+
+        DEFAULT_LLM_CLAUDE_ACCESS_TYPE                          = ""
+        DEFAULT_LLM_CLAUDE_TOKEN                                = ""
+        DEFAULT_LLM_CODEX_ACCESS_TYPE                           = ""
+        DEFAULT_LLM_CODEX_TOKEN                                 = ""
+        DEFAULT_LLM_DEEPSEEK_ACCESS_TYPE                        = "API"
+        DEFAULT_LLM_DEEPSEEK_TOKEN                              = ""
+        DEFAULT_LLM_QWEN_ACCESS_TYPE                            = "API"
+        DEFAULT_LLM_QWEN_TOKEN                                  = ""
+        self.LLM_CLAUDE_ACCESS_TYPE                             = os.getenv("LLM_CLAUDE_ACCESS_TYPE") or DEFAULT_LLM_CLAUDE_ACCESS_TYPE
+        self.LLM_CLAUDE_TOKEN                                   = os.getenv("LLM_CLAUDE_TOKEN") or DEFAULT_LLM_CLAUDE_TOKEN
+        self.LLM_CODEX_ACCESS_TYPE                              = os.getenv("LLM_CODEX_ACCESS_TYPE") or DEFAULT_LLM_CODEX_ACCESS_TYPE
+        self.LLM_CODEX_TOKEN                                    = os.getenv("LLM_CODEX_TOKEN") or DEFAULT_LLM_CODEX_TOKEN
+        self.LLM_DEEPSEEK_ACCESS_TYPE                           = os.getenv("LLM_DEEPSEEK_ACCESS_TYPE") or DEFAULT_LLM_DEEPSEEK_ACCESS_TYPE
+        self.LLM_DEEPSEEK_TOKEN                                 = os.getenv("LLM_DEEPSEEK_TOKEN") or DEFAULT_LLM_DEEPSEEK_TOKEN
+        self.LLM_QWEN_ACCESS_TYPE                               = os.getenv("LLM_QWEN_ACCESS_TYPE") or DEFAULT_LLM_QWEN_ACCESS_TYPE
+        self.LLM_QWEN_TOKEN                                     = os.getenv("LLM_QWEN_TOKEN") or DEFAULT_LLM_QWEN_TOKEN
 
         # Bot Identity - persona name shared with telegram_gateway, used as the SMTP From display name.
         DEFAULT_TELEGRAM_BOT_NAME                               = ""
@@ -117,6 +162,13 @@ class Settings:
         # Session routing - bounds each SessionWorker's own inbox (see utils_session/session_worker.py).
         DEFAULT_SESSION_INBOX_MAX_SIZE                          = 100
         self.SESSION_INBOX_MAX_SIZE                             = get_env_int("SESSION_INBOX_MAX_SIZE", DEFAULT_SESSION_INBOX_MAX_SIZE)
+
+        # Session on-disk directory - one subfolder per session_id, itself split into fresh "generation"
+        # subfolders (see utils_session/session_worker.py). Intended as a stable Claude Agent SDK cwd anchor
+        # for a future session-resume feature (see bot_sanctuary/CODE_TODO.md §5) - not yet wired into any
+        # actual LLM call. No conversation history is kept here today, per explicit instruction ("I do not
+        # intend to keep sessions for now") - this is lifecycle scaffolding only.
+        self.SESSION_DIR                                        = self.DATA_DIR / "sessions"
 
         # Bounds how long terminate_application() waits for each SessionWorker to finish on shutdown - 0 waits indefinitely.
         DEFAULT_SESSION_SHUTDOWN_TIMEOUT_SECONDS                = 30
