@@ -27,7 +27,9 @@ from .message_handler import process_message
 
 logger = logging.getLogger(__name__)
 
-# Publish and consume each use their own dedicated connection, confined to their own thread (publish: caller's thread, consume: _consumer_thread), since a pika BlockingConnection must not be shared or used concurrently across threads.
+# Publish and consume each use their own dedicated connection, since a pika BlockingConnection must not be shared or used concurrently across threads.
+# _lock_publish guards _connection_publish/_channel_publish end to end - both their lifecycle (open in _initialise_rabbitmq_publish_connection(), close in close_rabbitmq_connection()) and their actual use (queue_declare()/basic_publish() in queue_push_task()) - deliberately the same lock for both, since a publish call and a concurrent reconnect/close are contending for the same shared object and must exclude each other too, not just exclude within their own kind. Unlike consume below, publish is called from many independent threads (every send_*()/stop_poll() in gateway_outbound.py, across every concurrent thread class), so it cannot rely on single-thread confinement the way consume does - see CCR-021 (CODE_NON_COMPLIANCE.md).
+# _lock_consume only ever needs to guard _connection_consume/_channel_consume's lifecycle and _consumer_running - actual use (basic_consume()/start_consuming()) is confined to the single _consumer_thread by construction (only ever started once, guarded by _consumer_running), so no second thread ever calls those directly. The one legitimate cross-thread interaction, stop_queue_consumer(), uses pika's own add_callback_threadsafe() to hand the call back to the connection's own thread rather than invoking a channel method directly from outside it - so consume was never exposed to the same hazard publish had, and needs no equivalent widening.
 _lock_publish = threading.RLock()
 _lock_consume = threading.RLock()
 
@@ -236,36 +238,39 @@ def queue_push_task(payload: dict) -> bool:
 
     Notes:
         - UnroutableError is not retried (misconfigured queue/binding). Connection-level failures are.
+        - The entire retry loop runs under _lock_publish - only one thread at a time ever calls queue_declare()/basic_publish() on the shared _channel_publish, consistent with pika's requirement that a BlockingChannel not be used concurrently across threads. Closes CCR-021 (CODE_NON_COMPLIANCE.md).
+          Accepted cost: concurrent callers now fully serialise - a caller can wait up to another in-flight call's full Q_PUSH_MAX_ATTEMPTS x Q_PUSH_RETRY_DELAY (~30s) budget before its own first attempt even starts, if RabbitMQ is unreachable. Not a new cost this introduces so much as a redistribution of an existing one: any individual call already took up to that long in that scenario - the lock only decides whether concurrent callers wait for each other safely in turn, or overlap unsafely (the prior bug).
     """
-    for attempt in range(1, settings.Q_PUSH_MAX_ATTEMPTS + 1):
-        try:
-            channel = _get_rabbitmq_publish_channel()
-            channel.queue_declare(queue=settings.Q_CHANNEL_OUT, durable=True)
-            channel.basic_publish(
-                exchange="",
-                routing_key=settings.Q_CHANNEL_OUT,
-                body=json.dumps(payload),
-                properties=pika.BasicProperties(
-                    delivery_mode=pika.DeliveryMode.Persistent
+    with _lock_publish:
+        for attempt in range(1, settings.Q_PUSH_MAX_ATTEMPTS + 1):
+            try:
+                channel = _get_rabbitmq_publish_channel()
+                channel.queue_declare(queue=settings.Q_CHANNEL_OUT, durable=True)
+                channel.basic_publish(
+                    exchange="",
+                    routing_key=settings.Q_CHANNEL_OUT,
+                    body=json.dumps(payload),
+                    properties=pika.BasicProperties(
+                        delivery_mode=pika.DeliveryMode.Persistent
+                    )
                 )
-            )
-            logger.info(f"Pushed task to RabbitMQ queue={settings.Q_CHANNEL_OUT} (task_id={payload.get('task_id')}).")
-            return True
-        except pika.exceptions.UnroutableError:
-            logger.error("RabbitMQ rejected task as unroutable. Not retrying.")
-            return False
-        except (
-            pika.exceptions.AMQPConnectionError,
-            pika.exceptions.StreamLostError,
-            pika.exceptions.ChannelWrongStateError,
-            pika.exceptions.ChannelClosed,
-        ):
-            logger.warning(f"RabbitMQ push attempt {attempt}/{settings.Q_PUSH_MAX_ATTEMPTS} failed.")
-            if attempt < settings.Q_PUSH_MAX_ATTEMPTS:
-                time.sleep(settings.Q_PUSH_RETRY_DELAY)
+                logger.info(f"Pushed task to RabbitMQ queue={settings.Q_CHANNEL_OUT} (task_id={payload.get('task_id')}).")
+                return True
+            except pika.exceptions.UnroutableError:
+                logger.error("RabbitMQ rejected task as unroutable. Not retrying.")
+                return False
+            except (
+                pika.exceptions.AMQPConnectionError,
+                pika.exceptions.StreamLostError,
+                pika.exceptions.ChannelWrongStateError,
+                pika.exceptions.ChannelClosed,
+            ):
+                logger.warning(f"RabbitMQ push attempt {attempt}/{settings.Q_PUSH_MAX_ATTEMPTS} failed.")
+                if attempt < settings.Q_PUSH_MAX_ATTEMPTS:
+                    time.sleep(settings.Q_PUSH_RETRY_DELAY)
 
-    logger.error(f"Failed to push task to RabbitMQ after {settings.Q_PUSH_MAX_ATTEMPTS} attempts.")
-    return False
+        logger.error(f"Failed to push task to RabbitMQ after {settings.Q_PUSH_MAX_ATTEMPTS} attempts.")
+        return False
 
 def queue_consume_task():
     """

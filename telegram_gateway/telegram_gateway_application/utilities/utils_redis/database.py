@@ -40,7 +40,7 @@ def initialise_redis_connection() -> None:
     """
     Opens the shared Redis connection, reused across the application.
 
-    Retries indefinitely, with a fixed delay between attempts, whenever Redis is not yet reachable - blocks the caller until a connection succeeds rather than giving up after a bounded number of attempts.
+    Retries indefinitely, with a fixed delay between attempts, whenever Redis is not yet reachable, if REDIS_FORCE_INFINITE_RETRY is enabled - blocks the caller until a connection succeeds rather than giving up after a bounded number of attempts. Otherwise (the default), gives up after a single failed attempt, logging a warning and returning with the connection left unset.
 
     Args:
         None
@@ -49,7 +49,8 @@ def initialise_redis_connection() -> None:
         None
 
     Notes:
-        - Startup-only behaviour in practice: _client is only None before the first successful connection (or after close_redis_connection() during shutdown), so this retry loop is only ever entered from initialise.py::initialise_application(), and a transient Redis-not-up-yet race at container start does not crash-exit the whole application.
+        - Startup-only behaviour in practice: _client is only None before the first successful connection (or after close_redis_connection() during shutdown), so this retry loop is only ever entered from initialise.py::initialise_application(); a transient Redis-not-up-yet race at container start only avoids crash-exiting the whole application while REDIS_FORCE_INFINITE_RETRY is enabled.
+        - REDIS_FORCE_INFINITE_RETRY defaults to False - see _should_redis_retry_infinite() and CODE_TODO.md's "FIX — No retry on RabbitMQ/Redis startup connections" entry for why this is conditional here but unconditional on RabbitMQ's equivalent path (initialise_rabbitmq_connection()).
         - Once connected, ongoing operations rely on their own bounded retry instead (REDIS_TASK_MAX_ATTEMPTS) - see _redis_read()/_redis_write()/_redis_delete() - this function is not on that path.
         - Any exception other than redis.exceptions.RedisError still propagates immediately and is not retried.
     """
