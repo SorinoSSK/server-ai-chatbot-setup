@@ -1,16 +1,16 @@
 # =============================================================================
 # File        : queue.py
-# Description : File responsible for initialising, managing, and terminating RabbitMQ connections.
+# Description : Manages RabbitMQ connection lifecycle for consuming inbound messages and publishing outbound results.
 # Author      : SorinoSSK
 # Created On  : 2026-09-07
 #
 # Features    :
-#   - Single shared RabbitMQ consume connection, read by the one background consumer thread that demultiplexes every inbound message from telegram_gateway (see bot_sanctuary/CODE_TODO.md §3).
-#   - RabbitMQPublisher - a dedicated, caller-owned RabbitMQ publish connection per instance, deliberately not a shared/module-level connection - each session worker thread (see bot_sanctuary/CODE_TODO.md §3) is intended to own and publish through its own instance, since a pika BlockingConnection is not thread-safe and a lock around a shared one is documented as insufficient (the connection's I/O loop is tied to the thread that created it).
+#   - Shared RabbitMQ consume connection and background consumer loop for inbound messages.
+#   - RabbitMQPublisher - a dedicated, thread-owned publish connection for outbound results.
 #
 # Notes       :
-#   - Always use the helper functions/classes in this file to consume/publish RabbitMQ messages.
-#   - The session-routing layer (per-session worker threads - see bot_sanctuary/CODE_TODO.md §3) is not implemented yet - process_message() (utils_queue/message_handler.py) is currently a placeholder that logs and drops every session-scoped message rather than routing it to a session worker.
+#   - Always use the helper functions/classes in this file to consume or publish RabbitMQ messages.
+#   - See README.md for the full message routing and reconnection behaviour.
 #
 # =============================================================================
 # I M P O R T   H E A D E R
@@ -101,7 +101,7 @@ def initialise_rabbitmq_connection() -> None:
     """
     Initialises the RabbitMQ consume connection.
 
-    Retries indefinitely, with a fixed delay between attempts, whenever RabbitMQ is not yet reachable - blocks the caller until the connection succeeds rather than giving up after a bounded number of attempts.
+    Retries indefinitely, with a fixed delay between attempts, whenever RabbitMQ is not yet reachable.
 
     Args:
         None
@@ -110,8 +110,8 @@ def initialise_rabbitmq_connection() -> None:
         None
 
     Notes:
-        - Startup-only behaviour: intended for initialise.py::initialise_application(), so a transient RabbitMQ-not-up-yet race at container start does not crash-exit the whole application - same pattern as telegram_gateway/utilities/utils_queue/queue.py::initialise_rabbitmq_connection().
-        - Any exception other than pika.exceptions.AMQPConnectionError still propagates immediately and is not retried.
+        - Intended for startup use, so a transient RabbitMQ-not-yet-available condition does not crash-exit the application.
+        - Any exception other than a connection error still propagates immediately and is not retried.
     """
     while True:
         try:
@@ -171,7 +171,7 @@ def queue_consume_task() -> None:
     """
     Consumes messages from RabbitMQ in a loop, reconnecting automatically on connection failures.
 
-    Runs until _consumer_running is cleared (see stop_queue_consumer()).
+    Runs until the consumer is signalled to stop via stop_queue_consumer().
 
     Args:
         None
@@ -180,9 +180,8 @@ def queue_consume_task() -> None:
         None
 
     Notes:
-        - An undecodable message body is dropped (not requeued) - retrying cannot fix it.
-        - Other processing failures are requeued and retried up to Q_CONSUME_MAX_ATTEMPTS times (tracked per body in _message_attempts), then dropped.
-        - Mirrors telegram_gateway/utilities/utils_queue/queue.py::queue_consume_task() - see there for the established pattern this follows.
+        - An undecodable message body is dropped rather than requeued, since retrying cannot fix it.
+        - Other processing failures are requeued and retried up to a configured attempt limit, then dropped.
     """
     global _consumer_running
     while True:
@@ -287,10 +286,9 @@ def stop_queue_consumer() -> None:
 
 class RabbitMQPublisher:
     """
-    Thin, thread-owned wrapper around a single RabbitMQ connection/channel used for publishing results back to telegram_gateway.
+    Thread-owned wrapper around a single RabbitMQ connection/channel used for publishing results back to telegram_gateway.
 
-    Deliberately not shared/module-level and not thread-safe by design - intended to be created and used from within exactly one thread (a future session worker - see bot_sanctuary/CODE_TODO.md §3) for its entire lifetime, never passed across threads or shared.
-    Each instance owns and lazily opens its own connection on first publish() call.
+    Not thread-safe by design - intended to be created and used from within exactly one thread for its entire lifetime, never shared across threads.
 
     Example:
         publisher = RabbitMQPublisher()
@@ -324,18 +322,18 @@ class RabbitMQPublisher:
 
     def publish(self, payload: dict) -> bool:
         """
-        Publishes payload to Q_CHANNEL_OUT, retrying on connection failure up to Q_PUSH_MAX_ATTEMPTS times.
+        Publishes payload to Q_CHANNEL_OUT, retrying on connection failure.
 
         Args:
-            payload (dict)
+            payload (dict):
+                Message payload to publish.
 
         Returns:
             bool:
-                True if published successfully; otherwise False once attempts are exhausted.
+                True if published successfully; otherwise False once retry attempts are exhausted.
 
         Notes:
-            - UnroutableError is not retried (misconfigured queue/binding). Connection-level failures are.
-            - Mirrors telegram_gateway/utilities/utils_queue/queue.py::queue_push_task()'s retry behaviour, but against this instance's own connection rather than a shared module-level one.
+            - A misconfigured queue/binding is not retried; only connection-level failures are.
         """
         for attempt in range(1, settings.Q_PUSH_MAX_ATTEMPTS + 1):
             try:

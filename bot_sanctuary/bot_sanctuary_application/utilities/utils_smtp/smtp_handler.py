@@ -1,19 +1,17 @@
 # =============================================================================
 # File        : smtp_handler.py
-# Description : File responsible for sending mail via SMTP and for a manually-triggerable connectivity/credential test.
+# Description : Sends mail via SMTP and provides a manually-triggerable connectivity/credential test.
 # Author      : SorinoSSK
 # Created On  : 2026-09-07
 #
 # Features    :
-#   - send_mail() - sends a plain-text email via SMTP, honouring SMTP_ENABLE_MAILER/SMTP_FORCE_SSL/SMTP_SKIP_TLS/SMTP_AUTH_TYPE.
-#   - test_smtp_configuration() - sends a single fixed test email, intended to be triggered manually, e.g.:
-#       docker exec <container_name> python -m bot_sanctuary_application.utilities.utils_smtp.smtp_handler
-#       docker exec <container_name> python -m bot_sanctuary_application.utilities.utils_smtp.smtp_handler someone@example.com
-#     Deliberately not run automatically at application startup - see bot_sanctuary/CODE_TODO.md §4.
+#   - send_mail() - sends a plain-text email via SMTP, supporting implicit TLS, STARTTLS, or no TLS, with optional authentication.
+#   - test_smtp_configuration() - sends a single fixed test email to verify configuration end-to-end.
 #
 # Notes       :
-#   - SMTP_FROM_EMAIL/SMTP_USERNAME/SMTP_PASSWORD are never logged in full - _mask() only ever reports whether a value is set, never any part of its actual content (not even a partial reveal), since no specific masking scheme was mandated and this is the safest reading of "mask" for a credential.
-#   - send_mail() is a no-op (logged, returns False) while SMTP_ENABLE_MAILER is unset - see bot_sanctuary/CODE_TODO.md §4.
+#   - SMTP credentials are never logged in full - only whether a value is set.
+#   - Mail sending is inert until SMTP_ENABLE_MAILER is explicitly turned on.
+#   - See README.md for how to trigger the connectivity test manually.
 #
 # =============================================================================
 # I M P O R T   H E A D E R
@@ -37,11 +35,11 @@ logger = logging.getLogger(__name__)
 
 def _mask(value: str) -> str:
     """
-    Masks a sensitive setting for safe logging - never reveals any part of the actual value, only
-    whether it is set at all.
+    Masks a sensitive setting for safe logging - never reveals any part of the actual value, only whether it is set at all.
 
     Args:
-        value (str)
+        value (str):
+            Setting value to mask.
 
     Returns:
         str:
@@ -54,20 +52,22 @@ def _build_message(subject: str, body: str, to_addresses: list[str]) -> MIMEMult
     Builds a plain-text MIME message ready to be sent.
 
     Args:
-        subject (str)
+        subject (str):
+            Email subject line.
 
-        body (str)
+        body (str):
+            Plain-text email body.
 
-        to_addresses (list[str])
+        to_addresses (list[str]):
+            Recipient addresses.
 
     Returns:
-        MIMEMultipart
+        MIMEMultipart:
+            The constructed message.
 
     Notes:
-        - The From header renders as "TELEGRAM_BOT_NAME <SMTP_FROM_EMAIL>" (e.g. "Rukia <noreply@example.com>") when TELEGRAM_BOT_NAME is set, via email.utils.formataddr() - which also takes care of quoting the display name if it ever contains characters (commas, angle brackets, etc.) that would otherwise make the header ambiguous.
-        - Falls back to the bare address when TELEGRAM_BOT_NAME is unset.
-        - Deliberately reuses TELEGRAM_BOT_NAME (config.py's "Bot Identity" section, shared with telegram_gateway) rather than a separate SMTP-only name setting, so mail sent by this application identifies as the same persona the user already talks to on Telegram.
-        - This only affects the message header, not the SMTP envelope sender - send_mail() still passes the bare settings.SMTP_FROM_EMAIL as sendmail()'s from_addr, since the envelope sender is required to be a plain address regardless of what the header displays.
+        - The From header displays TELEGRAM_BOT_NAME alongside SMTP_FROM_EMAIL when a bot name is configured, falling back to the bare address otherwise.
+        - This only affects the message header, not the SMTP envelope sender, which always uses the bare address.
     """
     message = MIMEMultipart()
     message["From"] = formataddr((settings.TELEGRAM_BOT_NAME, settings.SMTP_FROM_EMAIL)) if settings.TELEGRAM_BOT_NAME else settings.SMTP_FROM_EMAIL
@@ -78,25 +78,20 @@ def _build_message(subject: str, body: str, to_addresses: list[str]) -> MIMEMult
 
 def _open_smtp_connection() -> smtplib.SMTP:
     """
-    Opens and returns a connected SMTP session, ready for send_mail() to authenticate (unless
-    SMTP_AUTH_TYPE is "NONE") and send through.
+    Opens and returns a connected SMTP session, ready for authentication and sending.
+
+    The connection method (implicit TLS, STARTTLS, or no TLS) is determined by SMTP_FORCE_SSL and SMTP_SKIP_TLS.
 
     Args:
         None
 
     Returns:
         smtplib.SMTP:
-            Ready for .login()/.sendmail() - caller is responsible for calling .quit().
+            An open connection - the caller is responsible for calling .quit().
 
     Raises:
         Exception:
-            Whatever smtplib/ssl raises on a connection failure - not caught here, left for the caller (send_mail()) to handle.
-
-    Notes:
-        - SMTP_FORCE_SSL=True: connects via smtplib.SMTP_SSL (implicit TLS from the first byte - typically port 465).
-          SMTP_SKIP_TLS is not consulted in this branch - implicit TLS cannot be selectively skipped once SMTP_FORCE_SSL is set.
-        - SMTP_FORCE_SSL=False, SMTP_SKIP_TLS=False (default): connects via smtplib.SMTP, then upgrades with STARTTLS - typically port 587.
-        - SMTP_FORCE_SSL=False, SMTP_SKIP_TLS=True: connects via smtplib.SMTP with no TLS at all - typically port 25, only appropriate for a trusted internal relay.
+            Whatever smtplib/ssl raises on a connection failure - left for the caller to handle.
     """
     if settings.SMTP_FORCE_SSL:
         return smtplib.SMTP_SSL(settings.SMTP_HOST, settings.SMTP_PORT, context=ssl.create_default_context())
@@ -112,9 +107,11 @@ def send_mail(subject: str, body: str, to_addresses: list[str] | str) -> bool:
     Sends a plain-text email via SMTP.
 
     Args:
-        subject (str)
+        subject (str):
+            Email subject line.
 
-        body (str)
+        body (str):
+            Plain-text email body.
 
         to_addresses (list[str] | str):
             A single recipient address, or a list of addresses.
@@ -124,10 +121,8 @@ def send_mail(subject: str, body: str, to_addresses: list[str] | str) -> bool:
             True if sent successfully; otherwise False.
 
     Notes:
-        - No-op (logged, returns False) while SMTP_ENABLE_MAILER is unset - see bot_sanctuary/CODE_TODO.md §4.
-        - SMTP_AUTH_TYPE="NONE" (case-insensitive) skips .login() entirely, for a relay that doesn't require authentication.
-          Any other value authenticates via SMTP_USERNAME/SMTP_PASSWORD - see _open_smtp_connection()'s Notes for why no further distinction between mechanism names is made.
-        - settings.SMTP_FROM_EMAIL/SMTP_USERNAME/SMTP_PASSWORD are never logged in full - see _mask().
+        - A no-op while SMTP_ENABLE_MAILER is unset - returns False without attempting to connect.
+        - Authentication is skipped entirely when SMTP_AUTH_TYPE is "NONE".
     """
     if not settings.SMTP_ENABLE_MAILER:
         logger.warning("SMTP_ENABLE_MAILER is unset - mail not sent (no-op).")
@@ -167,22 +162,19 @@ def send_mail(subject: str, body: str, to_addresses: list[str] | str) -> bool:
 
 def test_smtp_configuration(to_address: str | None = None) -> bool:
     """
-    Sends a single fixed test email, to confirm SMTP_* configuration actually works end-to-end.
+    Sends a single fixed test email, to confirm SMTP configuration works end-to-end.
 
     Args:
         to_address (str | None, optional):
-            Recipient for the test email - an explicit override, mainly for ad-hoc testing.
-            Defaults to SMTP_TO_EMAIL (the configured alert recipient) if omitted, then to SMTP_FROM_EMAIL (send to self) if that's unset too.
+            Recipient for the test email. Defaults to SMTP_TO_EMAIL, then SMTP_FROM_EMAIL, if omitted.
 
     Returns:
         bool:
             True if the test mail was sent successfully; otherwise False.
 
     Notes:
-        - Not run automatically at application startup - intended to be triggered manually, e.g.:
-          docker exec <container_name> python -m bot_sanctuary_application.utilities.utils_smtp.smtp_handler
-          docker exec <container_name> python -m bot_sanctuary_application.utilities.utils_smtp.smtp_handler someone@example.com  (override)
-        - Fails fast (logged, returns False) if SMTP_ENABLE_MAILER/SMTP_HOST/a resolvable recipient are missing, rather than attempting a connection that can't succeed.
+        - Not run automatically at application startup - see README.md for how to trigger it manually.
+        - Fails fast if mailer configuration or a resolvable recipient is missing, rather than attempting a connection that cannot succeed.
     """
     if not settings.SMTP_ENABLE_MAILER:
         logger.error(
@@ -218,9 +210,7 @@ def test_smtp_configuration(to_address: str | None = None) -> bool:
 # =============================================================================
 # C O M M A N D   L I N E   E N T R Y   P O I N T
 #
-# Lets an administrator trigger the SMTP test manually, independent of the application's own startup sequence, e.g.:
-#   docker exec <container_name> python -m bot_sanctuary_application.utilities.utils_smtp.smtp_handler
-#   docker exec <container_name> python -m bot_sanctuary_application.utilities.utils_smtp.smtp_handler someone@example.com
+# Lets an administrator trigger the SMTP test manually, independent of the application's own startup sequence - see README.md for usage.
 
 if __name__ == "__main__":
     import sys

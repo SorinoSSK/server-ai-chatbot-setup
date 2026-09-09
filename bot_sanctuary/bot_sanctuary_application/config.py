@@ -48,20 +48,11 @@ class Settings:
         self.LLM_TYPE                                           = os.getenv("LLM_TYPE") or DEFAULT_LLM_TYPE
         self.LLM_OAUTH_TOKEN                                    = os.getenv("LLM_OAUTH_TOKEN") or DEFAULT_LLM_OAUTH_TOKEN
 
-        # Bot Identity - shared with telegram_gateway, same env var name/convention as
-        # telegram_gateway/config.py's own TELEGRAM_BOT_NAME (both fed from the same root
-        # config.ini CHATBOT_NAME value) - used here as the display name on the SMTP From
-        # header (see utils_smtp/smtp_handler.py), so the mailer identifies as the same
-        # persona the user already talks to on Telegram, rather than a second, separate name.
+        # Bot Identity - persona name shared with telegram_gateway, used as the SMTP From display name.
         DEFAULT_TELEGRAM_BOT_NAME                               = ""
         self.TELEGRAM_BOT_NAME                                  = os.getenv("TELEGRAM_BOT_NAME") or DEFAULT_TELEGRAM_BOT_NAME
 
-        # Queue Connection (see bot_sanctuary/CODE_TODO.md §3)
-        # Q_CHANNEL_IN/Q_CHANNEL_OUT are named from this application's own point of view, same convention
-        # as telegram_gateway/config.py - IN is what this application consumes, OUT is what it publishes
-        # to. Since the two applications talk to each other, that makes this application's IN telegram_gateway's
-        # OUT, and vice versa - the literal queue name strings below are shared, durable RabbitMQ queues
-        # that telegram_gateway itself already declares (see telegram_gateway/config.py's own Q_CHANNEL_IN/OUT).
+        # Queue Connection - Q_CHANNEL_IN/Q_CHANNEL_OUT are named from this application's own point of view.
         DEFAULT_Q_HOST                                          = "chatbot-rabbitmq"
         DEFAULT_Q_USER                                          = ""
         DEFAULT_Q_PASSWORD                                      = ""
@@ -91,9 +82,7 @@ class Settings:
         self.Q_CONSUME_MAX_ATTEMPTS                             = get_env_int("Q_CONSUME_MAX_ATTEMPTS", DEFAULT_Q_CONSUME_MAX_ATTEMPTS)
         self.Q_CONNECT_RETRY_DELAY_SECONDS                      = get_env_int("Q_CONNECT_RETRY_DELAY_SECONDS", DEFAULT_Q_CONNECT_RETRY_DELAY_SECONDS)
 
-        # SMTP / Mailer (see bot_sanctuary/CODE_TODO.md §4 - Tier 2 gateway_alert alerting)
-        # SMTP_FROM_EMAIL/SMTP_USERNAME/SMTP_PASSWORD are never logged in full - see
-        # utils_smtp/smtp_handler.py's masking helper.
+        # SMTP / Mailer - used for Tier 2 gateway_alert alerting. Credentials are never logged in full.
         DEFAULT_SMTP_ENABLE_MAILER                              = False    # inert (send_mail() is a no-op) until explicitly turned on
         DEFAULT_SMTP_FORCE_SSL                                  = False    # True: connect via implicit TLS (smtplib.SMTP_SSL, typically port 465) instead of STARTTLS
         DEFAULT_SMTP_AUTH_TYPE                                  = "LOGIN"  # "NONE" (case-insensitive) skips authentication entirely; any other value authenticates via SMTP_USERNAME/SMTP_PASSWORD - smtplib.login() negotiates the actual SASL mechanism itself, so no further distinction between mechanism names is made here
@@ -115,26 +104,25 @@ class Settings:
         self.SMTP_USERNAME                                      = os.getenv("SMTP_USERNAME") or DEFAULT_SMTP_USERNAME
         self.SMTP_PASSWORD                                      = os.getenv("SMTP_PASSWORD") or DEFAULT_SMTP_PASSWORD
 
-        # gateway_alert notification throttle (see utils_queue/message_handler.py::_handle_gateway_alert(),
-        # utils_redis/database.py) - a gateway_alert notification email fires at most once per this many
-        # seconds (default 24h), no matter how many gateway_alert events arrive in between. Every
-        # occurrence is still counted in Redis regardless of whether an email is actually sent for it.
-        # Also used as a fixed (non-renewed) Redis TTL on both the occurrence counter and the notification
-        # cooldown - see utils_redis/database.py's module Notes for why it is deliberately NOT refreshed on
-        # every occurrence (a sliding/renewed TTL could never expire if occurrences never stopped arriving,
-        # which would make the fallback reset impossible).
+        # gateway_alert notification throttle - minimum seconds between notification emails, also used as the fixed Redis TTL fallback (see utils_redis/database.py).
         DEFAULT_GATEWAY_ALERT_NOTIFY_COOLDOWN_SECONDS           = 86400
         self.GATEWAY_ALERT_NOTIFY_COOLDOWN_SECONDS              = get_env_int("GATEWAY_ALERT_NOTIFY_COOLDOWN_SECONDS", DEFAULT_GATEWAY_ALERT_NOTIFY_COOLDOWN_SECONDS)
 
-        # Redis Connection (see bot_sanctuary/CODE_TODO.md §4) - a separate Redis ACL user/credentials
-        # from telegram_gateway's own REDIS_USERNAME/PASSWORD (same shared chatbot-redis container,
-        # deliberately not the same login - see compose.dev.yml's redis service, which scopes this
-        # application's user to only the "bot_sanctuary:*" key pattern). REDIS_DB also defaults to a
-        # different logical database (1, vs telegram_gateway's 0) as a second, belt-and-braces layer of
-        # separation on top of the ACL key-pattern restriction.
-        # Deliberately NOT a hard startup dependency, unlike RabbitMQ - Redis here only backs a durability
-        # nicety on an already-optional secondary feature (SMTP alerting); connects lazily on first use,
-        # fails open (see utils_redis/database.py) rather than blocking or crashing application startup.
+        # Redis per-call retry - bounded retry applied to every individual Redis call (see utils_redis/database.py).
+        DEFAULT_REDIS_TASK_MAX_ATTEMPTS                         = 5
+        DEFAULT_REDIS_TASK_RETRY_DELAY                          = 1
+        self.REDIS_TASK_MAX_ATTEMPTS                            = get_env_int("REDIS_TASK_MAX_ATTEMPTS", DEFAULT_REDIS_TASK_MAX_ATTEMPTS)
+        self.REDIS_TASK_RETRY_DELAY                             = get_env_int("REDIS_TASK_RETRY_DELAY", DEFAULT_REDIS_TASK_RETRY_DELAY)
+
+        # Session routing - bounds each SessionWorker's own inbox (see utils_session/session_worker.py).
+        DEFAULT_SESSION_INBOX_MAX_SIZE                          = 100
+        self.SESSION_INBOX_MAX_SIZE                             = get_env_int("SESSION_INBOX_MAX_SIZE", DEFAULT_SESSION_INBOX_MAX_SIZE)
+
+        # Bounds how long terminate_application() waits for each SessionWorker to finish on shutdown - 0 waits indefinitely.
+        DEFAULT_SESSION_SHUTDOWN_TIMEOUT_SECONDS                = 30
+        self.SESSION_SHUTDOWN_TIMEOUT_SECONDS                   = get_env_int("SESSION_SHUTDOWN_TIMEOUT_SECONDS", DEFAULT_SESSION_SHUTDOWN_TIMEOUT_SECONDS, minimum=0)
+
+        # Redis Connection - a separate Redis ACL user/credentials from telegram_gateway's own, sharing the same container. Not a hard startup dependency; connects lazily and fails open (see utils_redis/database.py).
         DEFAULT_REDIS_HOST                                      = "chatbot-redis"
         DEFAULT_REDIS_PORT                                      = 6379
         DEFAULT_REDIS_USERNAME                                  = ""

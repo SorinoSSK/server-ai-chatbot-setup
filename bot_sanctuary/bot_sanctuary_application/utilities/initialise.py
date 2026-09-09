@@ -5,13 +5,15 @@
 # Created On  : 2026-09-06
 #
 # Features    :
-#   - test_llm_oauth_token() - one-off startup smoke test that sends a minimal prompt through claude_agent_sdk using LLM_OAUTH_TOKEN, logging whatever comes back (or why it failed).
-#   - RabbitMQ consume connection initialisation and the background consumer thread (see utils_queue/queue.py) - the session-routing/agent-call pipeline is added here as its owning modules are built (see bot_sanctuary/CODE_TODO.md).
+#   - One-off LLM credential smoke test performed during startup.
+#   - RabbitMQ consume connection and background consumer lifecycle management.
+#   - Crash-recovery sweep for sessions left dangling by a prior run.
+#   - Graceful shutdown of active session workers ahead of connection teardown.
 #
 # Notes       :
-#   - Intended to be executed once during application startup.
-#   - Initialisation order should follow application dependency requirements.
-#   - test_llm_oauth_token() is a standalone smoke test, not part of the RabbitMQ pipeline - it exists purely to confirm LLM_OAUTH_TOKEN is valid/reachable at startup, nothing more.
+#   - Intended to be invoked once during application startup and once during shutdown.
+#   - Initialisation order follows each dependency's own startup requirements.
+#   - See README.md for the full startup/shutdown sequence and design rationale.
 #
 # =============================================================================
 # I M P O R T   H E A D E R
@@ -28,6 +30,7 @@ from .utils_queue.queue import (
     close_rabbitmq_connection
 )
 from .utils_redis.database import close_redis_connection
+from .utils_session.session_worker import resync_orphaned_sessions, shutdown_all_session_workers
 
 # =============================================================================
 # G L O B A L   V A R I A B L E
@@ -38,7 +41,9 @@ logger = logging.getLogger(__name__)
 
 async def _send_llm_test_prompt() -> None:
     """
-    Sends a single minimal prompt through claude_agent_sdk, logging the assistant's reply.
+    Sends a single test prompt through the Claude Agent SDK, logging the assistant's reply.
+
+    Used to confirm that LLM_OAUTH_TOKEN is valid and the LLM endpoint is reachable during startup.
 
     Args:
         None
@@ -47,9 +52,7 @@ async def _send_llm_test_prompt() -> None:
         None
 
     Notes:
-        - claude_agent_sdk resolves credentials via its own CLAUDE_CODE_OAUTH_TOKEN environment variable (per bot_sanctuary/CODE_TODO.md's credential resolution order) - not LLM_OAUTH_TOKEN directly, so it's bridged across here, at the one call site that actually needs it, keeping config.py's own LLM_TYPE/LLM_OAUTH_TOKEN provider-agnostic.
-        - Deferred import of claude_agent_sdk - this is the only place in the module that needs it.
-        - Any failure (bad/expired token, network issue, SDK error) is caught and logged, not raised - a failed smoke test must not crash application startup.
+        - Any failure is caught and logged rather than raised, so a failed test never crashes application startup.
     """
     from claude_agent_sdk import AssistantMessage, TextBlock, query
 
@@ -66,7 +69,7 @@ async def _send_llm_test_prompt() -> None:
 
 def test_llm_oauth_token() -> None:
     """
-    Runs a one-off startup smoke test of LLM_OAUTH_TOKEN, logging the response (or failure).
+    Runs a one-off startup smoke test of LLM_OAUTH_TOKEN, logging the outcome.
 
     Args:
         None
@@ -75,8 +78,7 @@ def test_llm_oauth_token() -> None:
         None
 
     Notes:
-        - No-op (logged) if LLM_OAUTH_TOKEN is unset, or LLM_TYPE isn't "claude" - only the claude_agent_sdk path is implemented so far (see bot_sanctuary/CODE_TODO.md).
-        - Synchronous wrapper around _send_llm_test_prompt() - the rest of the application has no other async code yet, so the event loop is spun up and torn down just for this call.
+        - Skipped, with a warning logged, if no credential is configured or the configured provider is not yet supported.
     """
     if not settings.LLM_OAUTH_TOKEN:
         logger.warning("LLM_OAUTH_TOKEN is unset - skipping startup LLM credential test.")
@@ -91,6 +93,8 @@ def initialise_application() -> None:
     """
     Runs application startup steps.
 
+    Performs the LLM credential smoke test, establishes the RabbitMQ consume connection, recovers any sessions left dangling by a prior run, and starts the background message consumer.
+
     Args:
         None
 
@@ -98,12 +102,13 @@ def initialise_application() -> None:
         None
 
     Notes:
-        - Opens the RabbitMQ consume connection (retrying indefinitely if not yet reachable - see utils_queue/queue.py::initialise_rabbitmq_connection()) and starts the background consumer thread.
-        - The session-routing/agent-call pipeline is still a placeholder at the message-handling layer (see utils_queue/message_handler.py) - see bot_sanctuary/CODE_TODO.md §3.
+        - The crash-recovery sweep runs before the consumer thread starts, so no new task can be accepted while it is in progress.
+        - See README.md for the full startup sequence and its design rationale.
     """
     test_llm_oauth_token()
 
     initialise_rabbitmq_connection()
+    resync_orphaned_sessions()
     start_queue_consumer()
 
     logger.info("Bot Sanctuary application initialised.")
@@ -112,6 +117,8 @@ def terminate_application() -> None:
     """
     Runs application shutdown steps.
 
+    Stops accepting new messages, allows active session workers to finish their current work, then closes the RabbitMQ and Redis connections.
+
     Args:
         None
 
@@ -119,9 +126,11 @@ def terminate_application() -> None:
         None
 
     Notes:
-        - close_redis_connection() is a safe no-op if the gateway_alert throttle's lazy Redis connection (see utils_redis/database.py) was never actually opened.
+        - Steps run in dependency order, so a worker finishing its last batch still has a live connection available to it.
+        - See README.md for the full shutdown sequence and its design rationale.
     """
     stop_queue_consumer()
+    shutdown_all_session_workers()
     close_rabbitmq_connection()
     close_redis_connection()
     logger.info("Bot Sanctuary application terminated.")
