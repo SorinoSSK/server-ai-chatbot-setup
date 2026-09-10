@@ -5,11 +5,10 @@
 # Created On  : 2026-09-06
 #
 # Features    :
-#   - Performs application startup/shutdown wiring (data directory, logging, signal handling).
+#   - Application startup/shutdown wiring (data directory, logging, signal handling).
 #
 # Notes       :
-#   - initialise_application() (see utilities/initialise.py) runs a one-off startup smoke test for every configured LLM provider credential, opens the RabbitMQ consume connection, and starts the background consumer thread.
-#   - The session-routing/agent-call pipeline is still a placeholder at the message-handling layer (see utilities/utils_queue/message_handler.py) - see bot_sanctuary/CODE_TODO.md §3.
+#   - Delegates actual startup/shutdown work to utilities/initialise.py.
 #
 # =============================================================================
 # I M P O R T   H E A D E R
@@ -29,16 +28,13 @@ def main():
     """
     Runs the Bot Sanctuary application for its entire process lifetime.
 
-    Performs application setup (data directory, logging), registers shutdown signal handlers, initialises the application, then blocks the main thread until a shutdown signal is received before terminating.
+    Performs application setup, registers shutdown signal handlers, initialises the application, then blocks until a shutdown signal is received before terminating.
 
     Args:
         None
 
     Returns:
         None
-
-    Notes:
-        - Setup is performed here (rather than at module import time) so importing this module has no filesystem/logging side effects - only running it as the application entry point does.
     """
     settings.DATA_DIR.mkdir(parents=True, exist_ok=True)
     settings.SESSION_DIR.mkdir(parents=True, exist_ok=True)

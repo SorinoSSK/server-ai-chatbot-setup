@@ -7,13 +7,11 @@
 # Features    :
 #   - Message type resolution and routing for every message consumed from RabbitMQ.
 #   - Systemic gateway_alert/gateway_recover notification handling, throttled and Redis-backed.
-#   - Session-scoped message routing to the owning per-session worker.
-#   - Session teardown handling on session_cleared - stops the owning SessionWorker (if any) and removes
-#     that session_id's on-disk session directory (see utils_session/session_worker.py).
+#   - Session-scoped message routing and session teardown handling.
 #
 # Notes       :
-#   - Owns its own JSON parsing so a malformed payload is logged and dropped rather than requeued forever.
-#   - See README.md for the full message routing and gateway_alert/gateway_recover notification design.
+#   - A malformed payload is logged and dropped rather than requeued forever.
+#   - See README.md for the full message routing and notification design.
 #
 # =============================================================================
 # I M P O R T   H E A D E R
@@ -123,8 +121,7 @@ def _handle_gateway_recover(data: dict) -> None:
 
 def _handle_session_cleared(data: dict) -> None:
     """
-    Handles a session_cleared acknowledgement, stopping any worker owning the named session and removing
-    its on-disk session directory.
+    Handles a session_cleared acknowledgement, stopping any worker owning the named session and removing its on-disk session directory.
 
     Args:
         data (dict):
@@ -134,12 +131,8 @@ def _handle_session_cleared(data: dict) -> None:
         None
 
     Notes:
-        - No active worker for the named session is a normal, expected case, and is logged at INFO rather than as a warning.
-        - clear_session_directory() is called unconditionally (even if no worker was found) - a session's
-          on-disk directory can outlive its SessionWorker (e.g. after a prior stop() without a matching
-          clear), so this does not skip cleanup just because nothing was currently active. The next message
-          for this session_id builds a brand new SessionWorker (and a fresh generation subfolder) from
-          scratch - see utils_session/session_worker.py's own Notes on why a fresh generation matters.
+        - No active worker for the named session is a normal, expected case.
+        - The on-disk directory is removed unconditionally, even if no worker was active.
     """
     session_id = data.get("session_id")
     if not session_id:

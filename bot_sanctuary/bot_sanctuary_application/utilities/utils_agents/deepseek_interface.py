@@ -9,28 +9,10 @@
 #   - query_via_oauth() - not supported; always logs and returns None (see Notes).
 #
 # Notes       :
-#   - Unlike claude_interface.py/codex_interface.py, DeepSeek is API-key-only - the official DeepSeek API
-#     has never offered an OAuth flow, and there is no official DeepSeek CLI to log in with at all (see
-#     bot_sanctuary/CODE_TODO.md §1/§2). query_via_oauth() exists purely so this module still matches the
-#     two-endpoint shape agent_interface.py::query_llm() dispatches against, uniformly, without a
-#     per-provider capability check - it is never expected to be reached in a correctly-configured
-#     deployment (config.py's LLM_DEEPSEEK_ACCESS_TYPE should be "API" - the default already).
-#   - No DeepSeek Python SDK dependency is installed - the DeepSeek API is OpenAI-compatible, so this
-#     calls its REST endpoint directly via the stdlib (urllib.request, wrapped in asyncio.to_thread() so
-#     the blocking call doesn't stall the event loop), rather than adding a new pip dependency for one
-#     HTTP call shape.
-#   - The credential is passed in by the caller (token, below) rather than read from settings directly -
-#     agent_interface.py resolves it from config.py's LLM_DEEPSEEK_TOKEN before calling either endpoint,
-#     so this module has no dependency on global config state and stays a pure function of its arguments.
-#     Bridged into the standard "Authorization: Bearer <token>" header - never logged.
-#   - Endpoint/model (_API_URL/_MODEL below) confirmed against DeepSeek's own API docs at the time this
-#     was written - see bot_sanctuary/CODE_TODO.md §2 if either ever needs revisiting.
-#   - persona (below) is delivered as its own {"role": "system", ...} message ahead of the user message -
-#     the standard OpenAI-compatible convention this API already supports - rather than being concatenated
-#     into prompt as plain text.
-#   - See agent_interface.py for the provider-agnostic dispatch that selects between this module and any
-#     other provider's own interface file, and bot_sanctuary/CODE_TODO.md for the wider multi-provider
-#     design context.
+#   - DeepSeek is API-key-only - it has no OAuth flow and no official CLI.
+#   - No DeepSeek Python SDK exists, so this calls its OpenAI-compatible REST endpoint directly via stdlib urllib, wrapped in asyncio.to_thread().
+#   - persona is delivered as its own leading "system" role message, not concatenated into prompt.
+#   - See agent_interface.py for the provider-agnostic dispatch that selects this module.
 #
 # =============================================================================
 # I M P O R T   H E A D E R
@@ -61,27 +43,21 @@ def _post_chat_completion(prompt: str, token: str, persona: str | None = None) -
             The prompt to send.
 
         token (str):
-            The DeepSeek API key (config.py's LLM_DEEPSEEK_TOKEN).
+            The DeepSeek API key.
 
         persona (str | None):
-            Optional persona/system prompt for this call, sent as its own leading "system" role message.
+            Optional persona/system prompt for this call.
 
     Returns:
         str | None:
             The assistant's reply text, or None if the request failed or returned no content.
 
     Notes:
-        - Synchronous/blocking (stdlib urllib) - only ever called via asyncio.to_thread(), never directly
-          from an async context, so it never stalls the event loop.
-        - Any failure (HTTP error, network error, unexpected response shape) is caught and logged rather
-          than raised, matching claude_interface.py's/codex_interface.py's own "never crash the caller"
-          convention.
+        - Synchronous/blocking - only ever called via asyncio.to_thread().
     """
     messages = []
     if persona:
         messages.append({"role": "system", "content": persona})
-    else:
-        pass  # No persona for this call - a plain single-turn user message, same as this function's original behaviour.
     messages.append({"role": "user", "content": prompt})
 
     body = json.dumps({
@@ -120,18 +96,17 @@ async def query_via_api(prompt: str, token: str, persona: str | None = None) -> 
             The prompt to send.
 
         token (str):
-            The DeepSeek API key (config.py's LLM_DEEPSEEK_TOKEN).
+            The DeepSeek API key.
 
         persona (str | None):
-            Optional persona/system prompt for this call - see _post_chat_completion()'s own Notes.
+            Optional persona/system prompt for this call.
 
     Returns:
         str | None:
             The assistant's text reply, or None on failure.
 
     Notes:
-        - Runs the blocking HTTP call in a worker thread (asyncio.to_thread()) so it doesn't stall the
-          event loop other async work (e.g. claude_interface.py's own SDK call) may be running on.
+        - Runs the blocking HTTP call in a worker thread so it doesn't stall the event loop.
     """
     return await asyncio.to_thread(_post_chat_completion, prompt, token, persona)
 
@@ -152,10 +127,6 @@ async def query_via_oauth(prompt: str, token: str, persona: str | None = None) -
     Returns:
         str | None:
             Always None.
-
-    Notes:
-        - Reaching this at all means LLM_DEEPSEEK_ACCESS_TYPE is configured as "OAUTH", which is a
-          configuration mistake - "API" is the only access type DeepSeek actually supports.
     """
     logger.warning("LLM_DEEPSEEK_ACCESS_TYPE=\"OAUTH\" is not supported - DeepSeek is API-key-only. Set LLM_DEEPSEEK_ACCESS_TYPE=\"API\" instead.")
     return None

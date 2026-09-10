@@ -12,10 +12,6 @@
 #
 # Notes       :
 #   - Intended to be invoked once during application startup and once during shutdown.
-#   - Initialisation order follows each dependency's own startup requirements.
-#   - The LLM credential smoke test itself (test_llm_tokens()) lives in utils_agents/agent_interface.py,
-#     not here - this module only invokes it, keeping every LLM-facing call in one place. It now tests
-#     every configured LLM provider in turn, not just one - see agent_interface.py's own Notes.
 #   - See README.md for the full startup/shutdown sequence and design rationale.
 #
 # =============================================================================
@@ -53,7 +49,6 @@ def initialise_application() -> None:
         None
 
     Notes:
-        - The crash-recovery sweep runs before the consumer thread starts, so no new task can be accepted while it is in progress.
         - See README.md for the full startup sequence and its design rationale.
     """
     test_llm_tokens()
@@ -77,7 +72,6 @@ def terminate_application() -> None:
         None
 
     Notes:
-        - Steps run in dependency order, so a worker finishing its last batch still has a live connection available to it.
         - See README.md for the full shutdown sequence and its design rationale.
     """
     stop_queue_consumer()

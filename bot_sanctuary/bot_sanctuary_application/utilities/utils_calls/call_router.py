@@ -9,19 +9,9 @@
 #   - get_call() - resolves a Call name to its module.
 #
 # Notes       :
-#   - Mirrors utils_agents/agent_interface.py's own dispatch-by-name shape (a registry lookup plus one
-#     explicit-argument entry point), applied to Calls instead of LLM providers.
-#   - Deliberately, individual Call modules (chat_call.py/architect_call.py/coder_call.py/review_call.py/
-#     documentation_call.py) never import each other or this router - that would need five modules to all
-#     know about each other (and about this router, which already knows about all five), a circular-import
-#     shape with no real benefit. This router is instead the one place that knows about every Call and
-#     mediates any handoff between them - "every Call type can call every other" is satisfied by this one,
-#     central, any-to-any handoff function, not by direct module-to-module references. A Call module is
-#     expected to stay self-contained (prompt in, reply out); deciding *whether* to hand off, and to whom,
-#     is intended to live in the per-thread turn loop that calls handoff_call() (not yet built - see
-#     CODE_TODO.md §5's phased plan), not inside a Call module itself.
-#   - No bounded back-and-forth limit, no whitelist/access-tier check, and no turn loop exist yet - this is
-#     routing/dispatch plumbing only. See bot_sanctuary/CODE_TODO.md §5 for the phased plan this belongs to.
+#   - Mirrors agent_interface.py's dispatch-by-name shape, applied to Calls instead of LLM providers.
+#   - Individual Call modules never import each other or this router, avoiding circular imports.
+#   - No bounded handoff limit, whitelist check, or turn loop exists yet - this is routing plumbing only.
 #
 # =============================================================================
 # I M P O R T   H E A D E R
@@ -76,14 +66,11 @@ async def handoff_call(target_call: str, prompt: str) -> str | None:
 
     Returns:
         str | None:
-            The target Call's reply, or None if target_call isn't recognised, or the Call itself returned
-            nothing.
+            The target Call's reply, or None if target_call isn't recognised or the Call returned nothing.
 
     Notes:
-        - Any Call can be handed off to from any other - there is no fixed pipeline order enforced here
-          (see bot_sanctuary/CODE_TODO.md §5 - "any Call may respond directly or hand off to another Call").
-        - Does not bound how many handoffs a single turn can chain through - that belongs to the per-thread
-          turn loop this router is meant to be called from, not yet built (see CODE_TODO.md §5).
+        - Any Call can be handed off to from any other - there is no fixed pipeline order.
+        - Does not bound how many handoffs a single turn can chain through.
     """
     call = get_call(target_call)
     if call is None:

@@ -29,9 +29,7 @@ from .message_handler import process_message
 
 logger = logging.getLogger(__name__)
 
-# The single consume connection/channel is only ever touched by the one background consumer thread (see
-# start_queue_consumer()) - this lock guards lifecycle transitions (start/stop/close), not concurrent use
-# from multiple threads.
+# Guards lifecycle transitions (start/stop/close) on the single shared consume connection.
 _lock_consume = threading.RLock()
 
 _connection_consume = None
@@ -40,10 +38,7 @@ _channel_consume = None
 _consumer_thread = None
 _consumer_running = False
 
-# Tracks failed processing attempts per message body, so a deterministically-failing message is
-# eventually dropped instead of being requeued forever.
-# In-memory only - only ever touched from the single consumer thread (pika callbacks run sequentially),
-# no lock needed.
+# Tracks failed attempts per message body, so a deterministically-failing message is eventually dropped.
 _message_attempts: dict[bytes, int] = {}
 
 # =============================================================================

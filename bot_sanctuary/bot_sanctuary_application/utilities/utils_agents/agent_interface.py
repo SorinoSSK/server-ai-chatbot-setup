@@ -5,42 +5,14 @@
 # Created On  : 2026-09-10
 #
 # Features    :
-#   - query_llm() - sends a prompt to an explicitly-named provider (llm_type), via that provider's own
-#     configured access method/credential (config.py's per-provider LLM_<PROVIDER>_ACCESS_TYPE/TOKEN).
-#   - test_llm_tokens() - one-off startup smoke test, invoked from utilities/initialise.py, run once per
-#     provider that actually has a credential configured.
+#   - query_llm() - sends a prompt to an explicitly-named provider, via that provider's configured access method/credential.
+#   - load_persona() - loads a provider/Call-specific persona file, if one has been written.
+#   - test_llm_tokens() - one-off startup smoke test, run once per provider with a configured credential.
 #
 # Notes       :
-#   - More than one provider's credentials can be configured/tested at once - there is no longer a single
-#     "current" global provider. query_llm() takes llm_type as an explicit argument (a plain string -
-#     "claude"/"codex"/"deepseek"/"qwen") rather than reading a single settings.LLM_TYPE, precisely so more
-#     than one caller can each ask for a different provider. All four are wired today via their own
-#     <provider>_interface.py; only claude/codex actually support both access types - deepseek/qwen are
-#     API-key-only, and their own query_via_oauth() is a stub that logs and returns None rather than being
-#     a real implementation (see each module's own Notes for why).
-#   - **Per-Call provider routing is now real** - each named Call (Chat/Architect/Coder/Review/
-#     Documentation, see utils_calls/) resolves its own config.py LLM_<CALL>_TYPE and calls query_llm()
-#     with it directly. This module still only provides the building block (an explicit-llm_type
-#     query_llm()) - it has no opinion on which Call is calling it or why, that routing logic lives in
-#     utils_calls/ (see bot_sanctuary/CODE_TODO.md §5).
-#   - Add a <provider>_interface.py alongside this file (same two-endpoint shape as the four existing
-#     ones - a query_via_oauth(prompt, token, persona=None) and a query_via_api(prompt, token, persona=None),
-#     even if one is only ever a "not supported" stub) and a matching branch in _resolve_provider() below,
-#     for any further future provider - see bot_sanctuary/CODE_TODO.md §1/§2.
-#   - test_llm_tokens() calls query_llm() itself for each configured provider - it is not a special-cased
-#     path outside the normal dispatch, unlike the single-provider smoke test this replaced.
-#   - query_llm()'s optional persona argument is passed straight through to whichever provider module is
-#     resolved, which is each provider's own native mechanism for it - never string-concatenated into
-#     prompt here or by any Call. See each <provider>_interface.py's own Notes for what "native" means for
-#     that provider (Claude Agent SDK's system_prompt/tools/model options; a per-call AGENTS.md for Codex;
-#     an OpenAI-style "system" role message for DeepSeek/Qwen).
-#   - load_persona() reads that persona content from bot_sanctuary_application/libraries/<llm_type>/
-#     <call_name>.md - one file per provider per Call, so the same Call can have a differently-optimised
-#     persona depending on which provider it's actually configured to use (e.g. Claude's copy is written
-#     with its own name:/description:/tools:/model: frontmatter, meaningful to claude_interface.py; an
-#     OpenAI-compatible provider's copy is just plain persona text). Callers (each <name>_call.py) resolve
-#     their own llm_type first and pass it here - this module has no opinion on which provider a Call uses,
-#     same as query_llm() itself. See bot_sanctuary/CODE_TODO.md §5 for the wider design.
+#   - More than one provider can be configured and used at once - callers pass llm_type explicitly rather than reading a single global setting.
+#   - Add a matching <provider>_interface.py and a branch in _resolve_provider() to support a further provider.
+#   - persona is passed through to the resolved provider's own native mechanism, never concatenated into prompt.
 #
 # =============================================================================
 # I M P O R T   H E A D E R
@@ -62,8 +34,6 @@ logger = logging.getLogger(__name__)
 
 _KNOWN_LLM_TYPES = ("claude", "codex", "deepseek", "qwen")
 
-# bot_sanctuary_application/libraries/ - this file lives at
-# bot_sanctuary_application/utilities/utils_agents/agent_interface.py, three levels below it.
 _LIBRARIES_ROOT = Path(__file__).resolve().parent.parent.parent / "libraries"
 
 # =============================================================================
@@ -104,12 +74,7 @@ def load_persona(llm_type: str, call_name: str) -> str | None:
 
     Returns:
         str | None:
-            The raw content of libraries/<llm_type>/<call_name>.md, or None if that file doesn't exist or
-            is empty/whitespace-only (not yet written for that provider/Call combination).
-
-    Notes:
-        - Returns raw file content, unparsed - claude_interface.py parses its own frontmatter
-          (name:/description:/tools:/model:) out of what this returns; other providers use it as-is.
+            The raw content of libraries/<llm_type>/<call_name>.md, or None if that file doesn't exist or is empty.
     """
     library_file = _LIBRARIES_ROOT / llm_type / f"{call_name}.md"
     if not library_file.is_file():
@@ -124,22 +89,17 @@ async def query_llm(llm_type: str, prompt: str, persona: str | None = None) -> s
 
     Args:
         llm_type (str):
-            Which provider to use - "claude", "codex", "deepseek", or "qwen". Passed explicitly by the
-            caller rather than read from a single global setting, since more than one provider's
-            credentials can be configured at once (see config.py's per-provider LLM_<PROVIDER>_* settings).
+            Which provider to use - "claude", "codex", "deepseek", or "qwen".
 
         prompt (str):
             The prompt to send.
 
         persona (str | None):
-            Optional persona/agent-context content for this call, typically the result of a prior
-            load_persona() call. Delivered via whichever mechanism is native to the resolved provider (see
-            this module's own Notes above) - never concatenated into prompt here.
+            Optional persona/agent-context content for this call, typically the result of a prior load_persona() call.
 
     Returns:
         str | None:
-            The assistant's text reply, or None if llm_type is not recognised, its configured access type
-            is invalid, or the underlying call failed.
+            The assistant's text reply, or None if llm_type/its access type is invalid, or the call failed.
     """
     resolved = _resolve_provider(llm_type)
     if resolved is None:
@@ -166,16 +126,10 @@ async def _send_llm_test_prompt(llm_type: str) -> None:
 
     Returns:
         None
-
-    Notes:
-        - Delegates to query_llm() - any failure there is already caught and logged internally by the
-          provider's own interface module, so a failed test never crashes application startup.
     """
     reply = await query_llm(llm_type, f"Hello - this is a startup connectivity test for {llm_type}. Reply with a short acknowledgement.")
     if reply is not None:
         logger.info(f"{llm_type} credential test response: {reply}")
-    else:
-        pass  # Failure is already logged inside query_llm()/the provider's own interface module - nothing further to do here.
 
 def test_llm_tokens() -> None:
     """
@@ -188,12 +142,7 @@ def test_llm_tokens() -> None:
         None
 
     Notes:
-        - Independent of config.py's LLM_CHAT_TYPE - every provider with a non-empty token is tested, not
-          just whichever one a future chat/Call pipeline might be configured to use.
-        - A provider with no token configured is skipped with an info log, not a warning - having only
-          some providers configured is the expected/normal case, not a misconfiguration.
-        - Each provider is tested with its own currently-configured access type - this does not attempt
-          both OAUTH and API per provider, only whichever one is actually set.
+        - A provider with no credential configured is skipped, not treated as a misconfiguration.
     """
     for llm_type in _KNOWN_LLM_TYPES:
         _, _, token = _resolve_provider(llm_type)

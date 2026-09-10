@@ -1,5 +1,52 @@
 # TODO Record for Telegram Gateway
 
+## BUG — `SESSION_RESET_ALLOWED_CHAT_IDS` implements self-service per-chat reset, not admin-triggered global reset
+
+Status: **Requirement clarified by user (2026-09-10) - current implementation does not match and needs rework. Not yet implemented - documented only, per explicit instruction ("Do not implement, I need this documented").**
+
+### Confirmed requirement (authoritative - given directly by user, must not change)
+
+- `SESSION_RESET_ALLOWED_CHAT_IDS` identifies the bot admin(s) - the group of individuals permitted to trigger a **global** reset of every session the bot is currently holding, not a self-service reset of their own chat. The env var's name is confirmed correct as-is - only its enforcement scope/target was wrong.
+- No `chat_id` may reset its own session on request, with exactly two legitimate paths to a session ever being cleared:
+  1. The admin/owner (a `chat_id` in `SESSION_RESET_ALLOWED_CHAT_IDS`) triggers the global reset - their own session is cleared as part of that same action too, incidentally, since "every session" includes their own, not because self-service reset exists as its own separate path.
+  2. A future fixed/scheduled reset time configured in `bot_sanctuary` - an automatic, time-based reset, not user-triggered at all, not yet designed on either side (see Open Questions below, and the corresponding new entry in `bot_sanctuary/CODE_TODO.md`).
+- `coding_allowed` (`bot_sanctuary`'s agent-call access tier - full Call-handoff graph vs. Chat-only, see `## Agent-call access tier` below) is a **separate** concern from admin/reset privilege, confirmed by the user. It gets its own dedicated whitelist env var, decoupled from `SESSION_RESET_ALLOWED_CHAT_IDS` entirely. **The same group of individuals is expected to hold both today** - that's a coincidence of who the user currently trusts with each privilege, not a structural requirement that the two lists must ever be kept in sync.
+
+### Symptom / current (incorrect) behaviour
+
+- `session_reset_handler.py::_is_reset_allowed(chat_id)` checks whether the **requesting chat's own** `chat_id` is in `SESSION_RESET_ALLOWED_CHAT_IDS`.
+- `handle_session_reset_request(task_id, chat_id)` / `_apply_session_reset(chat_id)` then only ever clears **that same chat's own** session - `reset_session(chat_id)` is entirely single-`chat_id`-scoped, by construction.
+- Net effect as built: a whitelisted chat can clear only its own session; a non-whitelisted chat can clear nothing. There is no "reset every session currently held" action anywhere in the codebase today - no function enumerates active sessions at all (`utils_redis/database.py` has no `session:*` equivalent of `get_all_chat_draft_ids()`/`get_all_poll_ids()`'s existing `SCAN`-based sweep).
+- `## Agent-call access tier` (below) then inherited the same conflation by deliberately reusing this same whitelist for `coding_allowed`, reasoning "a chat_id permitted to trigger a session_reset is treated as the same tier permitted full agent-call access" - a reasonable-sounding shortcut once `SESSION_RESET_ALLOWED_CHAT_IDS` is (mis)understood as a self-service permission, but not what was actually meant to be tied together once its correct admin/global meaning is restored.
+
+### Root cause
+
+`_is_reset_allowed()`/its whitelist were modelled directly on `TELEGRAM_ALLOWED_CHAT_IDS`'s existing pattern - see the original §7 Goal note further below: *"Same precedent as TELEGRAM_ALLOWED_CHAT_IDS... comma-separated env var -> set[int]."* That pattern answers "does this `chat_id` get to do X to itself?", which is correct for `TELEGRAM_ALLOWED_CHAT_IDS` (may this chat talk to the bot at all) but was never actually correct for an admin-triggers-a-global-action whitelist - the check needs to gate on the *requester's* identity while the *effect* fans out to every chat, not just the requester's own. That distinction was never drawn during the original implementation; the existing single-chat-scoped pattern was reused wholesale instead of designed against the actual admin/global requirement.
+
+### Must fix (not yet implemented - documented only, per explicit instruction)
+
+- [ ] Add a chat_id-enumeration primitive (`utils_redis/database.py`, e.g. `get_all_session_chat_ids()`, `SCAN`-based over `session:*`, mirroring `get_all_chat_draft_ids()`/`get_all_poll_ids()`'s existing shape) - needed since nothing today can answer "which chat_ids currently hold a session."
+- [ ] Rework `handle_session_reset_request()`'s whitelist check to gate on the **requester's own** `chat_id` being in `SESSION_RESET_ALLOWED_CHAT_IDS` (this half was already directionally correct), then, if permitted, apply `_apply_session_reset()` to **every** `chat_id` returned by the new enumeration primitive above - not just the requester's own `chat_id`.
+- [ ] Work through the deferred-vs-immediate logic (§1-§5 further below) per affected `chat_id` individually - a global reset can't treat "any chat has an open task" as a single gate the way today's single-chat check does; each chat's own `has_open_tasks()` state still needs to be respected independently, per this feature's existing deferred-reset design.
+- [ ] Confirm the resulting end state has no other self-service reset path - today, a non-admin `chat_id` has no way to trigger anything at all; per the confirmed requirement above, this is correct and should remain the case (the only two paths that ever clear a session are the admin-triggered global reset, and a possible future scheduled reset from `bot_sanctuary`).
+- [ ] `## Agent-call access tier` (below): replace the reused `SESSION_RESET_ALLOWED_CHAT_IDS` check with a new, dedicated whitelist env var (name not yet chosen - `AGENT_CALL_ALLOWED_CHAT_IDS` was the original candidate, rejected at the time in favour of reuse; worth reconsidering now that reuse is confirmed incorrect) - decoupled from `SESSION_RESET_ALLOWED_CHAT_IDS` entirely, even though today's actual membership is expected to be identical for both.
+- [ ] README.md's `session_reset` documentation (currently describes a per-chat, self-scoped action) needs rewriting to describe the corrected global-reset behaviour, once implemented - not updated yet, since the implementation itself hasn't changed.
+
+### Open Questions
+
+1. Exact shape of `bot_sanctuary`'s future "fixed reset time" mechanism (a scheduled, time-based automatic reset, given by the user as the other legitimate path to a session being cleared) - not yet designed on either side. Whether it should itself go through the same "reset every session" global action, or reset on a per-chat schedule independently, is undecided. Tracked as a new open item in `bot_sanctuary/CODE_TODO.md`.
+2. Exact new env var name for the decoupled `coding_allowed` whitelist - not yet chosen (see Must fix above).
+
+### Where
+
+- `telegram_gateway_application/utilities/utils_session/session_reset_handler.py`: `_is_reset_allowed()`, `handle_session_reset_request()`, `_apply_session_reset()`, `resolve_pending_reset_if_ready()`, `resync_pending_resets()`, `_enforce_pending_reset_ceiling()` - every one of these currently takes/operates on a single `chat_id`, and would need to operate across every currently-active `chat_id` for the admin-triggered path.
+- `telegram_gateway_application/utilities/utils_redis/database.py`: new enumeration primitive.
+- `telegram_gateway_application/utilities/utils_telegram/gateway_inbound.py::_push_task()`: `coding_allowed` stamping, once decoupled onto its own whitelist.
+- `README.md`: `session_reset` section, Agent-call access tier env var table.
+- `bot_sanctuary/CODE_TODO.md`: new cross-reference for the future scheduled-reset mechanism.
+
+---
+
 ## Agent-call access tier — whitelist for `bot_sanctuary`
 
 Status: **Implemented, reusing `SESSION_RESET_ALLOWED_CHAT_IDS` rather than a new whitelist.** Cross-service follow-up flagged from `bot_sanctuary/CODE_TODO.md` — `bot_sanctuary`'s multi-agent "Call" model (Chat [persona: Rukia] + Architect/Coder/Review/Documentation) needs to know, per task, whether the requesting `chat_id` is allowed to reach any Call beyond Chat. `telegram_gateway` is the right owner since it's the only component that knows chat_id identity — `bot_sanctuary` should not need its own whitelist lookup.
@@ -16,6 +63,7 @@ Same precedent as `SESSION_RESET_ALLOWED_CHAT_IDS` (§7 above) — comma-separat
   Field name finalised as `coding_allowed` (not `full_access`, the placeholder above). Always present on every task payload — `True` if `chat_id` is whitelisted, `False` by default otherwise. See README.md's Task Queue Payload section.
 - [x] Scoped to the payload built in `_push_task()` only (plain text/finalised-draft tasks) — the poll-answer/poll-timed-out pushes (`poll_response_handler.py`) and the delivery-failure/gateway-alert events (`error_handling.py`) do not currently carry `coding_allowed`, since those call sites resolve only `task_id`→`session_id` and don't have `chat_id` on hand. Extending it there, if `bot_sanctuary` needs it on every payload type rather than just the initial task, is open follow-up work.
 - [x] No enforcement on this side beyond the tag itself — `bot_sanctuary` is the one that actually restricts which Calls a tagged-Chat-only task can reach; `telegram_gateway`'s job here is purely to know and stamp identity, consistent with its existing "translate only, no downstream business logic" role.
+- [ ] **Superseded by user clarification (2026-09-10) — see the `BUG` entry at the top of this file.** Reusing `SESSION_RESET_ALLOWED_CHAT_IDS` here was decided on the (incorrect) understanding that it meant "self-service reset permission," treated as the same tier as full agent-call access. Its actual meaning is "bot admin, may trigger a global reset of every session" — a different privilege entirely. `coding_allowed` needs its own dedicated whitelist env var, decoupled from `SESSION_RESET_ALLOWED_CHAT_IDS`, even though the same individuals are expected to hold both today. Not yet implemented — see the `BUG` entry's "Must fix" list.
 
 ---
 

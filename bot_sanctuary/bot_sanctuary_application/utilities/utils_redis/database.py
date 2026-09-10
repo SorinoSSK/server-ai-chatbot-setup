@@ -104,7 +104,7 @@ def record_gateway_alert_occurrence() -> int | None:
             The counter's new value if recorded successfully; otherwise None once retry attempts are exhausted.
 
     Notes:
-        - A fixed cooldown-length TTL is applied only the first time the counter is created for a fresh window, so it self-clears on a guaranteed schedule regardless of how many further occurrences arrive.
+        - A fixed cooldown-length TTL is applied only the first time the counter is created for a fresh window.
     """
     for attempt in range(1, settings.REDIS_TASK_MAX_ATTEMPTS + 1):
         try:
