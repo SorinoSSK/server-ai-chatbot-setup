@@ -2,7 +2,7 @@
 
 ## BUG — `SESSION_RESET_ALLOWED_CHAT_IDS` implements self-service per-chat reset, not admin-triggered global reset
 
-Status: **Requirement clarified by user (2026-09-10) - current implementation does not match and needs rework. Not yet implemented - documented only, per explicit instruction ("Do not implement, I need this documented").**
+Status: **Design finalised (2026-09-11) - admin command ("Rukia refresh yourself") + `session_clear_request`/`session_reset` round-trip with `bot_sanctuary`. Corrected 2026-09-12 - the 2026-09-11 design wrongly modelled `bot_sanctuary` publishing one `session_reset` per session, after finishing; see "Confirmed design correction" below. Parts 0, 1, 2, 4, and 5's `telegram_gateway` side all implemented 2026-09-12 (`_is_reset_allowed()` removal included - pulled forward ahead of Part 4; two defensive hardening fixes also added post-implementation, see Part 4's "Post-implementation hardening"). `telegram_gateway`'s entire side of this feature is now implemented, plus one `telegram_gateway`-side-only correction to `session_cleared` (`chat_id` dropped from its payload - see Part 3's own subsection below; full retirement of that event deferred to `bot_sanctuary`'s side of Part 3). Only Part 3 (`bot_sanctuary` accepting `session_clear_request`/publishing `session_reset`) and Part 5's `bot_sanctuary` side (actually sending `bot_started`) remain - both a separate codebase, deliberately left to last, tracked in `bot_sanctuary/CODE_TODO.md`.** Supersedes the "Must fix" list this entry originally carried (2026-09-10) - kept below, marked superseded, for history.
 
 ### Confirmed requirement (authoritative - given directly by user, must not change)
 
@@ -23,27 +23,244 @@ Status: **Requirement clarified by user (2026-09-10) - current implementation do
 
 `_is_reset_allowed()`/its whitelist were modelled directly on `TELEGRAM_ALLOWED_CHAT_IDS`'s existing pattern - see the original §7 Goal note further below: *"Same precedent as TELEGRAM_ALLOWED_CHAT_IDS... comma-separated env var -> set[int]."* That pattern answers "does this `chat_id` get to do X to itself?", which is correct for `TELEGRAM_ALLOWED_CHAT_IDS` (may this chat talk to the bot at all) but was never actually correct for an admin-triggers-a-global-action whitelist - the check needs to gate on the *requester's* identity while the *effect* fans out to every chat, not just the requester's own. That distinction was never drawn during the original implementation; the existing single-chat-scoped pattern was reused wholesale instead of designed against the actual admin/global requirement.
 
-### Must fix (not yet implemented - documented only, per explicit instruction)
+### Must fix (2026-09-10 draft) - superseded by "Confirmed design" below, kept for history
 
-- [ ] Add a chat_id-enumeration primitive (`utils_redis/database.py`, e.g. `get_all_session_chat_ids()`, `SCAN`-based over `session:*`, mirroring `get_all_chat_draft_ids()`/`get_all_poll_ids()`'s existing shape) - needed since nothing today can answer "which chat_ids currently hold a session."
-- [ ] Rework `handle_session_reset_request()`'s whitelist check to gate on the **requester's own** `chat_id` being in `SESSION_RESET_ALLOWED_CHAT_IDS` (this half was already directionally correct), then, if permitted, apply `_apply_session_reset()` to **every** `chat_id` returned by the new enumeration primitive above - not just the requester's own `chat_id`.
-- [ ] Work through the deferred-vs-immediate logic (§1-§5 further below) per affected `chat_id` individually - a global reset can't treat "any chat has an open task" as a single gate the way today's single-chat check does; each chat's own `has_open_tasks()` state still needs to be respected independently, per this feature's existing deferred-reset design.
-- [ ] Confirm the resulting end state has no other self-service reset path - today, a non-admin `chat_id` has no way to trigger anything at all; per the confirmed requirement above, this is correct and should remain the case (the only two paths that ever clear a session are the admin-triggered global reset, and a possible future scheduled reset from `bot_sanctuary`).
-- [ ] `## Agent-call access tier` (below): replace the reused `SESSION_RESET_ALLOWED_CHAT_IDS` check with a new, dedicated whitelist env var (name not yet chosen - `AGENT_CALL_ALLOWED_CHAT_IDS` was the original candidate, rejected at the time in favour of reuse; worth reconsidering now that reuse is confirmed incorrect) - decoupled from `SESSION_RESET_ALLOWED_CHAT_IDS` entirely, even though today's actual membership is expected to be identical for both.
-- [ ] README.md's `session_reset` documentation (currently describes a per-chat, self-scoped action) needs rewriting to describe the corrected global-reset behaviour, once implemented - not updated yet, since the implementation itself hasn't changed.
+The core diagnosis (Confirmed requirement/Symptom/Root cause above) is unchanged and still authoritative. This specific remediation list - built around `telegram_gateway` itself enumerating every `chat_id` and applying a reset to all of them directly - was superseded on 2026-09-11 once the actual trigger mechanism (an in-chat admin command) and the cross-service split with `bot_sanctuary` were worked out. See "Confirmed design" below for what's actually being built.
+
+- [x] ~~Add a chat_id-enumeration primitive... needed since nothing today can answer "which chat_ids currently hold a session."~~ **Superseded** - `telegram_gateway` still gets an enumeration primitive (Part 0 below), but as a targeted `session_id -> chat_id` reverse lookup driven by `bot_sanctuary`'s own per-session `session_reset` publishes, not a bulk "list every chat_id" sweep applied all at once from this side.
+- [x] ~~Rework `handle_session_reset_request()`'s whitelist check to gate on the requester's own chat_id, then apply to every chat_id from the enumeration primitive.~~ **Superseded** - `bot_sanctuary`, not `telegram_gateway`, now decides and iterates which sessions get cleared (see Part 3/"Confirmed design" below). `telegram_gateway` no longer needs to fan a single admin request out to every chat_id itself.
+- [x] ~~Work through the deferred-vs-immediate logic per affected chat_id individually.~~ **No longer a distinct concern** - §0-§8's existing per-`chat_id` deferred logic is left completely untouched (see Part 4 below); it already handles one `chat_id` at a time correctly, and nothing in the new design asks it to do anything different.
+- [x] ~~Confirm the resulting end state has no other self-service reset path.~~ **Still true, unchanged** - see "Confirmed design" below; the only trigger is the whitelisted admin command.
+- [ ] `## Agent-call access tier` (below): still open, unchanged by this redesign - see its own entry.
+- [ ] README.md's `session_reset` documentation - still needs the rewrite, now against the design below instead.
+
+### Confirmed design (2026-09-11, superseding an earlier 2026-09-11 draft of this same section) — corrected 2026-09-12, see "Confirmed design correction" below
+
+New user-facing trigger: a whitelisted chat sends the literal text **`"${BOT_NAME} refresh yourself"`** - `${BOT_NAME}` interpolated from `settings.TELEGRAM_BOT_NAME` (the same variable already used for `RESET_NOTICE_MESSAGE` and every other persona-name string in this codebase), not a literal, hardcoded name. "Rukia" in earlier drafts of this entry was this project's own example persona, not the literal string to match.
+
+- `telegram_gateway` owns: detecting the command, gating it against `SESSION_RESET_ALLOWED_CHAT_IDS` on the **requesting** `chat_id`, ~~resolving `session_id -> chat_id` itself using its own existing Redis state~~ (**superseded 2026-09-12** - no `session_id` resolution exists anywhere in the corrected design; see below), and independently enumerating and attempting every chat_id it knows about on its own, rather than being told targets by `bot_sanctuary`.
+- `bot_sanctuary` owns: deciding whether to accept or ignore the request, clearing its own session state, and ~~notifying `telegram_gateway` per session as each is actually cleared~~ (**superseded 2026-09-12** - notifies `telegram_gateway` **once**, at the moment it *begins* the reset, not per session and not after finishing; see below). `bot_sanctuary` stays chat-agnostic throughout. Full entry: `bot_sanctuary/CODE_TODO.md`.
+- **Rejected intermediate design:** `bot_sanctuary` enumerating every active `session_id` and handing `telegram_gateway` an explicit target list. Rejected by the user - `telegram_gateway` already owns the `chat_id <-> session_id` mapping and should resolve/enumerate targets itself.
+- **No cross-process recovery of a `bot_sanctuary`-side sweep, deliberately.** Once `bot_sanctuary` consumes/acks a RabbitMQ message, its content is gone if the process crashes before finishing - there is nothing to "resume." `bot_sanctuary`'s own in-progress-sweep tracking is therefore plain in-memory, lost on any restart, with no attempt to persist or recover it. Reconciling anything left waiting on `telegram_gateway`'s side after such a crash is entirely `telegram_gateway`'s job, driven by a new `bot_started` signal (Part 5) - not something `bot_sanctuary` tries to do itself.
+
+Original flow diagram (2026-09-11) - **superseded by the corrected diagram below, kept for history**:
+
+```text
+Whitelisted chat: "${BOT_NAME} refresh yourself"
+        |
+telegram_gateway: detect command, check SESSION_RESET_ALLOWED_CHAT_IDS (requester),
+mint a real task_id for it (same as any other message)
+        | (whitelisted)                                  | (not whitelisted)
+push "session_clear_request" (task_id, chat_id)      treat as normal text,
+        |                                             _push_task() as usual
+bot_sanctuary: sweep already in progress?
+  yes -> IGNORE: send literal completed/error for the incoming task_id, stop.
+  no  -> mark sweep in progress (snapshot every session_id in the registry),
+         signal every one of them AT ONCE (concurrent, not sequential)
+        |
+  EACH session, independently, on its own thread:
+    finish current turn naturally (no abandonment, dedicated new method -
+    not shutdown()/stop()) -> clear own local state -> publish
+    "session_reset" (session_id, task_id: <last task_id, if any>)
+    -> log + report in; sweep-in-progress clears once every
+    snapshotted session has reported in once
+        |
+telegram_gateway, on receiving ANY session_reset:
+  resolve chat_id (task_id if present -> existing mapping; else session_id
+  -> new lookup, Part 0). If task_id present, close it exactly like a
+  completed/error would (this message doubles as that signal - no
+  separate completed/error is sent for the accepted/normal path at all).
+  THEN: independently enumerate every chat_id it knows about (its own
+  Part 0 primitive) and attempt the existing, unchanged
+  handle_session_reset_request()/has_open_tasks() logic for each one -
+  concurrently, no chat blocks another, each one deferred/applied purely
+  on its own open-task state. Idempotent - safe to re-run on every arrival.
+        |
+if bot_sanctuary restarts (crash or redeploy) before finishing:
+  it fires "bot_started" unconditionally on every startup (Part 5) ->
+  telegram_gateway force-resolves every still-pending chat directly via
+  _apply_session_reset() (NOT _force_apply_session_reset() - see Part 5)
+```
+
+### Confirmed design correction (2026-09-12) - one `session_reset` per trigger, sent at accept-time, no `session_id` resolution
+
+Corrects two mistakes in the 2026-09-11 diagram above, both caught by the user directly:
+
+1. **`bot_sanctuary` never publishes `session_reset` per session.** There is exactly **one** `session_reset` per trigger - whichever of the two scenarios below caused it - never one per session in a sweep. The "EACH session, independently... publish session_reset" step above never existed as a real requirement; it was this entry's own misreading of the original instruction, which was explicit: "session_reset is isolated... there should not be an indication for bot_sanctuary to inform telegram_gateway one by one."
+2. **`bot_sanctuary` sends that one `session_reset` when it *begins* handling the reset, not after it finishes clearing every session it holds.** Waiting until fully done before ever telling `telegram_gateway` would force the two sides to run sequentially (`bot_sanctuary` finishes its own graceful per-session termination first, only then `telegram_gateway` starts its own) instead of concurrently (each side runs its own graceful completion independently, in parallel) - "it will decouple session_reset sync," in the user's own words.
+
+**The two scenarios that produce a `session_reset`, restated:**
+
+1. **User-triggered** (the admin "refresh yourself" command, Part 1/2 below) - `telegram_gateway` mints a `task_id` for the triggering message, sends `session_clear_request`, `bot_sanctuary` accepts and immediately sends `session_reset` back **carrying that same `task_id`** (before it has finished clearing anything).
+2. **`bot_sanctuary`-triggered** (the still-undesigned future fixed/scheduled reset - see "Confirmed requirement" #2 above) - not user-initiated at all, so there is no `task_id` to carry. `bot_sanctuary` sends `session_reset` with `task_id: null`.
+
+**`telegram_gateway`'s handling of `session_reset` is identical in both scenarios except for one step:**
+- If `task_id` is present (scenario 1 only): resolve `chat_id` via the **existing** `get_task_mapping(task_id)` - the same resolution every other message type already uses, nothing new - and close that `task_id` out exactly like a `completed`/`error` would.
+- Regardless of scenario: independently enumerate every `chat_id` it knows about (`get_all_session_chat_ids()`) and attempt the existing, unchanged `handle_session_reset_request()`/`has_open_tasks()` logic for each one - concurrently, no chat blocks another, each deferred/applied purely on its own open-task state. Idempotent - safe to re-run on every arrival.
+
+**No `session_id -> chat_id` resolution exists anywhere in the corrected design.** There is never a case where `telegram_gateway` needs to identify "the one chat this `session_reset` targets," because the action is never scoped to a single chat - it's always either "close this one `task_id`, then sweep everyone" or just "sweep everyone." `session_id` is dropped from the payload entirely - confirmed by the user as serving no purpose on `telegram_gateway`'s side.
+
+Corrected flow diagram:
+
+```text
+Whitelisted chat: "${BOT_NAME} refresh yourself"          bot_sanctuary's own future
+        |                                                  scheduled/automatic reset
+telegram_gateway: detect command, check                   (not user-triggered, not yet
+SESSION_RESET_ALLOWED_CHAT_IDS (requester),                designed - see "Confirmed
+mint a real task_id for it (same as any                    requirement" #2 above)
+other message)                                                     |
+        | (whitelisted)          | (not whitelisted)                |
+push "session_clear_request"   treat as normal text,                |
+(task_id only - bot_sanctuary   _push_task() as usual                |
+ stays chat-agnostic)                                                |
+        |                                                            |
+        v                                                            v
+bot_sanctuary: sweep already in progress?
+  yes -> IGNORE: send literal completed/error for the incoming task_id (scenario 1
+         only - scenario 2 has none to close), stop.
+  no  -> mark sweep in progress, publish "session_reset" IMMEDIATELY
+         (task_id: <the triggering task_id> for scenario 1, null for scenario 2)
+         -> THEN begin gracefully finishing/clearing every session it holds
+        |
+telegram_gateway, on receiving ANY session_reset:
+  if task_id present -> resolve chat_id via existing get_task_mapping(), close
+  it exactly like a completed/error would (this message doubles as that signal -
+  no separate completed/error is sent for the accepted/normal path at all).
+  THEN, regardless: independently enumerate every chat_id it knows about (Part 0's
+  get_all_session_chat_ids()) and attempt the existing, unchanged
+  handle_session_reset_request()/has_open_tasks() logic for each one -
+  concurrently, no chat blocks another, each deferred/applied purely on its own
+  open-task state. Idempotent - safe to re-run on every arrival.
+        |
+if bot_sanctuary restarts (crash or redeploy) before finishing:
+  it fires "bot_started" unconditionally on every startup (Part 5) ->
+  telegram_gateway force-resolves every still-pending chat directly via
+  _apply_session_reset() (NOT _force_apply_session_reset() - see Part 5)
+```
+
+#### Part 0 — `chat_id` enumeration
+
+Status: **Re-implemented 2026-09-12 against the "Confirmed design correction" above - see the reverted/kept breakdown below.**
+
+- [x] New `utils_redis/database.py` primitive: `get_all_session_chat_ids() -> list[int]` - `SCAN`-based enumeration of every `chat_id` currently holding a `session:<chat_id>` entry, same shape/style as `get_all_chat_draft_ids()`/`get_all_poll_ids()`. Still needed and still correct as originally added (2026-09-11) - this is exactly what Part 4's broad sweep enumerates over in both scenarios. Not yet called from anywhere as of this entry - Part 4 itself is still not implemented.
+- [x] ~~`get_chat_id_for_session(session_id) -> int | None` - `SCAN`-based reverse lookup over `session:*`, used for the `task_id`-absent case.~~ **Reverted (2026-09-12).** Built on the mistaken belief that an absent `task_id` meant "resolve which single chat this targets" - it doesn't; an absent `task_id` means "nothing to close, go straight to the broad sweep" (see "Confirmed design correction" above). No code path ever needs a `session_id -> chat_id` lookup. Removed from `database.py` entirely.
+- [x] ~~`process_message()` reads `data.get("session_id")` and passes it through to `_handle_session_reset()`.~~ **Reverted (2026-09-12).** `session_id` is dropped from the payload design entirely - confirmed by the user as serving no purpose here. `process_message()`'s `session_reset` branch still dispatches ahead of the shared `task_id`/`get_task_mapping()` gate (that part was correct and is kept - `session_reset` is still the one type that may carry no `task_id`); it just no longer reads or forwards a `session_id`.
+- [x] `_handle_session_reset()` / `handle_session_reset_request()` signatures - **corrected 2026-09-12: `task_id: str | None` only, no second `session_id` parameter.** `handle_session_reset_request()` resolves `chat_id` via the existing `get_task_mapping(task_id)` when `task_id` is present; when absent, it resolves nothing and simply skips the close-a-task step, falling straight through to whatever Part 4's broad sweep does (not yet implemented) - there is no fallback resolution step of any kind.
+  - [x] `_is_reset_allowed()` - **removed outright, 2026-09-12 - pulled forward ahead of Part 4, see below.** Challenged directly by the user: "why is this still blocking?" - correctly so. It was never just a forward-looking cleanup item; it was actively wrong *today*, independent of anything else in this entry. An inbound `session_reset` always originates from `bot_sanctuary` itself (never directly from a chat), so there was nothing left to re-verify by the time it reached this function - and worse, `bot_sanctuary`'s already-shipped `resync_orphaned_sessions()` crash-recovery sweep sends a `session_reset` for **any** orphaned session regardless of chat, so this check was silently dropping crash-recovery resets for every non-whitelisted (i.e. non-admin) chat - a live instance of this entry's own "Symptom" section, not a hypothetical one. Removing it didn't need to wait for Part 4's broad sweep to exist first - the two were only bundled together in the original Part 4 draft because they were drafted at the same time, not because one depends on the other. `SESSION_RESET_ALLOWED_CHAT_IDS` itself is untouched and still has a job - gating Part 1's command-detection gate, not this function.
+  - `set_pending_reset()`/`get_all_pending_resets()` (`database.py`) and `_force_apply_session_reset()` (`session_reset_handler.py`) keep their `task_id: str | None` widening from the 2026-09-11 pass - **still needed, for a different reason than originally stated**: once Part 4's broad sweep exists, every `chat_id` *other than* the one (if any) tied to the triggering `task_id` has no `task_id` of its own to store against its own deferred reset - not because of any `session_id`-only path, which no longer exists.
+
+#### Part 1 — detect the command, mint a real task_id
+
+Status: **Implemented (2026-09-12).**
+
+- [x] `gateway_inbound.py`, at the point inbound text currently reaches `_push_task()` - new `_is_reset_command(text)`/`_handle_reset_command(chat_id, user_id)`, checked in `_handle_update()`'s plain-text branch only.
+- [x] **Match rule, decided (2026-09-11): case-insensitive, with leading/trailing/extra internal whitespace normalised away before comparison** - implemented as `" ".join(text.split()).lower()` (handles strip + internal-run-collapse in one step) compared against `f"{settings.TELEGRAM_BOT_NAME} refresh yourself".lower()`. Not a substring match - the normalised text must equal the normalised phrase in full.
+- [x] Whitelisted -> **mints a real `task_id`/task mapping** (same `create_task_mapping()` call `_push_task()` would have made), then pushes `session_clear_request` carrying it (Part 2) instead of a normal task payload. On a failed mint or push, mirrors `_push_task()`'s own apology-message shape rather than silently dropping.
+  - **Revised from an earlier draft that used `task_id: null` here.** Needed so `bot_sanctuary` has something concrete to close via a literal `completed`/`error` in the ignored-duplicate case (see Part 3/`bot_sanctuary`'s own entry) - `task_id: null` gave it nothing to close.
+  - **No special-casing for the requesting admin's own chat/session anywhere in this flow** - confirmed by the user. Its own eventual open task (this very command) is treated identically to any other chat's, folded into the same broad sweep and the same `session_reset`-closes-it-like-a-completed/error mechanism as everyone else - not a separate code path.
+- [x] Not whitelisted -> unchanged, falls through to `_push_task()` as ordinary text. Whitelisted but text doesn't match the command -> also unchanged, falls through to `_push_task()` as ordinary text (being whitelisted for reset doesn't make every message from that chat special).
+- **Scope decision made during implementation, not explicitly pinned down in the design above:** command detection only runs on a plain text message with **no draft pending** - never against a draft-finalising instruction. A pending draft's media always takes priority; the finalising text is only ever read as an instruction for that media, even in the narrow coincidental case where it happens to match the command phrase exactly. Flagged as an assumption, not re-confirmed with the user before implementing - open to revisiting if that's wrong.
+
+#### Part 2 — new outbound `session_clear_request`
+
+Status: **Implemented (2026-09-12).**
+
+- [x] **Corrected during implementation (2026-09-12): `{"task_id": <minted>, "type": "session_clear_request"}` only - no `chat_id`.** The originally-drafted shape above (`chat_id` included) was caught by the user - `bot_sanctuary` stays entirely chat-agnostic (see "Confirmed design correction" above), the same "identity-blind agents" principle every other outbound task payload already follows (see README.md's Design Decisions) - it has no use for `chat_id`, only `task_id` (to echo back later on its own `session_reset`). `push_session_clear_request(task_id, chat_id)` still accepts `chat_id` as a parameter, purely so its own log lines can identify which chat triggered the request - it's just never written into the payload itself.
+- [x] New helper alongside `_push_session_cleared()`'s existing pattern in `session_reset_handler.py` - public (not underscore-prefixed), since it's called from `gateway_inbound.py`, not just internally within this module. Same deferred-import-of-`queue_push_task` pattern to avoid the existing circular-import risk.
+
+#### Part 3 — `bot_sanctuary` side
+
+Owned and documented in full in `bot_sanctuary/CODE_TODO.md`'s own entry - accepts or ignores (sweep already in progress -> literal `completed`/`error` closes the incoming `task_id`, nothing else happens), and on acceptance publishes **one** `session_reset` **immediately** (**corrected 2026-09-12** - not per session, not after finishing; see "Confirmed design correction" above), then proceeds to gracefully finish/clear every session it holds, concurrently, via a new dedicated method (not `shutdown()`/`stop()` - a third, purpose-built exit path).
+
+**Cross-file consistency gap, flagged not fixed:** `bot_sanctuary/CODE_TODO.md`'s own "`session_clear_request` handling" entry is still dated 2026-09-11 and was never updated after this file's 2026-09-12 "Confirmed design correction" above - it still describes the disproven model (`session_reset` carrying `session_id`, published once **per session** as each finishes, rather than once per trigger at accept-time). Needs reconciling with the corrected design before `bot_sanctuary`'s side of Part 3 is actually implemented - out of scope for this pass (Part 3 remains a separate codebase, deliberately last), noted here so it isn't lost.
+
+##### `session_cleared` - investigated and partially corrected (2026-09-12), `telegram_gateway` side only
+
+Raised directly by the user: `_push_session_cleared()` was never removed, and still included `chat_id` in its payload - "I realised that `_push_session_cleared` is not removed which contradicts the requirement in addition to sending `chat_id` in... bot_sanctuary will not have an active session to ack this."
+
+- **Confirmed correct, on investigation.** `bot_sanctuary/CODE_TODO.md`'s own "`session_clear_request` handling" entry (§Decisions) already states its forthcoming dedicated per-session clearing method tears down its own `SessionWorker`/session directory **proactively**, as part of publishing its own `session_reset` - not waiting on or needing `telegram_gateway`'s `session_cleared` ack for anything ("`_handle_session_cleared()` still exists and is still idempotent against an already-removed session, but this feature does not wait on or need it"). So by the time that ack arrives - especially for a chat gateway deferred behind an open poll/task - `bot_sanctuary`'s worker for that session will typically already be gone. `session_cleared`'s original premise (an ack `bot_sanctuary` depends on to know when to tear its own state down) doesn't hold under the corrected, decoupled design.
+- **Three options presented (A: remove both sides now, B: remove `telegram_gateway`'s push side now and accept a temporary bot_sanctuary-side cleanup gap until Part 3 ships, C: fix the identity-blind violation now and defer full removal to Part 3-time).** Full removal (A/B) was set aside for now - `bot_sanctuary`'s Part 3 (the new dedicated clearing method) is not yet implemented, and today `_handle_session_cleared()` remains `bot_sanctuary`'s *only* mechanism for tearing down a stale `SessionWorker`/session directory after any reset. Removing `telegram_gateway`'s push side before that replacement exists would leave `bot_sanctuary` with no cleanup mechanism at all in the meantime.
+- [x] **Option C implemented (2026-09-12), `telegram_gateway` side only:** `_push_session_cleared()`'s payload no longer includes `chat_id` - `{"task_id": null, "session_id": "<cleared>", "type": "session_cleared"}`. Restores the "identity-blind agents" principle this payload had been a standing exception to; `session_id` alone is already sufficient for `bot_sanctuary`'s existing `_handle_session_cleared()` (keyed purely by `session_id`). `chat_id` is still accepted as a parameter, purely for this function's own log lines - same pattern as `push_session_clear_request()`. No `bot_sanctuary` code touched by this change.
+- **Not done, deliberately deferred to `bot_sanctuary`'s own Part 3 implementation:** retiring `session_cleared` entirely (both the push here and `_handle_session_cleared()`/its dispatch branch there), once `bot_sanctuary`'s new dedicated clearing method actually exists and proves out tearing down its own state without this event. Tracked as a `bot_sanctuary/CODE_TODO.md` follow-up at that point, not here.
+
+#### Part 4 — add the broad sweep-on-receipt behaviour
+
+Status: **Implemented (2026-09-12).**
+
+`session_reset_handler.py::_is_reset_allowed()`'s removal - originally drafted as this Part's opening bullet - was pulled forward and **already implemented 2026-09-12**; see Part 0 above for the full reasoning.
+
+- [x] `handle_session_reset_request(task_id)` now does two passes: **(1)** if `task_id` is present, resolve `chat_id` via the existing `get_task_mapping()` and close it out via `delete_task_mapping(task_id, chat_id)` - exactly like a `completed`/`error` would, per the "Confirmed design correction" above (this was the previously-flagged gap - without it, a deferred reset triggered by this very `task_id` could never resolve, since nothing else was ever going to close it). **(2)** Regardless of whether `task_id` was present, enumerate every `chat_id` it knows about (Part 0's `get_all_session_chat_ids()`) and attempt the existing, **completely unchanged** `has_open_tasks()`/`pending_reset` decision for each one, independently - no chat blocks on another; each is deferred or applied purely by its own open-task state, exactly as today. Idempotent by construction (a no-op for an already-clear chat or one already correctly sitting in `pending_reset`), so re-running this on every arrival is safe, if somewhat redundant at scale - a minor efficiency note, not a correctness concern given this project's size.
+  - The chat_id tied to `task_id` (if any) is **not** special-cased out of the sweep - it's swept like any other, just carrying the real `task_id` (instead of `None`) in its own `pending_reset` entry for traceability.
+  - **New private helper `_defer_or_apply_reset(chat_id, task_id)`** - the `has_open_tasks()` → `set_pending_reset()`/`_apply_session_reset()` decision, extracted out of what used to be `handle_session_reset_request()`'s own body, so it can run once per chat_id in a loop instead of once for a single already-resolved chat_id.
+  - **Run as a plain sequential `for` loop, not across separate threads** - a deliberate implementation choice, not explicitly specified in the design above. This project's chat count is small and bounded (same assumption already relied on by `utils_redis/database.py::_get_chat_lock()`'s one-lock-per-chat_id, never-removed design), so sequential execution was judged sufficient; `bot_sanctuary`'s own "signal every session AT ONCE (concurrent, not sequential)" requirement (Part 3) is a separate, unrelated concern on that side, not something this loop needs to replicate.
+- [x] **§0-§8 ("Graceful `session_reset`" feature, below this entry) needed no internal changes at all.** `_apply_session_reset()`, `resolve_pending_reset_if_ready()`, `resync_pending_resets()`, `_enforce_pending_reset_ceiling()` are all untouched - `_defer_or_apply_reset()` reuses exactly what `handle_session_reset_request()` used to do inline, just now callable per chat_id in a loop.
+- [x] **No new per-chat tracking state needed on `telegram_gateway`'s side** (an earlier draft of this entry proposed a `pending_refresh:<chat_id>` key - superseded; the existing `pending_reset` store already does everything required once this broad, idempotent sweep exists).
+
+#### Post-implementation hardening (2026-09-12 verification pass)
+
+Two defensive fixes made during a dedicated integrity-verification pass over Parts 0/1/2/4, requested directly by the user rather than found during initial implementation. Both are cheap, harmless additions with no behavioural downside - implemented on that basis ("I see no risk in implementing the hardening, it's defensive coding"), independent of exactly how likely either gap is to ever actually fire.
+
+**Issue 1 - `_defer_or_apply_reset()` could apply a reset without clearing a stale `pending_reset` entry first.**
+
+- Initial claim (now corrected): first described as reachable via two overlapping admin triggers on the same chat. That specific construction turned out to be **wrong** - directly caught by the user - because `bot_sanctuary` rejects a second `session_clear_request` outright while its own sweep is still in progress (Part 3), and its sweep can only clear once every session it holds (including the one blocking `has_open_tasks()` on the gateway side) has already finished its current turn and reported in. That means whatever was keeping `has_open_tasks()` true would already have triggered `resolve_pending_reset_if_ready()` (which does clear first) before a second trigger could ever be accepted - closing the exact path first described.
+- **Re-derived, narrower, still-real path:** only reachable as a compounding effect on top of the already-known, already-documented §8 gap (an orphaned/expired task mapping whose `completed`/`error` was lost/dropped, so `bot_sanctuary` considers it done while the gateway's own `session_tasks:<chat_id>` still lists it as open). In that specific combination, a later `session_reset`'s own task-closing step can be what empties `session_tasks:<chat_id>`, reaching the immediate-apply branch while an earlier, different `pending_reset` entry is still sitting there un-refreshed.
+- **Not an independent gap** - contingent entirely on §8 already being present; already backstopped today by `PENDING_RESET_MAX_WAIT_SECONDS`'s periodic ceiling sweep even without this fix. Its only effect if left unfixed: one delayed force-apply plus a spurious "Force-applied session_reset" warning log, once, after the ceiling elapses - no duplicate resets, no user-facing symptom, no data corruption.
+- [x] **Fixed anyway, as defensive coding, not because the gap was proven likely:** `_defer_or_apply_reset()`'s immediate-apply branch now calls `clear_pending_reset(chat_id)` before `_apply_session_reset(chat_id)` - a no-op when there was nothing pending, and removes the one delayed-warning-log outcome above when there was.
+
+**Issue 2 - `_handle_reset_command()`'s mint-succeeds/push-fails path could leave an orphaned task mapping.** Not previously written down anywhere despite being raised in conversation - corrected here.
+
+- If `create_task_mapping()` succeeds but `push_session_clear_request()` then fails (e.g. a RabbitMQ publish failure), the admin is still told via the existing apology message, but the just-created `task:<task_id>` mapping and its `session_tasks:<chat_id>` index entry were never cleaned up - `bot_sanctuary` never received the request, so nothing was ever going to close it.
+- **Effect if left unfixed:** `has_open_tasks(chat_id)` returns `True` for that chat indefinitely - any *future* `session_reset` for the same chat, including a successful retry of the same command, gets deferred instead of applying immediately, purely because of this one dead entry. Same shape as the §8 gap, so bounded by the same `PENDING_RESET_MAX_WAIT_SECONDS` ceiling sweep rather than an indefinite hang - but a real, avoidable delay.
+- [x] **Fixed:** the `push_session_clear_request()`-failed branch now calls `delete_task_mapping(task_id, chat_id)` before sending the apology message, rolling back the orphaned mapping immediately instead of waiting on the ceiling sweep.
+- **Explicitly not addressed:** `_push_task()` has the identical unrolled-back-mapping shape on its own two failure branches (`generate_session()` failing, `queue_push_task()` failing) - a separate, pre-existing risk of the same kind, flagged but out of scope for this pass.
+
+#### Part 5 — `bot_started`: the only mechanism for reconciling a `bot_sanctuary` crash/restart
+
+Status: **`telegram_gateway` side implemented (2026-09-12), by explicit instruction - `bot_sanctuary` side (the actual sending of `bot_started`) deliberately not started, remains fully open in `bot_sanctuary/CODE_TODO.md`.**
+
+- [ ] New event, `bot_sanctuary -> telegram_gateway`, `{"type": "bot_started"}` (no other fields - not chat/session-scoped), fired **unconditionally at every `bot_sanctuary` startup** (crash-recovery or a routine redeploy alike - either way, whatever `bot_sanctuary` was doing before is gone), ahead of its own existing `resync_orphaned_sessions()` sweep. **Not yet implemented** - `bot_sanctuary`'s side of this, out of scope for this pass.
+- [x] `telegram_gateway`: new `resolve_pending_resets_on_bot_started()` (`session_reset_handler.py`) - loops `get_all_pending_resets()` (already exists) and, for every entry, resolves it **directly via `_apply_session_reset(chat_id)`** - not `_force_apply_session_reset()`. Dispatched from `process_message()` via a new thin delegate, `_handle_bot_started()` (`message_handler.py`), routed the same way `session_reset` already is - ahead of the shared `task_id`-mandatory gate, since `bot_started` carries no `task_id` (or any other field) at all.
+  - [x] **Why not `_force_apply_session_reset()` - explicit instruction, and it turns out to be the more honest fit once traced through:** that function differs from plain `_apply_session_reset()` by exactly two things - a defensive `stop_poll_for_reset()` sweep over any lingering polls, and a "forced after timeout" warning log. The warning-log framing ("forced after exceeding the wait ceiling") doesn't fit `bot_started` - this isn't a guess after waiting too long, it's a definite, known fact that `bot_sanctuary` restarted, so nothing is coming for whatever it was holding.
+  - [x] **Decided (2026-09-11): still close any lingering open poll for each resolved chat, same as `_force_apply_session_reset()` does** - "expire that poll if a session reset is on-going." `resolve_pending_resets_on_bot_started()` calls the same `get_session_poll_ids(chat_id)` + `stop_poll_for_reset(poll_id)` step directly, then `_apply_session_reset(chat_id)` - structurally identical to `_force_apply_session_reset()`'s body, but as its own function with its own log framing ("resolved via bot_started" rather than "forced after timeout"), not a call into that function itself.
+  - [x] **No `has_open_tasks()`/expiry check at all** - unlike `resync_pending_resets()`/`_enforce_pending_reset_ceiling()`, every entry in `get_all_pending_resets()` is resolved unconditionally and immediately. A `bot_started` event is a definite fact, not a guess after waiting - there is nothing left to wait for, for any of them.
+  - **`bot_sanctuary` itself does nothing about this and doesn't need to** - confirmed: "I am expecting bot_sanctuary to reset and moved on." Closing a lingering Telegram poll is entirely `telegram_gateway`'s own concern (it owns the poll, `bot_sanctuary` never knew about it as anything other than an open task_id) - `bot_sanctuary`'s side of a restart is just the unconditional `bot_started` broadcast, nothing more.
+  - [x] **`_force_apply_session_reset()`/`_enforce_pending_reset_ceiling()` remain completely untouched** - kept purely as the last-resort safety net for whatever `bot_started` itself doesn't cover (the `bot_started` message being lost, or some other scenario not yet identified). Explicit expectation, not just a side effect: once `bot_started` is wired end-to-end (i.e. once `bot_sanctuary` actually sends it), this path **should rarely or never actually fire in practice** for this feature's cause of pending resets - it stays as defence-in-depth, not as the primary mechanism. Until `bot_sanctuary`'s side ships, this remains the *only* mechanism in practice, since nothing yet sends `bot_started`.
+- `bot_sanctuary`'s own existing crash recovery (`mark_task_active`/`mark_task_complete`/`sweep_orphaned_sessions`/`resync_orphaned_sessions()`) is **unrelated and untouched** - it keeps doing its own generic job for ordinary orphaned tasks, whether or not they happen to belong to an in-progress admin sweep. This feature does not rely on it, build on it, or change it.
+
+#### Also needed
+
+- [ ] `## Agent-call access tier` (below): still-open, separate follow-up - decoupled `coding_allowed` whitelist env var. Not part of this design, not blocking it.
+- [x] `README.md` - new `session_clear_request`/`bot_started` sections added, `session_reset`/whitelist scope description corrected to match the design above (implemented 2026-09-12).
+- [x] `CODE_SEQUENCE_DIAGRAM.md` - new §8.0 (admin command → `session_clear_request` round trip) and §8.8 (`bot_started` recovery) added, §8.1-8.3/§6.5-6.9 corrected to match the design above (implemented 2026-09-12).
+
+#### Compliance review findings — CCR-023/CCR-024 (`CODE_NON_COMPLIANCE.md`'s tenth follow-up pass, 2026-09-12)
+
+`CODE_NON_COMPLIANCE.md` (the project's own protected compliance record - reviewed, never edited directly here) identified two findings against this feature's own implementation above, on request ("reverify telegram_gateway for non-compliance and weakness"). Both were re-verified directly against current source before any fix was made, not assumed from the report's own text.
+
+- **CCR-024 (Low) - Fixed 2026-09-12.** `gateway_inbound.py::_is_reset_command()`'s own docstring claimed a symmetric whitespace-normalisation contract ("leading/trailing whitespace stripped and internal runs collapsed") that the code didn't actually apply to both sides of its comparison - only the incoming Telegram text (`normalised_text`) was run through `" ".join(text.split())`; the configured command phrase (`normalised_command`, built from `settings.TELEGRAM_BOT_NAME`) was only `.lower()`'d. A stray whitespace character in a deployment's configured `TELEGRAM_BOT_NAME` would have made this function return `False` unconditionally, silently and permanently disabling the only mechanism this codebase provides for triggering a global session reset - with no error or log line anywhere to explain why. **Fix:** `normalised_command` now goes through the identical `" ".join(...split()).lower()` normalisation as `normalised_text` - one line, no behavioural change under a normally-configured (whitespace-clean) `TELEGRAM_BOT_NAME`, closes the gap for a misconfigured one.
+- **CCR-023 (Medium) - Fixed 2026-09-12, after two rejected/corrected proposals - kept below for the full history, per this file's own record-keeping convention.** `database.py::get_pending_reset()`'s `None` return value ambiguously represented both "no `pending_reset:<chat_id>` entry exists" and "an entry exists with a legitimately-`None` `task_id`" (the latter a deliberate, expected outcome of Part 4's broad sweep passing `task_id=None` for every non-triggering chat_id - see `set_pending_reset()`'s own docstring). `resolve_pending_reset_if_ready()` - the natural-completion resolution path, called the instant a chat's last open task's `completed`/`error` is processed - couldn't tell the two cases apart and silently no-opped for the second one, falling back to the up-to-`PENDING_RESET_MAX_WAIT_SECONDS` (1h default) ceiling sweep instead of resolving immediately. Directly contradicted `README.md`'s own documented contract for this feature ("applied automatically the moment that chat's last open task naturally completes"). Confirmed reachable regardless of any other fix already landed - `get_all_pending_resets()` (used by `resync_pending_resets()`/`_enforce_pending_reset_ceiling()`/`resolve_pending_resets_on_bot_started()`) reads the full stored record directly and was never affected; only `get_pending_reset()`/`resolve_pending_reset_if_ready()` were.
+  - **First proposal, rejected (user-caught): swap `resolve_pending_reset_if_ready()`'s check to `_get_pending_reset_info(chat_id) is None`.** Logically sound in isolation, but `_get_pending_reset_info()` is a private (`_`-prefixed) `database.py` helper never imported into `session_reset_handler.py` - as literally proposed this would not run at all, not silently fix nothing as first assumed. Correctly challenged: "Either fix nothing." True two-line cost was understated (an import, plus crossing this codebase's own private/public module-boundary convention, or a new public wrapper) - not the "no `database.py` change needed" originally claimed.
+  - **Follow-up question, also correctly raised: what about a failed Redis read?** `_redis_read()` already collapses "key missing" and "read failed after exhausted retries" into the same `None` - a pre-existing, documented, codebase-wide convention shared by every other Redis-backed getter (`get_task_mapping()`, `get_chat_draft()`, etc.), not something either proposed fix introduced or needed to solve. Resolved by explicit design decision: a failed read is treated identically to "not pending" here - fail-safe (skips one resolution attempt, never falsely resolves/clears on bad information) and self-healing (the `PENDING_RESET_MAX_WAIT_SECONDS` ceiling sweep remains the backstop for exactly this kind of missed natural-completion attempt) - consistent with, not a deviation from, how the rest of this codebase already treats every other Redis read failure.
+  - **Adopted fix, user-proposed: a fixed sentinel string instead of a bare `None`.** New `session_reset_handler.py` module constant `SYSTEM_TRIGGERED_TASK_ID = "system_triggered"`. `handle_session_reset_request()`'s broad-sweep loop now passes this sentinel (never a bare `None`) for every chat_id that isn't the one that actually triggered the reset - covering both scenarios: the majority of chats under a user-triggered (Scenario 1) reset, and *every* chat under an orchestrator-triggered (Scenario 2, no `task_id` at all) reset, since `triggering_chat_id` never matches any real `chat_id` in that case. A stored `pending_reset:<chat_id>` entry's `task_id` field is therefore never actually `None` in practice - only ever a real `task_id` or this sentinel - which makes `get_pending_reset()`'s existing `None` return unambiguous again ("no entry exists", full stop) with **zero changes needed to `database.py`'s implementation, signature, or storage format, and no new cross-module exposure** - a smaller, cleaner fix than either prior proposal. Never collides with a real `task_id` (always a `uuid.uuid4().hex` value from `create_task_mapping()`). `set_pending_reset()`'s own signature is deliberately left as `task_id: str | None` regardless - it's a generic storage primitive with no opinion on the sentinel's meaning; the invariant is enforced entirely at the one call site in `session_reset_handler.py` that owns this feature's semantics.
 
 ### Open Questions
 
-1. Exact shape of `bot_sanctuary`'s future "fixed reset time" mechanism (a scheduled, time-based automatic reset, given by the user as the other legitimate path to a session being cleared) - not yet designed on either side. Whether it should itself go through the same "reset every session" global action, or reset on a per-chat schedule independently, is undecided. Tracked as a new open item in `bot_sanctuary/CODE_TODO.md`.
-2. Exact new env var name for the decoupled `coding_allowed` whitelist - not yet chosen (see Must fix above).
+All five resolved on 2026-09-11 except the last, which stays open by explicit instruction:
+
+1. ~~Exact command-matching rule.~~ **Decided** - case-insensitive, whitespace-normalised, full-body match. See Part 1.
+2. ~~Whether `_handle_bot_started()` should also defensively close any lingering open poll.~~ **Decided: yes.** See Part 5.
+3. ~~Exact ordering of `bot_started` vs. `resync_orphaned_sessions()` at startup.~~ **Closed as a non-issue.** Both are independently idempotent - each resolves whatever it's responsible for and finds nothing to do if the other already handled it, regardless of which runs first. No explicit ordering requirement needed; this entry's Part 5 still fires `bot_started` first purely as the simpler-to-write-down default, not because order is load-bearing.
+4. ~~Exact shape of `bot_sanctuary`'s future "fixed/scheduled reset time" mechanism.~~ **Closed as a non-issue for this design specifically.** However that future trigger ends up built, it should simply behave like any other `session_reset` arrival once triggered - this is scenario 2 in the "Confirmed design correction" above, and Part 0/Part 4's handling is already agnostic to *why* a `session_reset` was sent: a `task_id`-less trigger already has a defined, correct behaviour (nothing task-specific to close, go straight to the broad sweep - no `session_id` resolution of any kind). The *scheduling* mechanism itself (when/how it decides to fire) remains a separate, still-undesigned question on `bot_sanctuary`'s side, unaffected by this closure.
+5. **Still open, explicit instruction not to address it now:** exact new env var name for the decoupled `coding_allowed` whitelist.
 
 ### Where
 
-- `telegram_gateway_application/utilities/utils_session/session_reset_handler.py`: `_is_reset_allowed()`, `handle_session_reset_request()`, `_apply_session_reset()`, `resolve_pending_reset_if_ready()`, `resync_pending_resets()`, `_enforce_pending_reset_ceiling()` - every one of these currently takes/operates on a single `chat_id`, and would need to operate across every currently-active `chat_id` for the admin-triggered path.
-- `telegram_gateway_application/utilities/utils_redis/database.py`: new enumeration primitive.
-- `telegram_gateway_application/utilities/utils_telegram/gateway_inbound.py::_push_task()`: `coding_allowed` stamping, once decoupled onto its own whitelist.
-- `README.md`: `session_reset` section, Agent-call access tier env var table.
-- `bot_sanctuary/CODE_TODO.md`: new cross-reference for the future scheduled-reset mechanism.
+- `telegram_gateway_application/utilities/utils_session/session_reset_handler.py`: `_is_reset_allowed()` (removed), `handle_session_reset_request()` (Part 4 broad sweep, implemented 2026-09-12), `_defer_or_apply_reset()` (Part 4; `clear_pending_reset()` hardening added post-implementation), `_apply_session_reset()`, `resolve_pending_reset_if_ready()`, `resync_pending_resets()`, `_enforce_pending_reset_ceiling()`, new `resolve_pending_resets_on_bot_started()` (Part 5, `telegram_gateway` side implemented 2026-09-12).
+- `telegram_gateway_application/utilities/utils_redis/database.py`: new `get_all_session_chat_ids()` (`get_chat_id_for_session()` was added, then reverted 2026-09-12 - see Part 0).
+- `telegram_gateway_application/utilities/utils_queue/message_handler.py`: `process_message()`'s dispatch (`session_reset`'s `task_id`-optional gate, Part 0; new `bot_started` branch, Part 5, implemented 2026-09-12), `_handle_session_reset()`, new `_handle_bot_started()`.
+- `telegram_gateway_application/utilities/utils_telegram/gateway_inbound.py`: command detection (`${BOT_NAME}` interpolation) - `_is_reset_command()`/`_handle_reset_command()`, implemented 2026-09-12 (Part 1; `delete_task_mapping()` rollback-on-push-failure hardening added post-implementation) - task_id minting, new `session_clear_request` push (`push_session_clear_request()`, `session_reset_handler.py`, Part 2).
+- `README.md`: `session_reset` section, new `session_clear_request`/`bot_started` sections, Agent-call access tier env var table.
+- `bot_sanctuary/CODE_TODO.md`: full counterpart entry.
 
 ---
 
@@ -220,6 +437,8 @@ Fires once, after a reset actually takes effect, for **every** `chat_id` whose s
 
 ### 7. Whitelist — who can trigger a session reset
 
+**Superseded 2026-09-12 - see the `BUG` entry at the top of this file.** This section's original premise - that `handle_session_reset_request()` should itself gate a `session_reset` on `chat_id` being whitelisted - is exactly the "self-service" misunderstanding the `BUG` entry above corrects. `_is_reset_allowed()` (below) has been **removed outright**, not just moved: an inbound `session_reset` always originates from `bot_sanctuary` itself, never directly from a chat, so there was never anything here to legitimately re-verify - see the `BUG` entry's Part 0 for the full reasoning, including the live crash-recovery bug this was silently causing. `SESSION_RESET_ALLOWED_CHAT_IDS` itself (the `config.py` setting below) is untouched and still real - it's just enforced elsewhere now (the `BUG` entry's Part 1, gateway_inbound.py's command-detection gate), not here. Kept below for history, exactly as originally written:
+
 New `config.py` setting, following the exact existing pattern used for `TELEGRAM_ALLOWED_CHAT_IDS` (comma-separated env var → a `set[int]`, empty default):
 
 - [x] `config.py`:
@@ -233,12 +452,12 @@ New `config.py` setting, following the exact existing pattern used for `TELEGRAM
   }
   ```
 - [x] `config_sample.ini` gets the matching new key, same as `TELEGRAM_ALLOWED_CHAT_IDS` today.
-- [x] Enforced in `handle_session_reset_request(task_id, chat_id)` (§1), first thing, before any deferral/immediate-reset decision:
+- [x] ~~Enforced in `handle_session_reset_request(task_id, chat_id)` (§1), first thing, before any deferral/immediate-reset decision~~ **Removed 2026-09-12 - see superseding note above.**
   ```python
   def _is_reset_allowed(chat_id: int) -> bool:
       return chat_id in settings.SESSION_RESET_ALLOWED_CHAT_IDS
   ```
-  A `chat_id` not in the whitelist is logged and dropped — no defer, no reset, no notice, no orchestrator ack. **Decided: silent (log only), no response of any kind.**
+  ~~A `chat_id` not in the whitelist is logged and dropped — no defer, no reset, no notice, no orchestrator ack. **Decided: silent (log only), no response of any kind.**~~
 
 ---
 

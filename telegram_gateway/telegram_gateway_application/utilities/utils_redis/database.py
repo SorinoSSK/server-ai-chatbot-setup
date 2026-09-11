@@ -866,6 +866,40 @@ def reset_session(chat_id: int) -> str | None:
     logger.info(f"Session reset for chat_id={chat_id}: cleared session mapping, {len(task_ids)} task mapping(s), pending draft, and poll indexing.")
     return cleared_session_id
 
+def get_all_session_chat_ids() -> list[int]:
+    """
+    Retrieves the chat_id of every chat currently holding a session:<chat_id> entry in Redis.
+
+    Args:
+        None
+
+    Returns:
+        list[int]:
+            chat_ids with a session:<chat_id> key present; empty list on failure (including a failed ping - see Notes).
+
+    Notes:
+        - telegram_gateway's own trigger for the broad "attempt every active chat_id" sweep on receiving a session_reset - see utils_session/session_reset_handler.py::handle_session_reset_request(), CODE_TODO.md's Part 4 (implemented 2026-09-12).
+        - Confirms connectivity via _redis_ping() first (SCAN has no dedicated retrying primitive of its own). A failed ping is treated exactly like any other failure here - same empty-list fallback, just skipping the SCAN itself rather than attempting and failing it.
+        - Uses SCAN (not KEYS) so it doesn't block Redis on a large keyspace - same shape/style as get_all_chat_draft_ids()/get_all_poll_ids().
+    """
+    if not _redis_ping():
+        logger.error("Failed to sweep Redis for active sessions - ping failed.")
+        return []
+    else:
+        try:
+            client = _get_redis_client()
+            chat_ids = []
+            for key in client.scan_iter(match="session:*"):
+                try:
+                    chat_ids.append(int(key.split(":", 1)[1]))
+                except (IndexError, ValueError):
+                    logger.error(f"Skipped malformed session key while sweeping Redis: {key}")
+
+            return chat_ids
+        except Exception:
+            logger.exception("Failed to sweep Redis for active sessions.")
+            return []
+
 def get_all_poll_ids() -> list[str]:
     """
     Retrieves the poll_id of every currently open poll mapping in Redis.
@@ -900,15 +934,16 @@ def get_all_poll_ids() -> list[str]:
             logger.exception("Failed to sweep Redis for open polls.")
             return []
 
-def set_pending_reset(chat_id: int, task_id: str) -> bool:
+def set_pending_reset(chat_id: int, task_id: str | None) -> bool:
     """
     Stores (or overwrites) a chat_id's deferred session_reset, awaiting every currently open task_id for that chat to naturally complete.
 
     Args:
         chat_id (int)
 
-        task_id (str):
-            The task_id the session_reset instruction arrived on - kept for traceability only; readiness is decided by has_open_tasks(), not by this task_id specifically.
+        task_id (str | None):
+            The task_id the session_reset instruction arrived on, if any - kept for traceability only; readiness is decided by has_open_tasks(), not by this task_id specifically.
+            Still typed str | None since this function places no requirement on the value itself - it only ever stores whatever it's given. In practice, utils_session/session_reset_handler.py never actually calls this with a bare None - see its SYSTEM_TRIGGERED_TASK_ID sentinel and get_pending_reset()'s own Notes.
 
     Returns:
         bool:
@@ -960,6 +995,10 @@ def get_pending_reset(chat_id: int) -> str | None:
     Returns:
         str | None:
             The task_id if a reset is pending for chat_id; otherwise None.
+
+    Notes:
+        - A None return always means no pending_reset entry exists, never that one exists with a None task_id, since set_pending_reset() is never actually called with a bare None in practice - see its own docstring.
+        - This function's own implementation still cannot distinguish the two cases if a future caller ever did store a literal None - a caller relying on that distinction should use _get_pending_reset_info() directly instead.
     """
     info = _get_pending_reset_info(chat_id)
     return info.get("task_id") if info else None
@@ -977,7 +1016,7 @@ def clear_pending_reset(chat_id: int) -> bool:
     """
     return _redis_delete(f"pending_reset:{chat_id}")
 
-def get_all_pending_resets() -> list[tuple[int, str, float]]:
+def get_all_pending_resets() -> list[tuple[int, str | None, float]]:
     """
     Retrieves every currently deferred session_reset in Redis.
 
@@ -985,8 +1024,9 @@ def get_all_pending_resets() -> list[tuple[int, str, float]]:
         None
 
     Returns:
-        list[tuple[int, str, float]]:
+        list[tuple[int, str | None, float]]:
             (chat_id, task_id, created_at) for every pending_reset:<chat_id> key present; empty list on failure (including a failed ping - see Notes).
+            task_id is whatever set_pending_reset() was called with - in practice, either a real task_id or, for a chat_id with no task_id of its own tied to the triggering session_reset, utils_session/session_reset_handler.py's SYSTEM_TRIGGERED_TASK_ID sentinel - see set_pending_reset()'s own docstring.
 
     Notes:
         - Used on startup to resync deferred resets that may have become resolvable while the gateway was down, and by the periodic PENDING_RESET_MAX_WAIT_SECONDS backstop sweep - see utils_session/session_reset_handler.py::resync_pending_resets()/_enforce_pending_reset_ceiling().

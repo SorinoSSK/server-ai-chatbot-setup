@@ -5,8 +5,10 @@
 # Created On  : 2026-08-29
 #
 # Features    :
-#   - Dispatches incoming queue messages by type - poll/image/video/album/file/text/completed/error/session_reset.
+#   - Dispatches incoming queue messages by type - poll/image/video/album/file/text/completed/error/session_reset/bot_started.
 #     See README.md for the payload shape per type.
+#   - session_reset is the one type that does not require a task_id - see utils_session/session_reset_handler.py::handle_session_reset_request().
+#   - bot_started requires no task_id/chat_id/session_id at all - an orchestrator restart signal, resolved via utils_session/session_reset_handler.py::resolve_pending_resets_on_bot_started().
 #   - text messages may carry inline keyboard buttons - see utils_telegram/utilities/button_prompt_handler.py.
 #   - poll messages start their answer-collection timer on send - see utils_telegram/utilities/poll_response_handler.py.
 #   - A send rejected by Telegram (or by local validation) is reported as a Tier 1 delivery_failed event, per task_id - see error_handling.py.
@@ -39,7 +41,11 @@ from ..utils_telegram.gateway_outbound import (
 from ..utils_telegram.utilities.button_prompt_handler import register_bot_button, send_message_with_buttons
 from ..utils_telegram.utilities.typing_indicator import stop_typing
 from ..utils_telegram.utilities.poll_response_handler import start_poll_timer
-from ..utils_session.session_reset_handler import handle_session_reset_request, resolve_pending_reset_if_ready
+from ..utils_session.session_reset_handler import (
+    handle_session_reset_request,
+    resolve_pending_reset_if_ready,
+    resolve_pending_resets_on_bot_started
+)
 from .error_handling import push_tier1_delivery_failed
 
 # =============================================================================
@@ -378,24 +384,39 @@ def _handle_completed(task_id: str, chat_id: int) -> None:
     logger.info(f"Task task_id={task_id} completed. Is mapping deleted successfully: {deleted}.")
     resolve_pending_reset_if_ready(chat_id)
 
-def _handle_session_reset(task_id: str, chat_id: int) -> None:
+def _handle_session_reset(task_id: str | None) -> None:
     """
     Handle a session_reset marker payload - thin delegate onto utils_session/session_reset_handler.py.
 
     Args:
-        task_id (str):
-            The task_id the session_reset instruction arrived on - see handle_session_reset_request()'s own docstring.
-
-        chat_id (int)
+        task_id (str | None):
+            The task_id the session_reset instruction arrived on, if any - see handle_session_reset_request()'s own docstring.
+            Absent when the orchestrator triggered the reset itself rather than a user.
 
     Returns:
         None
 
     Notes:
         - Execution authority for triggering a reset belongs to the orchestrator, not this gateway - this handler only carries out a reset instruction already decided upstream.
-        - See utils_session/session_reset_handler.py for the whitelist check, defer-vs-immediate decision, and what a reset actually clears/acks/notifies.
+        - Unlike every other message type, chat_id is not resolved here - handle_session_reset_request() resolves it itself, per chat, via utils_session/session_reset_handler.py.
     """
-    handle_session_reset_request(task_id, chat_id)
+    handle_session_reset_request(task_id)
+
+def _handle_bot_started() -> None:
+    """
+    Handle a bot_started marker payload - thin delegate onto utils_session/session_reset_handler.py.
+
+    Args:
+        None
+
+    Returns:
+        None
+
+    Notes:
+        - Fired unconditionally by the orchestrator on every startup (crash-recovery or a routine redeploy alike) - carries no task_id/chat_id/session_id of its own, not chat/session-scoped.
+        - See utils_session/session_reset_handler.py::resolve_pending_resets_on_bot_started() for what this actually resolves - every currently deferred session_reset, unconditionally.
+    """
+    resolve_pending_resets_on_bot_started()
 
 def _handle_error(task_id: str, chat_id: int, error_type: str, message: str) -> None:
     """
@@ -454,7 +475,7 @@ def process_message(payload: str) -> None:
 
     Args:
         payload (str):
-            Raw JSON-encoded message body, expected to contain a task_id field.
+            Raw JSON-encoded message body, expected to contain a task_id field - except session_reset (may arrive with no task_id) and bot_started (carries no task_id at all - see Notes).
 
     Returns:
         None
@@ -462,6 +483,7 @@ def process_message(payload: str) -> None:
     Notes:
         - Invalid/non-object JSON, a missing task_id, an unknown task_id mapping, or an unrecognised type are each logged and dropped rather than raised.
         - Dispatches by data["type"] to a _handle_* function.
+        - session_reset and bot_started are both dispatched ahead of every other type's shared task_id/get_task_mapping() gate below - session_reset may arrive with no task_id at all, and bot_started carries no task_id/chat_id/session_id fields whatsoever - see utils_session/session_reset_handler.py.
     """
     try:
         data = json.loads(payload)
@@ -473,8 +495,16 @@ def process_message(payload: str) -> None:
         logger.critical(f"Received RabbitMQ message with a non-object JSON payload: {payload}")
         return
     else:
+        message_type = data.get("type")
         task_id = data.get("task_id")
-        if not task_id:
+
+        if message_type == "session_reset":
+            if task_id:
+                stop_typing(task_id)
+            _handle_session_reset(task_id)
+        elif message_type == "bot_started":
+            _handle_bot_started()
+        elif not task_id:
             logger.critical(f"Received RabbitMQ message with missing task_id field: {payload}")
         else:
             stop_typing(task_id)
@@ -485,7 +515,6 @@ def process_message(payload: str) -> None:
             else:
                 chat_id = mapping.get("chat_id")
 
-                message_type = data.get("type")
                 if message_type == "poll":
                     _handle_poll(
                         task_id,
@@ -508,8 +537,6 @@ def process_message(payload: str) -> None:
                     _handle_completed(task_id, chat_id)
                 elif message_type == "error":
                     _handle_error(task_id, chat_id, data.get("error_type"), data.get("message"))
-                elif message_type == "session_reset":
-                    _handle_session_reset(task_id, chat_id)
                 else:
                     logger.error(f"Received RabbitMQ message with unknown type={message_type}: {payload}")
 

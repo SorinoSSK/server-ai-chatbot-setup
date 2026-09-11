@@ -478,7 +478,7 @@ sequenceDiagram
     end
 ```
 
-### 6.5 – 6.8 `completed` / `error` / `session_reset` markers
+### 6.5 – 6.9 `completed` / `error` / `session_reset` / `bot_started` markers
 
 ```mermaid
 sequenceDiagram
@@ -506,11 +506,16 @@ sequenceDiagram
         Handler->>TG: sendMessage (html.escape(message), parse_mode=HTML)
         Handler->>Redis: delete_task_mapping(task_id, chat_id)
         Handler->>Session: resolve_pending_reset_if_ready(chat_id)
-    else type = session_reset
-        Orchestrator->>MQ: {type: session_reset, task_id}
-        MQ-->>Handler: deliver
-        Handler->>Session: handle_session_reset_request(task_id, chat_id)
+    else type = session_reset (task_id present or absent)
+        Orchestrator->>MQ: {type: session_reset, task_id?}
+        MQ-->>Handler: deliver (dispatched ahead of the shared task_id gate)
+        Handler->>Session: handle_session_reset_request(task_id)
         Note over Session: full flow in §8
+    else type = bot_started
+        Orchestrator->>MQ: {type: bot_started}
+        MQ-->>Handler: deliver (dispatched ahead of the shared task_id gate - no task_id/chat_id/session_id at all)
+        Handler->>Session: resolve_pending_resets_on_bot_started()
+        Note over Session: full flow in §8.8
     end
 ```
 
@@ -653,7 +658,48 @@ sequenceDiagram
 
 ## 8. Session Reset Flow
 
-### 8.1 – 8.3 Reset request: whitelist check, defer vs. immediate
+### 8.0 Admin command detected → `session_clear_request` round trip
+
+```mermaid
+sequenceDiagram
+    participant Admin as Whitelisted chat
+    participant TG as Telegram Bot API
+    participant Gateway as gateway_inbound (_handle_reset_command)
+    participant Redis
+    participant MQ as RabbitMQ
+    participant Orchestrator
+
+    Admin->>TG: sends "${TELEGRAM_BOT_NAME} refresh yourself"
+    TG-->>Gateway: update delivered via getUpdates
+    Gateway->>Gateway: chat_id in SESSION_RESET_ALLOWED_CHAT_IDS and text matches command phrase?
+    alt not whitelisted, or text doesn't match, or a draft is pending
+        Gateway->>Gateway: fall through to _push_task() as an ordinary text message
+    else whitelisted admin command, no draft pending
+        Gateway->>Redis: create_task_mapping(chat_id, user_id)
+        alt mapping creation fails
+            Redis-->>Gateway: None
+            Gateway->>TG: sendMessage (apology)
+        else mapping created
+            Redis-->>Gateway: task_id
+            Gateway->>MQ: push {type: session_clear_request, task_id}
+            alt push fails
+                MQ-->>Gateway: False
+                Gateway->>Redis: delete_task_mapping(task_id, chat_id) (rollback)
+                Gateway->>TG: sendMessage (apology)
+            else push succeeds
+                Orchestrator->>Orchestrator: sweep already in progress?
+                alt sweep already in progress
+                    Orchestrator->>MQ: push {type: completed | error, task_id} (request ignored, nothing else happens)
+                else no sweep in progress
+                    Orchestrator->>MQ: push {type: session_reset, task_id} IMMEDIATELY
+                    Note over Orchestrator: then begins gracefully finishing/clearing every session it holds, in parallel with §8.1 below
+                end
+            end
+        end
+    end
+```
+
+### 8.1 – 8.3 Reset request: close triggering task, broad per-chat sweep
 
 ```mermaid
 sequenceDiagram
@@ -664,25 +710,38 @@ sequenceDiagram
     participant Redis
     participant TG as Telegram Bot API
 
-    Orchestrator->>MQ: {type: session_reset, task_id, chat_id}
+    Orchestrator->>MQ: {type: session_reset, task_id?}
     MQ-->>Handler: deliver
-    Handler->>Session: handle_session_reset_request(task_id, chat_id)
-    alt chat_id not in SESSION_RESET_ALLOWED_CHAT_IDS
-        Session->>Session: log warning, drop silently (no defer, no reset, no ack)
-    else chat_id whitelisted
+    Handler->>Session: handle_session_reset_request(task_id)
+    Note over Session: no whitelist check here - trusted as already authorised (§8.0), or bot-triggered directly
+    alt task_id present
+        Session->>Redis: get_task_mapping(task_id)
+        alt mapping found
+            Redis-->>Session: {chat_id}
+            Session->>Redis: delete_task_mapping(task_id, chat_id) (closes it like a completed/error)
+        else mapping not found (already expired)
+            Session->>Session: log error, proceed regardless
+        end
+    else task_id absent (orchestrator triggered the reset itself)
+        Session->>Session: nothing to close, proceed straight to the sweep
+    end
+    Session->>Redis: get_all_session_chat_ids()
+    Redis-->>Session: [chat_id, ...]
+    loop each chat_id, independently
         Session->>Redis: has_open_tasks(chat_id)
         alt open task(s) exist
             Redis-->>Session: True
-            Session->>Redis: set_pending_reset(chat_id, task_id)
+            Session->>Redis: set_pending_reset(chat_id, task_id if this is the triggering chat_id else SYSTEM_TRIGGERED_TASK_ID)
             Note over Session: no user-facing notice sent yet
         else no open tasks
             Redis-->>Session: False
+            Session->>Redis: clear_pending_reset(chat_id) (defensive, usually a no-op)
             Session->>Session: _apply_session_reset(chat_id)
             Session->>Session: stop_draft_timer(chat_id)
             Session->>Redis: reset_session(chat_id)
             Redis-->>Session: cleared_session_id
             alt session_id existed
-                Session->>MQ: push {type: session_cleared, session_id, chat_id}
+                Session->>MQ: push {type: session_cleared, session_id}
                 Session->>TG: sendMessage (reset notice)
             else no session existed (§8.7)
                 Session->>Session: no-op (nothing to clear/ack/notify)
@@ -802,6 +861,36 @@ sequenceDiagram
         Redis-->>Session: cleared_session_id
         Session->>MQ: push {type: session_cleared, session_id}
         Session->>TG: sendMessage (reset notice)
+    end
+```
+
+### 8.8 Orchestrator restart reconciliation (`bot_started`)
+
+```mermaid
+sequenceDiagram
+    participant Orchestrator
+    participant MQ as RabbitMQ (Q_CHANNEL_IN)
+    participant Handler as message_handler
+    participant Session as session_reset_handler
+    participant Redis
+    participant PollMod as poll_response_handler
+    participant TG as Telegram Bot API
+
+    Orchestrator->>MQ: {type: bot_started} (fired unconditionally on every startup)
+    MQ-->>Handler: deliver (dispatched ahead of the shared task_id gate)
+    Handler->>Session: resolve_pending_resets_on_bot_started()
+    Session->>Redis: get_all_pending_resets()
+    Redis-->>Session: [(chat_id, task_id, created_at), ...]
+    loop each pending reset, unconditionally (no has_open_tasks()/expiry check)
+        Session->>Redis: clear_pending_reset(chat_id)
+        Session->>Redis: get_session_poll_ids(chat_id)
+        loop each still-open poll_id (defensive)
+            Session->>PollMod: stop_poll_for_reset(poll_id)
+        end
+        Session->>Session: _apply_session_reset(chat_id)
+        Session->>MQ: push {type: session_cleared}
+        Session->>TG: sendMessage (reset notice)
+        Session->>Session: log info (resolved via bot_started)
     end
 ```
 

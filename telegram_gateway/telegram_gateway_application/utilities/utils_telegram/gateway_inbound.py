@@ -7,6 +7,7 @@
 # Features    :
 #   - Long-polls the Telegram Bot API for new updates (messages, button presses, poll answers, etc.)
 #   - Resolves incoming photo/video/document to a fetchable URL and stages it as a pending draft until an instruction (text) arrives, or the draft times out.
+#   - Detects the global-reset admin command ("${BOT_NAME} refresh yourself", from a chat_id in SESSION_RESET_ALLOWED_CHAT_IDS) on a plain text message and pushes a session_clear_request instead of a normal task - see _is_reset_command()/_handle_reset_command().
 #
 # Notes       :
 #   - Uses Telegram's getUpdates long polling method, not webhooks.
@@ -32,11 +33,13 @@ from ..utils_gatekeeper.gatekeeper import track_unauthorised_access
 from ..utils_queue.queue import queue_push_task
 from ..utils_redis.database import (
     create_task_mapping,
+    delete_task_mapping,
     get_chat_draft,
     create_chat_draft,
     delete_chat_draft,
     generate_session
 )
+from ..utils_session.session_reset_handler import push_session_clear_request
 from .gateway_outbound import send_message, log_sanitised_exception
 from .utilities.typing_indicator import start_typing
 from .utilities.image_draft_handler import (
@@ -270,6 +273,64 @@ def _send_still_curious(chat_id: int, media_type: str) -> None:
         f"is there anything you'd like {settings.TELEGRAM_BOT_NAME} to do with it?"
     )
 
+def _is_reset_command(text: str) -> bool:
+    """
+    Checks whether text is the literal global-reset admin command - "${BOT_NAME} refresh yourself".
+
+    Args:
+        text (str)
+
+    Returns:
+        bool:
+            True if text, once normalised, exactly matches the normalised command phrase; otherwise False.
+
+    Notes:
+        - Case-insensitive, with leading/trailing whitespace stripped and internal runs of whitespace collapsed - not a substring match, the normalised text must equal the normalised phrase in full.
+        - Both sides of the comparison go through the identical normalisation, so a stray whitespace character in settings.TELEGRAM_BOT_NAME's configured value cannot silently make this function stop matching.
+        - settings.TELEGRAM_BOT_NAME is read at call time, not cached at import - consistent with every other persona-name string in this codebase.
+    """
+    normalised_text = " ".join(text.split()).lower()
+    normalised_command = " ".join(f"{settings.TELEGRAM_BOT_NAME} refresh yourself".split()).lower()
+    return normalised_text == normalised_command
+
+def _handle_reset_command(chat_id: int, user_id: int) -> None:
+    """
+    Handles the global-reset admin command - mints a real task_id (same as _push_task() would), then pushes a session_clear_request instead of a normal task payload.
+
+    Args:
+        chat_id (int)
+
+        user_id (int)
+
+    Returns:
+        None
+
+    Notes:
+        - Only ever called once chat_id is already confirmed whitelisted and the message text is already confirmed to match the command phrase exactly - see _is_reset_command()/_handle_update().
+        - No special-casing for the requesting admin's own chat/session beyond this point - its own eventual open task is swept and resolved identically to any other chat's, once the orchestrator's session_reset comes back.
+        - Mirrors _push_task()'s own failure-handling shape (apology message on a failed mint/push), for consistency.
+        - A failed push rolls back the just-created task mapping - without this, the task_id would otherwise linger open for this chat indefinitely, with nothing ever going to close it.
+    """
+    task_id = create_task_mapping(chat_id, user_id)
+    if not task_id:
+        logger.error(f"Failed to create task mapping for reset command from chat_id={chat_id}. Command dropped.")
+        send_message(
+            chat_id,
+            f"{settings.TELEGRAM_BOT_NAME} have been working hard and might be sick. "
+            f"Could you check on {settings.TELEGRAM_BOT_NAME}?"
+        )
+    elif not push_session_clear_request(task_id, chat_id):
+        logger.error(f"Failed to push session_clear_request for chat_id={chat_id} (task_id={task_id}). Rolling back task mapping. Command dropped.")
+        delete_task_mapping(task_id, chat_id)
+        send_message(
+            chat_id,
+            f"{settings.TELEGRAM_BOT_NAME} is bedridden and will try to help you when "
+            f"{settings.TELEGRAM_BOT_NAME} gets better."
+        )
+    else:
+        start_typing(task_id, chat_id)
+        logger.info(f"Pushed session_clear_request task_id={task_id} for chat_id={chat_id} to the outbound queue.")
+
 def _push_task(chat_id: int, user_id: int, text: str, image_url: str = "", video_url: str = "", file_url: str = "") -> None:
     """
     Creates a task mapping and pushes the task payload to RabbitMQ, notifying the user on failure.
@@ -380,6 +441,7 @@ def _handle_update(chat_id: int, user_id: int, update: dict) -> None:
         - Prunes _recent_media_groups on every update, not just album items.
         - callback_query updates are validated via validate_bot_callback() here, rather than falling through to the text branch (which would otherwise read them as empty-text).
         - "draft_continue" (see utils_telegram/utilities/image_draft_handler.py) is the only callback purpose currently wired up; any other purpose is logged and otherwise ignored.
+        - The global-reset admin command (_is_reset_command()/_handle_reset_command(), CODE_TODO.md's Part 1) is only checked on a plain text message with no draft pending - never against a draft-finalising instruction. A draft's media always takes priority; the finalising text is only ever read as an instruction for that media, never as this command, even in the coincidental case where it happens to match the phrase exactly.
     """
     _prune_recent_media_groups()
 
@@ -451,6 +513,8 @@ def _handle_update(chat_id: int, user_id: int, update: dict) -> None:
 
                 field_name = _MEDIA_FIELD_NAMES[existing_draft["media_type"]]
                 _push_task(chat_id, user_id, final_text, **{field_name: existing_draft["media_url"]})
+            elif chat_id in settings.SESSION_RESET_ALLOWED_CHAT_IDS and _is_reset_command(text):
+                _handle_reset_command(chat_id, user_id)
             else:
                 _push_task(chat_id, user_id, text)
 

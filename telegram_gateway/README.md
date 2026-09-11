@@ -26,8 +26,8 @@ telegram_gateway/telegram_gateway_application
 - `utilities/utils_gatekeeper/` - tracks repeated access attempts from unauthorised chats.
 - `utilities/utils_queue/` - RabbitMQ connection lifecycle, inbound message dispatch, and delivery-failure reporting.
 - `utilities/utils_redis/` - Redis connection lifecycle and task/draft/poll/pending-reset state storage.
-- `utilities/utils_session/` - graceful `session_reset` handling: whitelist enforcement, defer-until-idle, crash-recovery resync, orchestrator ack, and the chat-facing reset notice.
-- `utilities/utils_telegram/` - Telegram Bot API integration: inbound long-polling (`gateway_inbound.py`) and outbound sends (`gateway_outbound.py`), with supporting behaviours (typing indicator, draft keep-alive, poll debounce, inline keyboard buttons) under `utils_telegram/utilities/`.
+- `utilities/utils_session/` - graceful `session_reset` handling: per-chat defer-until-idle sweep, crash-recovery resync, a bounded force-apply ceiling, orchestrator ack, the chat-facing reset notice, and `bot_started` reconciliation.
+- `utilities/utils_telegram/` - Telegram Bot API integration: inbound long-polling (`gateway_inbound.py`, which also detects the admin global-reset command and enforces its whitelist) and outbound sends (`gateway_outbound.py`), with supporting behaviours (typing indicator, draft keep-alive, poll debounce, inline keyboard buttons) under `utils_telegram/utilities/`.
 - `data/logs/` - runtime log output (rotating daily, see Logging below).
 
 ### Application Lifecycle
@@ -123,7 +123,7 @@ docker restart <docker-container-name>
 - **Long-polling, not webhooks** - `getUpdates` is used instead of a webhook, avoiding the need for a publicly reachable inbound endpoint.
 - **Identity-blind agents** - `chat_id`/`user_id` are never forwarded to downstream agents directly; a `task_id` correlates back to identity via Redis, keeping the gateway the sole holder of chat identity.
 - **`task_id` vs `session_id`** - `task_id` is the primary identifier: scoped to one request/response exchange, and deleted once that exchange's `completed`/`error` response is delivered. `session_id` is a separate, permanent identifier derived from `chat_id` (see `utils_redis/database.py::generate_session()`), mandatory on every message published to RabbitMQ in both directions, purely for segregation - deciding which chat a message belongs to - not for per-exchange correlation. It does not expire or rotate on its own; it is only cleared by an explicit, orchestrator-executed global session reset (`session_reset`, user-triggered via Telegram, see below), which also destroys every `task_id` still open under that chat, since the backend has already unwound whatever state it held for them.
-- **Deferred, crash-resilient `session_reset`** - a `session_reset` never forcibly interrupts an open poll/draft-bearing task; it waits for every currently open `task_id` for that chat to naturally complete (`completed`/`error`) before applying, tracked durably in Redis (no TTL) so a gateway restart doesn't lose track of a reset still owed - see `utils_session/session_reset_handler.py` and "`session_reset`"/"`session_cleared`" below.
+- **Deferred, crash-resilient `session_reset`** - a `session_reset` never forcibly interrupts an open poll/draft-bearing task; it waits for every currently open `task_id` for that chat to naturally complete (`completed`/`error`) before applying, tracked durably in Redis (no TTL) so a gateway restart doesn't lose track of a reset still owed - see `utils_session/session_reset_handler.py` and "`session_clear_request`"/"`session_reset`"/"`session_cleared`"/"`bot_started`" below.
 - **Media staged as a draft, not sent as a task immediately** - a photo/video/document arriving without a finalising instruction is held server-side as a draft, rather than forcing every upload to carry its instruction as a caption.
 - **Two-tier delivery-failure reporting** - a rejected send is reported per-task (Tier 1, actionable by retrying differently) separately from a systemic outage (Tier 2, human intervention), so a consumer of `Q_CHANNEL_OUT` can distinguish "retry this differently" from "something is broken".
 - **In-memory timers with a Redis backstop** - draft/poll keep-alive timers are deliberately in-memory rather than persisted/distributed, with Redis TTLs and startup sweeps (`close_orphaned_drafts()`/`close_orphaned_polls()`) as a safety net against a restart leaving state silently stuck.
@@ -233,7 +233,7 @@ reset_session(chat_id)                         <- everything below keyed by the 
 #### Session Reset
 | Variable | Purpose |
 |-----------|---------|
-| SESSION_RESET_ALLOWED_CHAT_IDS | Whitelist of chat IDs permitted to trigger a `session_reset`. A `chat_id` outside this list is silently logged and dropped - no defer, no reset, no notice, no orchestrator ack. |
+| SESSION_RESET_ALLOWED_CHAT_IDS | Whitelist of chat IDs permitted to trigger the admin global-reset command. A `chat_id` outside this list, or text that doesn't match the command phrase, is treated as an ordinary message instead. |
 | PENDING_RESET_MAX_WAIT_SECONDS | Ceiling on how long a deferred `session_reset` may wait for its chat's open task_id(s) to naturally complete, before being force-applied regardless. |
 | PENDING_RESET_SWEEP_INTERVAL_SECONDS | How often the ceiling above is checked by the background sweep. |
 
@@ -462,18 +462,30 @@ Pushed once a send succeeds again after a `gateway_alert` was fired - the counte
 
 ### Session Reset Events (gateway -> backend)
 
+#### `session_clear_request`
+
+Pushed the moment a whitelisted admin's in-chat command (the literal text `"${TELEGRAM_BOT_NAME} refresh yourself"`, matched case-insensitively with whitespace normalised) is detected - requests that the orchestrator begin a global session reset. See `utils_telegram/gateway_inbound.py`, `utils_session/session_reset_handler.py::push_session_clear_request()`.
+
+```json
+{"task_id": "...", "type": "session_clear_request"}
+```
+- `task_id`: minted for the triggering command the same way any other task would be, so the orchestrator has something concrete to close via a `completed`/`error` if the request is ignored (e.g. a sweep is already in progress). Echoed back on the orchestrator's own `session_reset` once accepted.
+- `chat_id` deliberately not included - the orchestrator stays entirely chat-agnostic, the same "identity-blind agents" principle every other outbound payload already follows (see Design Decisions above).
+- Only ever sent for a `chat_id` in `SESSION_RESET_ALLOWED_CHAT_IDS` whose message matches the command phrase in full - any other `chat_id`, or any non-matching text, is pushed as an ordinary task instead. Not checked against a message finalising a pending draft.
+
 #### `session_cleared`
 
 Pushed once a `session_reset` (see below) has actually taken effect for a chat - the orchestrator's positive confirmation that this specific `session_id` is gone on the gateway side. See `utils_session/session_reset_handler.py::_push_session_cleared()`.
 
 ```json
-{"task_id": null, "session_id": "...", "chat_id": 123456789, "type": "session_cleared"}
+{"task_id": null, "session_id": "...", "type": "session_cleared"}
 ```
 - `task_id`: always `null` - this is a session-level ack, not tied to any one task.
-- `session_id`: the `session_id` that was just cleared.
-- `chat_id`: included directly (unlike every other payload above) - a `session_reset` triggered for one chat can end up clearing several, so each affected chat gets its own `session_cleared` event, and this is the only place identifying which one.
+- `session_id`: the `session_id` that was just cleared - the only identifier in this payload; `session_id` alone is what bot_sanctuary keys its own session-scoped state off, so nothing further is needed to identify which session this concerns.
+- `chat_id` deliberately **not** included (corrected 2026-09-12) - an earlier version of this payload carried it directly, on the assumption bot_sanctuary needed it to identify which of several chats a broader reset had affected. Caught as a violation of this gateway's own "identity-blind agents" principle (see Design Decisions below): bot_sanctuary was never chat-aware for this event and doesn't need to become chat-aware now, so `chat_id` is dropped, restoring the same principle every other outbound payload already follows.
 - Only pushed if the chat actually had a `session_id` to clear - a reset applying to a chat with no existing session has nothing to ack.
 - Fires once, at the moment a reset actually applies - whether that's immediately or after being deferred (see `session_reset` below), the ack path is identical either way.
+- **Under review, not yet acted on:** bot_sanctuary's own forthcoming per-session sweep-clearing mechanism (`telegram_gateway/CODE_TODO.md`'s Part 3) is expected to tear down its own session state proactively, without depending on this event at all - once that ships, this event is expected to be retired from both sides entirely, not merely have `chat_id` trimmed from it as done here. See `CODE_TODO.md`.
 
 ### Response Queue Message Payloads
 
@@ -595,18 +607,27 @@ Signals the task ended abnormally (e.g. an agent's token budget was exhausted).
 - Same cleanup as `completed`, plus a user-facing notification.
 
 #### `session_reset`
-Requests a chat's permanent `session_id`, and every `task_id` still open under it, be wiped - the backend/agent-side counterpart of a user-triggered global session reset. See `utils_session/session_reset_handler.py`.
+Requests that every chat's permanent `session_id`, and every `task_id` still open under it, be wiped - the orchestrator's counterpart to a global session reset, whether triggered by the admin command below or by a future scheduled reset on the orchestrator's own side. See `utils_session/session_reset_handler.py`.
 ```json
 {"task_id": "...", "type": "session_reset"}
 ```
-- `task_id` here is only used to resolve `chat_id` (same as any other payload) and to track a deferred reset (see below) - it is not itself preserved.
-- Execution authority belongs to the orchestrator, not this gateway - the gateway only carries out a reset already decided upstream, triggered by the user via Telegram.
-- **Whitelist first**: a `chat_id` outside `SESSION_RESET_ALLOWED_CHAT_IDS` is silently logged and dropped - no defer, no reset, no notice, no ack of any kind.
-- **Deferred, not forced**: if the chat currently has any open `task_id` (`session_tasks:<chat_id>`), the reset does not apply yet - it's stored durably in Redis (`pending_reset:<chat_id>`, no TTL) and applied automatically the moment that chat's last open task naturally completes (`completed`/`error`) - no poll/draft is ever forcibly interrupted. If the chat has no open task_id, it applies immediately.
+- `task_id`: present only when the reset was triggered by the admin command below - the same `task_id` minted for that command, echoed back once the orchestrator accepts the request. Closed out exactly like a `completed`/`error` would, since this message doubles as that signal. Absent when the orchestrator triggers a reset on its own initiative, in which case there is nothing to close.
+- Execution authority belongs to the orchestrator, not this gateway - by the time a `session_reset` reaches the gateway it is always trusted as already authorised; the whitelist itself is enforced earlier, at the point the admin command is detected (see `session_clear_request` below).
+- **Broad sweep, not chat-scoped**: regardless of whether `task_id` was present, the gateway independently sweeps every chat it currently holds a session for, deferring or applying a reset to each one purely on its own open-task state - one `session_reset` may end up affecting several chats, not just the one behind `task_id`.
+- **Deferred, not forced**: a chat with any open `task_id` (`session_tasks:<chat_id>`) does not have its reset applied yet - it's stored durably in Redis (`pending_reset:<chat_id>`, no TTL) and applied automatically the moment that chat's last open task naturally completes (`completed`/`error`) - no poll/draft is ever forcibly interrupted. A chat with no open task_id has its reset applied immediately.
 - A gateway restart does not lose track of a reset that's still owed - `resync_pending_resets()` re-checks every deferred reset on startup and applies any that already became resolvable while the gateway was down (see Startup above).
-- **Bounded wait, not indefinite**: a deferred reset isn't left waiting forever on a `task_id` that's never going to send `completed`/`error` (e.g. a bug, a crash, a dropped message, or - for a poll specifically - see `poll_timed_out` above). Once a pending reset has been waiting longer than `PENDING_RESET_MAX_WAIT_SECONDS` (1h by default), it's force-applied regardless of whether its task_id(s) are still technically open - checked every `PENDING_RESET_SWEEP_INTERVAL_SECONDS` by a background sweep (`enforce_pending_reset_ceiling()`), and also on startup as part of `resync_pending_resets()`. `reset_session()` deletes every `task_id` still indexed under the chat unconditionally either way, so nothing needs special "abandoned" handling beyond the normal reset.
+- **Bounded wait, not indefinite**: a deferred reset isn't left waiting forever on a `task_id` that's never going to send `completed`/`error` (e.g. a bug, a crash, a dropped message, or - for a poll specifically - see `poll_timed_out` above). Once a pending reset has been waiting longer than `PENDING_RESET_MAX_WAIT_SECONDS` (1h by default), it's force-applied regardless of whether its task_id(s) are still technically open - checked every `PENDING_RESET_SWEEP_INTERVAL_SECONDS` by a background sweep, and also on startup as part of `resync_pending_resets()`. `reset_session()` deletes every `task_id` still indexed under the chat unconditionally either way, so nothing needs special "abandoned" handling beyond the normal reset.
 - Once applied, see `utils_redis/database.py::reset_session()` for exactly what gets deleted (`session:<chat_id>`, `session_tasks:<chat_id>`, every `task:<task_id>` indexed under it, the chat's pending draft, and its poll indexing) - the chat's draft keep-alive timer (in-memory, not covered by the Redis deletion) is also stopped at this point, and (defensively, only relevant if `PENDING_RESET_MAX_WAIT_SECONDS` is misconfigured shorter than a poll's own maximum lifetime) any poll still open for the chat is closed out silently, the same way a reset always has.
-- Applying a reset always does two more things, for **every** `chat_id` whose session actually gets cleared - not just the `chat_id` that triggered it, since one `session_reset` may end up affecting several chats: pushes a `session_cleared` event (see below) and sends a fixed, configurable chat notice (`RESET_NOTICE_MESSAGE` in `session_reset_handler.py`; no-op while unset). Nothing is sent to the chat while a reset is only deferred/waiting.
+- Applying a reset always does two more things, for **every** chat whose session actually gets cleared - not just the chat that triggered it: pushes a `session_cleared` event (see above) and sends a fixed, configurable chat notice (`RESET_NOTICE_MESSAGE` in `session_reset_handler.py`; no-op while unset). Nothing is sent to a chat while its reset is only deferred/waiting.
+
+#### `bot_started`
+Fired unconditionally by the orchestrator on every startup - a crash-recovery restart or a routine redeploy alike - signalling that whatever it was holding before is gone, so nothing further is coming for any reset it may already have accepted. See `utils_session/session_reset_handler.py::resolve_pending_resets_on_bot_started()`.
+```json
+{"type": "bot_started"}
+```
+- Carries no `task_id`/`session_id`/`chat_id` at all - it is never scoped to a single chat or task, so it is dispatched ahead of every other payload's shared `task_id` requirement.
+- Resolves every currently deferred `session_reset` immediately and unconditionally, regardless of whether the gateway itself still considers any of that chat's tasks open, and also closes out any lingering open poll for each resolved chat the same way a forced reset does.
+- Expected to rarely resolve an actual pending reset once this event is reliably sent - `resync_pending_resets()`/the periodic ceiling sweep remain the fallback for whatever a lost `bot_started` message doesn't cover.
 
 ## Project Architecture
 
