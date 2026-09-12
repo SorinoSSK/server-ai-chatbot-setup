@@ -19,11 +19,11 @@
 # =============================================================================
 # I M P O R T   H E A D E R
 
-import time
 import logging
 import threading
 
 from ...config import settings
+from ..utilities import application_time_diff
 from ..utils_redis.database import (
     has_open_tasks,
     set_pending_reset,
@@ -296,13 +296,13 @@ def _is_pending_reset_expired(created_at: float) -> bool:
 
     Args:
         created_at (float):
-            The pending reset's creation time (time.time(), as stored by set_pending_reset()).
+            The pending reset's creation time (application_time().timestamp(), as stored by set_pending_reset()).
 
     Returns:
         bool:
             True if it's been pending at least PENDING_RESET_MAX_WAIT_SECONDS; otherwise False.
     """
-    return (time.time() - created_at) >= settings.PENDING_RESET_MAX_WAIT_SECONDS
+    return application_time_diff(created_at) >= settings.PENDING_RESET_MAX_WAIT_SECONDS
 
 def resync_pending_resets() -> None:
     """

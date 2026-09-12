@@ -22,6 +22,7 @@ import threading
 import redis
 
 from ...config import settings
+from ..utilities import application_time
 
 # =============================================================================
 # G L O B A L   V A R I A B L E
@@ -952,10 +953,10 @@ def set_pending_reset(chat_id: int, task_id: str | None) -> bool:
     Notes:
         - Stored as pending_reset:<chat_id> -> json {"task_id", "created_at"}, with no TTL - see utils_session/session_reset_handler.py.
           This store must outlive whatever task it's waiting on, since a task can legitimately stay open for an unbounded duration; only an explicit clear_pending_reset() call resolves it.
-        - `created_at` (time.time(), on write) is not itself the resolution mechanism - it's read back by utils_session/session_reset_handler.py's PENDING_RESET_MAX_WAIT_SECONDS backstop, so a reset stuck waiting on a task_id that never sends completed/error doesn't wait forever - see §8 (TODO.md).
+        - `created_at` (application_time().timestamp(), on write) is not itself the resolution mechanism - it's read back by utils_session/session_reset_handler.py's PENDING_RESET_MAX_WAIT_SECONDS backstop, so a reset stuck waiting on a task_id that never sends completed/error doesn't wait forever - see §8 (TODO.md).
         - Writes with nx=False (default) - a repeat trigger while one is already pending just overwrites it (including a fresh `created_at`), since only the most recent session_reset instruction matters once it's finally applied.
     """
-    value = json.dumps({"task_id": task_id, "created_at": time.time()})
+    value = json.dumps({"task_id": task_id, "created_at": application_time().timestamp()})
     written = _redis_write(f"pending_reset:{chat_id}", value)
     if written:
         logger.info(f"Stored pending reset for chat_id={chat_id} (task_id={task_id}).")

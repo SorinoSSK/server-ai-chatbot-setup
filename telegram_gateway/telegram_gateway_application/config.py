@@ -13,6 +13,7 @@
 import os
 
 from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 # =============================================================================
 
@@ -37,6 +38,12 @@ class Settings:
         self.LOG_LEVEL                                          = os.getenv("LOG_LEVEL") or DEFAULT_LOG_LEVEL
         self.LOG_MAX_SIZE_MB                                    = get_env_int("LOG_MAX_SIZE_MB", DEFAULT_LOG_MAX_SIZE_MB)
         self.LOG_RETENTION_DAYS                                 = get_env_int("LOG_RETENTION_DAYS", DEFAULT_LOG_RETENTION_DAYS)
+
+        # Timezone (see get_env_timezone(), utilities/logging_setup.py)
+        # Every wall-clock timing decision this application makes, and its own log timestamps, are anchored to this value rather than the container's OS-level local time directly.
+        # Deliberately reads the standard "TZ" name, not a project-prefixed one, since that's also what the container's own OS layer already expects.
+        DEFAULT_TZ                                              = "UTC"
+        self.TZ                                                 = get_env_timezone("TZ", DEFAULT_TZ)
 
         # Telegram Bot Connection
         # NOTE: placeholder values - update TELEGRAM_BOT_TOKEN via env/.env before running.
@@ -259,6 +266,32 @@ def get_env_bool(name: str, default: bool) -> bool:
         """
         value = os.getenv(name)
         return default if value is None else value.strip().lower() == "true"
+
+def get_env_timezone(name: str, default: str) -> ZoneInfo:
+        """
+        Reads an IANA timezone name environment variable, falling back to default if unset or unrecognised.
+
+        Args:
+            name (str):
+                Environment variable name.
+
+            default (str):
+                Fallback IANA timezone name if unset or invalid - must itself be a valid zone (e.g. "UTC").
+
+        Returns:
+            ZoneInfo:
+                The resolved timezone.
+
+        Notes:
+            - Falls back to default, silently, on an unrecognised zone name - same "disable/fall back rather than crash" convention as get_env_int()/get_env_bool() in this file.
+            - Requires the tzdata PyPI package on a base image with no system IANA timezone database (e.g. python:3.12.4-slim) - zoneinfo falls back to it automatically.
+            - Catches ZoneInfoNotFoundError, ValueError, and OSError, not just ZoneInfoNotFoundError - a malformed key (e.g. an absolute path, or a tzdata directory rather than a leaf zone such as "America" instead of "America/New_York") can raise any of the three.
+        """
+        raw_value = os.getenv(name) or default
+        try:
+            return ZoneInfo(raw_value)
+        except (ZoneInfoNotFoundError, ValueError, OSError):
+            return ZoneInfo(default)
 
 # import settings for singleton
 settings = Settings()

@@ -26,9 +26,10 @@ import logging
 import queue
 import threading
 
-from datetime import datetime, timedelta
+from datetime import timedelta
 
 from ...config import settings
+from ..utilities import application_time
 from ..utils_redis.database import mark_task_active, mark_task_complete, sweep_orphaned_sessions
 
 # =============================================================================
@@ -366,11 +367,11 @@ def _seconds_until_next_session_reset_time() -> float:
             Seconds until the next occurrence - today's, if it hasn't passed yet; otherwise tomorrow's.
 
     Notes:
-        - Only ever called from within a guard that has already confirmed settings.SESSION_RESET_TIME is set - see start_session_reset_schedule()/_session_reset_schedule_loop().
-        - Timezone-naive - compares against datetime.now() as-is, matching settings.SESSION_RESET_TIME's own "ignore timezone for now" scope - see config.py::get_env_time().
+        - Only ever called from within a guard that has already confirmed settings.SESSION_RESET_TIME is set.
+        - "now" comes from application_time(), timezone-aware and anchored to settings.TZ - SESSION_RESET_TIME itself is a plain hour/minute, interpreted as a wall-clock time in that same zone.
         - A target exactly equal to now (the boundary itself) is treated as already passed, rolling to tomorrow - avoids a zero-second wait firing the reset twice back to back.
     """
-    now = datetime.now()
+    now = application_time()
     target = now.replace(hour=settings.SESSION_RESET_TIME.hour, minute=settings.SESSION_RESET_TIME.minute, second=0, microsecond=0)
     if target <= now:
         target += timedelta(days=1)
@@ -418,7 +419,7 @@ def start_session_reset_schedule() -> None:
         _session_reset_schedule_stop_event.clear()
         _session_reset_schedule_thread = threading.Thread(target=_session_reset_schedule_loop, daemon=True)
         _session_reset_schedule_thread.start()
-        logger.info(f"Started timed session reset schedule - next at {settings.SESSION_RESET_TIME.strftime('%H:%M')} (daily, timezone ignored).")
+        logger.info(f"Started timed session reset schedule - next at {settings.SESSION_RESET_TIME.strftime('%H:%M')} {settings.TZ} (daily).")
 
 def stop_session_reset_schedule() -> None:
     """

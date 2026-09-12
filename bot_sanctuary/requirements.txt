@@ -2,3 +2,4 @@ pika==1.4.4
 concurrent-log-handler==0.9.29
 claude-agent-sdk==0.2.152
 redis==5.2.1
+tzdata==2025.2

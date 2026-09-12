@@ -23,6 +23,7 @@ import logging
 import redis
 
 from ...config import settings
+from ..utilities import application_time, application_time_diff
 
 # =============================================================================
 # G L O B A L   V A R I A B L E
@@ -142,7 +143,7 @@ def should_notify_gateway_alert() -> bool:
             if last_notified_at is None:
                 return True
             else:
-                return (time.time() - float(last_notified_at)) >= settings.GATEWAY_ALERT_NOTIFY_COOLDOWN_SECONDS
+                return application_time_diff(float(last_notified_at)) >= settings.GATEWAY_ALERT_NOTIFY_COOLDOWN_SECONDS
         except Exception:
             if attempt < settings.REDIS_TASK_MAX_ATTEMPTS:
                 logger.warning(f"Failed to check gateway_alert notification throttle in Redis (attempt {attempt}/{settings.REDIS_TASK_MAX_ATTEMPTS}). Retrying...")
@@ -194,7 +195,7 @@ def mark_gateway_alert_notified() -> None:
     for attempt in range(1, settings.REDIS_TASK_MAX_ATTEMPTS + 1):
         try:
             client = _get_redis_client()
-            client.set(_LAST_NOTIFIED_KEY, str(time.time()), ex=settings.GATEWAY_ALERT_NOTIFY_COOLDOWN_SECONDS)
+            client.set(_LAST_NOTIFIED_KEY, str(application_time().timestamp()), ex=settings.GATEWAY_ALERT_NOTIFY_COOLDOWN_SECONDS)
             return
         except Exception:
             if attempt < settings.REDIS_TASK_MAX_ATTEMPTS:

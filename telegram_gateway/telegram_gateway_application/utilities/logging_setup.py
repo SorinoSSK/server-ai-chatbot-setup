@@ -6,6 +6,7 @@
 #
 # Features    :
 #   - Console and daily/size-based rotating file logging, with retention management.
+#   - Log timestamps rendered in settings.TZ, not the process's raw OS-level local time.
 #
 # Notes       :
 #   - Centralised logging configuration for the application.
@@ -16,6 +17,8 @@
 
 import os
 import logging
+
+from datetime import datetime
 from concurrent_log_handler import ConcurrentTimedRotatingFileHandler
 from ..config import settings
 
@@ -34,10 +37,12 @@ def setup_logging() -> logging.Logger:
 
     Notes:
         - Clears existing handlers first to avoid duplicates; call once at startup.
+        - Every log timestamp is rendered in settings.TZ, regardless of the container's own OS-level local time - Formatter.converter is overridden below rather than left at its default.
     """
     settings.LOG_DIR.mkdir(parents=True, exist_ok=True)
 
     formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s")
+    formatter.converter = lambda timestamp: datetime.fromtimestamp(timestamp, tz=settings.TZ).timetuple()
 
     log_level = getattr(logging, settings.LOG_LEVEL.upper(), logging.INFO)
     log_max_size = settings.LOG_MAX_SIZE_MB * 1024 * 1024

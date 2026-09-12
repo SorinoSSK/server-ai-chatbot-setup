@@ -127,6 +127,7 @@ docker restart <docker-container-name>
 - **Media staged as a draft, not sent as a task immediately** - a photo/video/document arriving without a finalising instruction is held server-side as a draft, rather than forcing every upload to carry its instruction as a caption.
 - **Two-tier delivery-failure reporting** - a rejected send is reported per-task (Tier 1, actionable by retrying differently) separately from a systemic outage (Tier 2, human intervention), so a consumer of `Q_CHANNEL_OUT` can distinguish "retry this differently" from "something is broken".
 - **In-memory timers with a Redis backstop** - draft/poll keep-alive timers are deliberately in-memory rather than persisted/distributed, with Redis TTLs and startup sweeps (`close_orphaned_drafts()`/`close_orphaned_polls()`) as a safety net against a restart leaving state silently stuck.
+- **One configurable timezone, one shared time source** - log timestamps and every stored/compared timestamp (e.g. a pending reset's `created_at`) are anchored to a single configurable timezone (`TZ`) via a single shared time-retrieval helper, rather than each module reading the container's own local time independently.
 
 ### Limitations
 - Only one pending draft is held per `chat_id` at a time - further media is rejected with a reminder rather than queued.
@@ -214,6 +215,11 @@ reset_session(chat_id)                         <- everything below keyed by the 
 | LOG_LEVEL | Root logger verbosity. |
 | LOG_MAX_SIZE_MB | File size that triggers a log rotation, alongside the daily rotation. |
 | LOG_RETENTION_DAYS | Number of rotated log files kept before deletion. |
+
+#### Timezone
+| Variable | Purpose |
+|-----------|---------|
+| TZ | IANA timezone name (e.g. `Asia/Singapore`). Sourced from `config.ini`'s `CHATBOT_TZ`, shared with `bot_sanctuary` (both set the container's own `TZ` env var to the same value - see `compose.dev.yml`). Governs this application's own log timestamps (`utilities/logging_setup.py`) - unlike `bot_sanctuary`, nothing here schedules against wall-clock time, so `TZ` has no other effect on this side. Defaults to `UTC` if unset or unrecognised - see `config.py::get_env_timezone()`. |
 
 #### Telegram Connectivity
 | Variable | Purpose |

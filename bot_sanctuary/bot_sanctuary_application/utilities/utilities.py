@@ -16,12 +16,50 @@
 import logging
 import threading
 
+from datetime import datetime
+
+from ..config import settings
+
 # =============================================================================
 # G L O B A L   V A R I A B L E
 
 logger = logging.getLogger(__name__)
 
 # =============================================================================
+
+def application_time() -> datetime:
+    """
+    Returns the application's current time, as a timezone-aware datetime anchored to settings.TZ.
+
+    Args:
+        None
+
+    Returns:
+        datetime:
+            The current time in settings.TZ.
+
+    Notes:
+        - The single source of truth for "what time is it right now" throughout the application - every module needing the current time should call this rather than datetime.now()/time.time() directly, so every timing decision and every stored timestamp agrees on the same clock.
+        - Anchored to settings.TZ, not the container's OS-level local time directly - same reasoning as logging_setup.py's log timestamps.
+    """
+    return datetime.now(settings.TZ)
+
+def application_time_diff(reference: float) -> float:
+    """
+    Computes the number of seconds elapsed since a previously captured epoch timestamp, measured against application_time().
+
+    Args:
+        reference (float):
+            An earlier point in time as a POSIX timestamp - normally application_time().timestamp(), as stored by whatever originally recorded it.
+
+    Returns:
+        float:
+            Elapsed seconds since reference, measured against application_time().
+
+    Notes:
+        - Exists alongside application_time() for callers that persist a bare epoch float rather than a datetime, and only ever need the elapsed duration back, not the wall-clock time itself.
+    """
+    return application_time().timestamp() - reference
 
 class ShutdownSignal(threading.Event):
     """

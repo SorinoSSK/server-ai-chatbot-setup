@@ -766,3 +766,78 @@ After `_redis_write()`/`_redis_read()`/`_redis_delete()` gained retry, 10 call s
 
 1. `get_all_pending_resets()`'s raw `client.get(key)` inside its `scan_iter` loop still bypasses `_redis_read()` even after this change - covered by the same up-front `_redis_ping()` guard as the `scan_iter` call itself, but not given its own dedicated retry. Consistent with treating this function's Low-tier ranking as a whole, not fixed further.
 2. Whether `CODE_NON_COMPLIANCE.md` should be revisited given this closes most of the retry gaps identified in the earlier audit is a call for whoever owns that document next - not modified as part of this session.
+
+---
+
+## NEW — Timezone awareness (`TZ`) for logging and wall-clock timing
+
+Status: **Implemented 2026-09-12, cross-service with `bot_sanctuary` — full shared history recorded in `bot_sanctuary/CODE_TODO.md`'s own "NEW — `session_clear_request` handling" entry, "Timezone awareness" subsection (not duplicated in full here, since this project has no wall-clock scheduling logic of its own to describe - only logging is affected on this side). Same day, immediate follow-up: `config.ini` (missed when `CHATBOT_TZ` was first added) has been caught up, and this project's own direct `time.time()` call sites now go through two new shared helpers, `application_time()`/`application_time_diff()` (`utilities/utilities.py`) - see this entry's own "Centralised time retrieval" subsection below and `bot_sanctuary/CODE_TODO.md`'s parallel entry for the full cross-project history.**
+
+### Context
+
+Direct instruction: "implement timing according to whichever timezone set to env. follow `${HOME}/repository/V-Project-Multimedia-Application/development/compose.standalone_dev.yml` to implement timezone for both telegram_gateway and bot_sanctuary. Logging such use timezone timing too." Immediate same-day follow-up to `bot_sanctuary`'s newly-added `SESSION_RESET_TIME` (which had explicitly deferred timezone handling - "ignore timezone for now" - per an earlier instruction the same day).
+
+### Decisions
+
+- **New `config.py` setting: `TZ`, plus a new `get_env_timezone()` helper** - same file, same silent-fallback-to-default convention as `get_env_int()`/`get_env_bool()`. Resolves the standard `TZ` environment variable (deliberately not a project-prefixed name, since that's also what the container's own OS layer expects) to a `zoneinfo.ZoneInfo`, falling back to `"UTC"` on unset or an unrecognised zone name.
+- **`utilities/logging_setup.py`'s shared `Formatter` instance given an explicit `.converter`** - `lambda timestamp: datetime.fromtimestamp(timestamp, tz=settings.TZ).timetuple()`, replacing the default `time.localtime`-based conversion. Applies to both the console and rotating-file handlers, since both share the one `formatter` object. This is this project's only actual use of `settings.TZ` today - unlike `bot_sanctuary`, nothing here schedules against a wall-clock target time.
+- **`tzdata` (PyPI) added to `requirements.txt`** - `python:3.12.4-slim` has no guaranteed system IANA timezone database; `zoneinfo.ZoneInfo()` automatically falls back to this package when the system one is missing (documented stdlib behaviour), removing the risk of a `ZoneInfoNotFoundError` regardless of the image's own OS-level timezone data.
+- **Root `config_sample.ini` - new `CHATBOT_TZ="Asia/Singapore"` variable**, shared between this project and `bot_sanctuary` (both containers' `TZ` env var is set from the same value in `compose.dev.yml`) - added to the shared/common section at the top of the file, not scoped under either service's own section. Not added to `setup.sh`'s `get_masked_config_variables()` (that list is for values every install must supply its own real value for; `TZ` already has one reasonable universal default carried over unchanged from what `compose.dev.yml` previously hardcoded) or to either project's own `tg_dev_run_docker()`/`bs_dev_run_docker()` (both settings this project and `bot_sanctuary` gained today - `TZ` and `SESSION_RESET_TIME` - have safe in-`config.py` defaults, so a standalone dev run works without them).
+- **Root `compose.dev.yml` - both services' hardcoded `TZ: "Asia/Singapore"` replaced with `TZ: "${CHATBOT_TZ}"`** - follows the referenced `compose.standalone_dev.yml`'s own plain-`TZ`-env-var pattern, but parameterised through this project's existing `CHATBOT_*`/`config.ini` convention rather than a second hardcoded literal, so this project and `bot_sanctuary` can never silently drift apart on which zone they're each using.
+- **`README.md` - new "Timezone" settings-table section.**
+
+### Where
+
+- `telegram_gateway_application/config.py`: new `TZ` setting + `get_env_timezone()`.
+- `telegram_gateway_application/utilities/logging_setup.py`: `Formatter.converter` override.
+- `requirements.txt`: new `tzdata` dependency.
+- `README.md`: new "Timezone" section under Environment Variables.
+- Root `config_sample.ini`/`compose.dev.yml`: shared `CHATBOT_TZ`/`TZ` plumbing, covering both this project and `bot_sanctuary`.
+- `bot_sanctuary/CODE_TODO.md`: the full counterpart entry, including the `bot_sanctuary`-side wall-clock scheduling change (`SESSION_RESET_TIME` made timezone-aware) that this project has no equivalent of.
+
+### Centralised time retrieval — `application_time()`/`application_time_diff()` — implemented 2026-09-12
+
+Direct same-day follow-up instruction: "update config.ini too. Additionally, create application_time() function in utilitise.py on both bot_sanctuary and telegram_gateway. all retrieval of time should be retrieved from application_time(), create another function to get time diff too if required." See `bot_sanctuary/CODE_TODO.md`'s parallel "Centralised time retrieval" subsection for the full shared rationale (single clock source of truth, why a separate diff helper, why `time.sleep()`/`logging_setup.py`'s `Formatter.converter` were deliberately left untouched) - not repeated here in full.
+
+- [x] **`config.ini` updated** with the same `CHATBOT_TZ="Asia/Singapore"` block added to `config_sample.ini` in the "Timezone awareness" section above - this file was overlooked in that earlier pass.
+- [x] **New `application_time() -> datetime` and `application_time_diff(reference: float) -> float` added to `utilities/utilities.py`** - `application_time()` returns `datetime.now(settings.TZ)`; `application_time_diff()` returns `application_time().timestamp() - reference`. Same implementation as `bot_sanctuary`'s copy - no shared package between the two projects, so each gets its own.
+- [x] **This project's own direct time-retrieval call sites migrated:** `utils_redis/database.py::set_pending_reset()`'s `"created_at": time.time()` → `"created_at": application_time().timestamp()`; `utils_session/session_reset_handler.py::_is_pending_reset_expired()`'s `time.time() - created_at` → `application_time_diff(created_at)`. `import time` dropped from `session_reset_handler.py` entirely once its only use was replaced (still needed in `database.py`, for its `time.sleep()` retry-delay calls, which stay untouched).
+
+### Where (this subsection only)
+
+- `telegram_gateway_application/utilities/utilities.py`: new `application_time()`/`application_time_diff()`.
+- `telegram_gateway_application/utilities/utils_redis/database.py`: `set_pending_reset()`.
+- `telegram_gateway_application/utilities/utils_session/session_reset_handler.py`: `_is_pending_reset_expired()`, dropped `import time`.
+- Root `config.ini`: new `CHATBOT_TZ`.
+- `bot_sanctuary/CODE_TODO.md`: the full shared rationale and its own parallel call-site migration.
+
+---
+
+## FIX — CCR-025: `get_env_timezone()` only caught one of several exception types `zoneinfo.ZoneInfo()` can raise for a malformed `TZ` value
+
+Status: **Implemented, cross-service with `bot_sanctuary` (identical fix, both `config.py` files) — by explicit instruction ("update fix for both telegram_gateway and bot_santuary") following on-request validation confirming the finding was still Open. Fixes the Medium-severity finding identified in the twelfth follow-up compliance review (2026-09-12) of the new timezone-awareness change — see `CODE_NON_COMPLIANCE.md`. Not modified there directly (treated as an immutable compliance record); this entry is the code-side record of the fix.**
+
+### Context
+
+`get_env_timezone()`'s own docstring promised "Falls back to default, silently, on an unrecognised zone name" — the same "disable/fall back rather than crash" convention every other `get_env_*()` helper in `config.py` follows. Its implementation only caught `zoneinfo.ZoneInfoNotFoundError`, but CPython's `zoneinfo.ZoneInfo()` also raises `ValueError` for a key that is an absolute path or contains an uplevel (`..`) component, and `IsADirectoryError` (an `OSError` subclass) for a key that resolves to a tzdata directory rather than a leaf zone file — the latter a plausible real operator typo (`TZ=America` instead of `TZ=America/New_York`), not a contrived attack string. Since `settings = Settings()` runs unconditionally at module-import time, before `setup_logging()` or any other guarded startup step, either uncaught exception type crashed the whole process with a raw traceback instead of the documented graceful fallback.
+
+### Decisions
+
+- **Broadened the `except` clause to `(ZoneInfoNotFoundError, ValueError, OSError)`** — exactly the Recommended Remediation from the original finding. `OSError` covers `IsADirectoryError` (and any other filesystem-adjacent exception `zoneinfo`'s path-validation logic might raise for a malformed key) without needing to enumerate every subclass individually.
+- **No behavioural change for a valid `TZ` value** — the fix only widens what is caught on the failure path; a well-formed IANA zone name resolves exactly as before.
+- **Docstring's Notes section updated** to name the three caught exception types and why each is caught, cross-referencing CCR-025 by number for anyone tracing the code back to the compliance record.
+- **Applied identically to `bot_sanctuary/bot_sanctuary_application/config.py`'s own `get_env_timezone()`** — the two functions are byte-for-byte identical copies (no shared package between the two projects), so the same defect existed in both and is fixed in both, in the same commit-worthy change.
+
+### Implementation Notes
+
+- `telegram_gateway_application/config.py::get_env_timezone()`: `except ZoneInfoNotFoundError:` → `except (ZoneInfoNotFoundError, ValueError, OSError):`.
+- `bot_sanctuary_application/config.py::get_env_timezone()`: identical change.
+
+### Open Questions
+
+1. Whether `CODE_NON_COMPLIANCE.md` should be updated to mark CCR-025 Resolved is a call for whoever owns that document next — it's treated as an immutable compliance record here and was not modified as part of this session.
+
+### Where
+
+- `telegram_gateway_application/config.py`: `get_env_timezone()`.
+- `bot_sanctuary/bot_sanctuary_application/config.py`: `get_env_timezone()` (see `bot_sanctuary/CODE_TODO.md` for that project's own copy of this entry).

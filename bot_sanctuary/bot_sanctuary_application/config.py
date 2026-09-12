@@ -18,6 +18,7 @@ import re
 
 from pathlib import Path
 from datetime import time
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 # =============================================================================
 
@@ -42,6 +43,12 @@ class Settings:
         self.LOG_LEVEL                                          = os.getenv("LOG_LEVEL") or DEFAULT_LOG_LEVEL
         self.LOG_MAX_SIZE_MB                                    = get_env_int("LOG_MAX_SIZE_MB", DEFAULT_LOG_MAX_SIZE_MB)
         self.LOG_RETENTION_DAYS                                 = get_env_int("LOG_RETENTION_DAYS", DEFAULT_LOG_RETENTION_DAYS)
+
+        # Timezone (see get_env_timezone(), utilities/logging_setup.py)
+        # Every wall-clock timing decision this application makes, and its own log timestamps, are anchored to this value rather than the container's OS-level local time directly.
+        # Deliberately reads the standard "TZ" name, not a project-prefixed one, since that's also what the container's own OS layer already expects.
+        DEFAULT_TZ                                              = "UTC"
+        self.TZ                                                 = get_env_timezone("TZ", DEFAULT_TZ)
 
         # LLM Provider - each named Call resolves its own LLM_<CALL>_TYPE, falling back to LLM_CHAT_TYPE.
         DEFAULT_LLM_CHAT_TYPE                                   = ""
@@ -147,7 +154,7 @@ class Settings:
         # Optional daily timed global session reset - this application decides and fires it itself, on its own schedule.
         # Empty (the default) means no timed reset at all.
         # Accepts either a 24-hour ("13:00") or a 12-hour ("1:00pm") clock value - see get_env_time() for the exact parsing rules.
-        # Timezone-naive for now - compared directly against the container's own local time.
+        # Interpreted as a wall-clock time in settings.TZ (see above), not whatever zone the host/container happens to be running in.
         DEFAULT_SESSION_RESET_TIME                              = ""
         self.SESSION_RESET_TIME                                 = get_env_time("SESSION_RESET_TIME", DEFAULT_SESSION_RESET_TIME)
 
@@ -213,6 +220,32 @@ def get_env_bool(name: str, default: bool) -> bool:
         value = os.getenv(name)
         return default if value is None else value.strip().lower() == "true"
 
+def get_env_timezone(name: str, default: str) -> ZoneInfo:
+        """
+        Reads an IANA timezone name environment variable, falling back to default if unset or unrecognised.
+
+        Args:
+            name (str):
+                Environment variable name.
+
+            default (str):
+                Fallback IANA timezone name if unset or invalid - must itself be a valid zone (e.g. "UTC").
+
+        Returns:
+            ZoneInfo:
+                The resolved timezone.
+
+        Notes:
+            - Falls back to default, silently, on an unrecognised zone name - same "disable/fall back rather than crash" convention as get_env_int()/get_env_bool() in this file.
+            - Requires the tzdata PyPI package on a base image with no system IANA timezone database (e.g. python:3.12.4-slim) - zoneinfo falls back to it automatically.
+            - Catches ZoneInfoNotFoundError, ValueError, and OSError, not just ZoneInfoNotFoundError - a malformed key (e.g. an absolute path, or a tzdata directory rather than a leaf zone such as "America" instead of "America/New_York") can raise any of the three.
+        """
+        raw_value = os.getenv(name) or default
+        try:
+            return ZoneInfo(raw_value)
+        except (ZoneInfoNotFoundError, ValueError, OSError):
+            return ZoneInfo(default)
+
 # Matches "H:MM"/"HH:MM", optionally followed by "am"/"pm" (case-insensitive, with or without a space).
 # The am/pm group is what distinguishes a 24-hour value from a 12-hour one - see get_env_time().
 _TIME_PATTERN = re.compile(r"^(\d{1,2}):(\d{2})\s*([AaPp][Mm])?$")
@@ -234,16 +267,9 @@ def get_env_time(name: str, default: str = "") -> time | None:
 
         Notes:
             - No am/pm suffix is always read as a 24-hour hour (0-23) - e.g. "13:00" is 1pm, "09:00" is 9am.
-            - An am/pm suffix is read as a 12-hour hour (1-12) and converted the usual way, with one
-              deliberate exception: an hour of 12 - "12:00am" as much as "12:00pm" - is always taken to mean
-              noon (12:00), never midnight. This trades away any way to express midnight via the 12-hour
-              form (use "00:00" instead) in return for never silently misreading the classic 12am/12pm mix-up.
-            - Timezone-naive - the returned time is compared as-is against local time by whatever schedules
-              against it (see utils_session/session_worker.py).
-            - Falls back to None (not default re-parsed) on anything unparsable - an invalid value disables
-              the timed feature it configures rather than risking a silently-wrong time. Silent, like every
-              other get_env_*() helper in this file - this module has no logger of its own, and settings is
-              constructed before logging is configured elsewhere in the application.
+            - An am/pm suffix is read as a 12-hour hour (1-12) and converted the usual way, with one deliberate exception: an hour of 12 - "12:00am" as much as "12:00pm" - is always taken to mean noon, never midnight. Midnight can only be expressed via the 24-hour form ("00:00").
+            - Returns a plain time with no tzinfo of its own - the caller is responsible for interpreting it against settings.TZ, not the container's raw local time.
+            - Falls back to None (not default re-parsed) on anything unparsable - an invalid value disables the timed feature it configures rather than risking a silently-wrong time.
         """
         raw_value = (os.getenv(name) or default).strip()
         if not raw_value:

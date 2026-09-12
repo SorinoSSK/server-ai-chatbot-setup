@@ -138,6 +138,7 @@ Exits `0` on success, `1` on failure - check the container logs either way for d
 - The `gateway_alert` throttle fails open on a Redis outage, favouring alert availability over perfect throttling.
 - `SessionWorker` has three stop paths: `stop()` abandons queued work immediately (used on `session_cleared`), `shutdown()` drains it fully with no further action (used at application shutdown), and `retire()` drains it fully and then permanently removes the session (used by a global session reset).
 - A global session reset's accept/reject decision is a single in-memory flag - whether an earlier sweep is still draining - not a comparison against the requesting admin or request identity; any request arriving while one is in progress is rejected the same way regardless of who or what triggered it.
+- All wall-clock timing - log timestamps, `SESSION_RESET_TIME` scheduling, throttle timestamps - is anchored to one configurable timezone (`TZ`) via a single shared time-retrieval helper, rather than each module reading the container's own local time independently.
 
 ### Limitations
 
@@ -158,6 +159,12 @@ Exits `0` on success, `1` on failure - check the container logs either way for d
 | LOG_LEVEL | Root logger verbosity. |
 | LOG_MAX_SIZE_MB | File size that triggers a log rotation, alongside the daily rotation. |
 | LOG_RETENTION_DAYS | Number of rotated log files kept before deletion. |
+
+#### Timezone
+
+| Variable | Purpose |
+|---------|---------|
+| TZ | IANA timezone name (e.g. `Asia/Singapore`). Sourced from `config.ini`'s `CHATBOT_TZ`, shared with `telegram_gateway` (both set the container's own `TZ` env var to the same value - see `compose.dev.yml`). Governs this application's own log timestamps and every wall-clock timing decision it makes - `SESSION_RESET_TIME` (below) is interpreted as a wall-clock time in this zone, not the container's raw local time. Defaults to `UTC` if unset or unrecognised - see `config.py::get_env_timezone()`. |
 
 #### LLM Provider
 
@@ -219,7 +226,7 @@ Exits `0` on success, `1` on failure - check the container logs either way for d
 
 | Variable | Purpose |
 |---------|---------|
-| SESSION_RESET_TIME | Optional daily wall-clock time (e.g. `13:00` or `1:00pm`) at which this application fires a global session reset itself, on its own schedule - publishing `session_reset` (`task_id: null`) directly, the same as an accepted `session_clear_request` but with no requesting task to echo back. Empty (default) means no timed reset - `telegram_gateway` has no authority to trigger one on a schedule; only this timer or an admin command (via `session_clear_request`) ever starts one. Accepts a 24-hour value with no am/pm suffix, or a 12-hour value with one; `12:00am` and `12:00pm` are both read as noon - see `config.py::get_env_time()`. Timezone-naive - compared against the container's own local time. |
+| SESSION_RESET_TIME | Optional daily wall-clock time (e.g. `13:00` or `1:00pm`) at which this application fires a global session reset itself, on its own schedule - publishing `session_reset` (`task_id: null`) directly, the same as an accepted `session_clear_request` but with no requesting task to echo back. Empty (default) means no timed reset - `telegram_gateway` has no authority to trigger one on a schedule; only this timer or an admin command (via `session_clear_request`) ever starts one. Accepts a 24-hour value with no am/pm suffix, or a 12-hour value with one; `12:00am` and `12:00pm` are both read as noon - see `config.py::get_env_time()`. Interpreted as a wall-clock time in `TZ` (above), not the container's raw local time. |
 
 #### Redis Connection
 
