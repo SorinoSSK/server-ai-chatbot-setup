@@ -8,6 +8,7 @@
 #   - Message type resolution and routing for every message consumed from RabbitMQ.
 #   - Systemic gateway_alert/gateway_recover notification handling, throttled and Redis-backed.
 #   - Session-scoped message routing and session teardown handling.
+#   - Admin-triggered session_clear_request routing - accept/reject decision delegated to utils_session/session_worker.py::handle_session_clear_request().
 #
 # Notes       :
 #   - A malformed payload is logged and dropped rather than requeued forever.
@@ -27,7 +28,12 @@ from ..utils_redis.database import (
     mark_gateway_alert_notified,
     reset_gateway_alert_throttle
 )
-from ..utils_session.session_worker import clear_session_directory, get_or_create_session_worker, remove_session_worker
+from ..utils_session.session_worker import (
+    clear_session_directory,
+    get_or_create_session_worker,
+    remove_session_worker,
+    handle_session_clear_request
+)
 
 # =============================================================================
 # G L O B A L   V A R I A B L E
@@ -147,6 +153,27 @@ def _handle_session_cleared(data: dict) -> None:
 
         clear_session_directory(session_id)
 
+def _handle_session_clear_request(data: dict) -> None:
+    """
+    Handles an inbound session_clear_request - the admin-triggered request for a global session reset.
+
+    Args:
+        data (dict):
+            Decoded session_clear_request payload.
+
+    Returns:
+        None
+
+    Notes:
+        - A missing/empty task_id is a malformed message and is logged and dropped rather than passed on.
+        - The accept/reject decision, the session_reset publish, and the per-session retire signalling all live in utils_session/session_worker.py::handle_session_clear_request() - this function is only the inbound validation/routing step.
+    """
+    task_id = data.get("task_id")
+    if not task_id:
+        logger.error(f"Received session_clear_request with missing task_id. Message dropped: {data}")
+    else:
+        handle_session_clear_request(task_id)
+
 def _dispatch_to_session(data: dict) -> None:
     """
     Routes a session-scoped message to its owning session worker, creating one if this is a new session.
@@ -205,6 +232,8 @@ def process_message(payload: str) -> None:
             _handle_gateway_recover(data)
         elif message_type == "session_cleared":
             _handle_session_cleared(data)
+        elif message_type == "session_clear_request":
+            _handle_session_clear_request(data)
         else:
             _dispatch_to_session(data)
 

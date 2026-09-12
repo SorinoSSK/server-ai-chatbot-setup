@@ -7,7 +7,9 @@
 # Features    :
 #   - One-off LLM credential smoke test performed during startup.
 #   - RabbitMQ consume connection and background consumer lifecycle management.
+#   - Unconditional bot_started broadcast on every startup, ahead of crash recovery.
 #   - Crash-recovery sweep for sessions left dangling by a prior run.
+#   - Starts the optional daily timed global session reset (SESSION_RESET_TIME), if configured.
 #   - Graceful shutdown of active session workers ahead of connection teardown.
 #
 # Notes       :
@@ -24,10 +26,16 @@ from .utils_queue.queue import (
     initialise_rabbitmq_connection,
     start_queue_consumer,
     stop_queue_consumer,
-    close_rabbitmq_connection
+    close_rabbitmq_connection,
+    RabbitMQPublisher
 )
 from .utils_redis.database import close_redis_connection
-from .utils_session.session_worker import resync_orphaned_sessions, shutdown_all_session_workers
+from .utils_session.session_worker import (
+    resync_orphaned_sessions,
+    shutdown_all_session_workers,
+    start_session_reset_schedule,
+    stop_session_reset_schedule
+)
 
 # =============================================================================
 # G L O B A L   V A R I A B L E
@@ -36,11 +44,37 @@ logger = logging.getLogger(__name__)
 
 # =============================================================================
 
+def _push_bot_started() -> None:
+    """
+    Publishes an unconditional bot_started event to telegram_gateway on every application startup.
+
+    Fired regardless of cause - a genuine crash-recovery restart or a routine redeploy alike - since either way this application has no memory of what it was doing before.
+
+    Args:
+        None
+
+    Returns:
+        None
+
+    Notes:
+        - Fired once RabbitMQ connectivity is already confirmed, ahead of the crash-recovery sweep.
+        - Best-effort and non-fatal - a failed publish is logged and startup proceeds regardless; telegram_gateway's own ceiling sweep is the fallback for a lost event.
+        - Uses its own disposable RabbitMQPublisher, not a long-lived, thread-confined instance.
+    """
+    publisher = RabbitMQPublisher()
+    try:
+        if publisher.publish({"type": "bot_started"}):
+            logger.info("Published bot_started - this application has just started (crash-recovery restart or a routine redeploy).")
+        else:
+            logger.error("Failed to publish bot_started - telegram_gateway's own PENDING_RESET_MAX_WAIT_SECONDS ceiling sweep remains the fallback for whatever this was meant to reconcile.")
+    finally:
+        publisher.close()
+
 def initialise_application() -> None:
     """
     Runs application startup steps.
 
-    Performs the LLM credential smoke test, establishes the RabbitMQ consume connection, recovers any sessions left dangling by a prior run, and starts the background message consumer.
+    Performs the LLM credential smoke test, establishes the RabbitMQ consume connection, broadcasts bot_started, recovers any sessions left dangling by a prior run, starts the optional timed session reset schedule, and starts the background message consumer.
 
     Args:
         None
@@ -54,7 +88,9 @@ def initialise_application() -> None:
     test_llm_tokens()
 
     initialise_rabbitmq_connection()
+    _push_bot_started()
     resync_orphaned_sessions()
+    start_session_reset_schedule()
     start_queue_consumer()
 
     logger.info("Bot Sanctuary application initialised.")
@@ -63,7 +99,7 @@ def terminate_application() -> None:
     """
     Runs application shutdown steps.
 
-    Stops accepting new messages, allows active session workers to finish their current work, then closes the RabbitMQ and Redis connections.
+    Stops the timed session reset schedule and accepting new messages, allows active session workers to finish their current work, then closes the RabbitMQ and Redis connections.
 
     Args:
         None
@@ -74,6 +110,7 @@ def terminate_application() -> None:
     Notes:
         - See README.md for the full shutdown sequence and its design rationale.
     """
+    stop_session_reset_schedule()
     stop_queue_consumer()
     shutdown_all_session_workers()
     close_rabbitmq_connection()

@@ -14,8 +14,10 @@
 # I M P O R T   H E A D E R
 
 import os
+import re
 
 from pathlib import Path
+from datetime import time
 
 # =============================================================================
 
@@ -141,6 +143,14 @@ class Settings:
         DEFAULT_SESSION_SHUTDOWN_TIMEOUT_SECONDS                = 30
         self.SESSION_SHUTDOWN_TIMEOUT_SECONDS                   = get_env_int("SESSION_SHUTDOWN_TIMEOUT_SECONDS", DEFAULT_SESSION_SHUTDOWN_TIMEOUT_SECONDS, minimum=0)
 
+        # Session Reset (see utils_session/session_worker.py::trigger_timed_session_reset())
+        # Optional daily timed global session reset - this application decides and fires it itself, on its own schedule.
+        # Empty (the default) means no timed reset at all.
+        # Accepts either a 24-hour ("13:00") or a 12-hour ("1:00pm") clock value - see get_env_time() for the exact parsing rules.
+        # Timezone-naive for now - compared directly against the container's own local time.
+        DEFAULT_SESSION_RESET_TIME                              = ""
+        self.SESSION_RESET_TIME                                 = get_env_time("SESSION_RESET_TIME", DEFAULT_SESSION_RESET_TIME)
+
         # Redis Connection
         DEFAULT_REDIS_HOST                                      = "chatbot-redis"
         DEFAULT_REDIS_PORT                                      = 6379
@@ -202,5 +212,64 @@ def get_env_bool(name: str, default: bool) -> bool:
         """
         value = os.getenv(name)
         return default if value is None else value.strip().lower() == "true"
+
+# Matches "H:MM"/"HH:MM", optionally followed by "am"/"pm" (case-insensitive, with or without a space).
+# The am/pm group is what distinguishes a 24-hour value from a 12-hour one - see get_env_time().
+_TIME_PATTERN = re.compile(r"^(\d{1,2}):(\d{2})\s*([AaPp][Mm])?$")
+
+def get_env_time(name: str, default: str = "") -> time | None:
+        """
+        Reads a wall-clock time environment variable, accepting either a 24-hour or a 12-hour clock value.
+
+        Args:
+            name (str):
+                Environment variable name.
+
+            default (str, optional):
+                Fallback raw value if unset. Defaults to "" (no timed value at all).
+
+        Returns:
+            time | None:
+                The parsed time, or None if unset/blank/unparsable.
+
+        Notes:
+            - No am/pm suffix is always read as a 24-hour hour (0-23) - e.g. "13:00" is 1pm, "09:00" is 9am.
+            - An am/pm suffix is read as a 12-hour hour (1-12) and converted the usual way, with one
+              deliberate exception: an hour of 12 - "12:00am" as much as "12:00pm" - is always taken to mean
+              noon (12:00), never midnight. This trades away any way to express midnight via the 12-hour
+              form (use "00:00" instead) in return for never silently misreading the classic 12am/12pm mix-up.
+            - Timezone-naive - the returned time is compared as-is against local time by whatever schedules
+              against it (see utils_session/session_worker.py).
+            - Falls back to None (not default re-parsed) on anything unparsable - an invalid value disables
+              the timed feature it configures rather than risking a silently-wrong time. Silent, like every
+              other get_env_*() helper in this file - this module has no logger of its own, and settings is
+              constructed before logging is configured elsewhere in the application.
+        """
+        raw_value = (os.getenv(name) or default).strip()
+        if not raw_value:
+            return None
+
+        match = _TIME_PATTERN.match(raw_value)
+        if not match:
+            return None
+
+        hour, minute, meridiem = int(match.group(1)), int(match.group(2)), match.group(3)
+        if not (0 <= minute <= 59):
+            return None
+        elif meridiem is None:
+            if not (0 <= hour <= 23):
+                return None
+            else:
+                return time(hour, minute)
+        else:
+            if not (1 <= hour <= 12):
+                return None
+            elif hour == 12:
+                # Both "12:00am" and "12:00pm" mean noon here - see this function's own docstring Notes.
+                return time(12, minute)
+            elif meridiem.lower() == "pm":
+                return time(hour + 12, minute)
+            else:
+                return time(hour, minute)
 
 settings = Settings()

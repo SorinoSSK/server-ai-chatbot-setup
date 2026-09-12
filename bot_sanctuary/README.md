@@ -36,7 +36,7 @@ Python application root is located at `bot_sanctuary/bot_sanctuary_application`.
 
 1. Ensure `DATA_DIR`/`SESSION_DIR` exist and configure logging.
 2. Register `SIGINT`/`SIGTERM` handlers.
-3. `initialise_application()` runs a startup LLM credential smoke test, opens the RabbitMQ consume connection (retrying indefinitely until reachable), runs the crash-recovery sweep, then starts the background consumer thread.
+3. `initialise_application()` runs a startup LLM credential smoke test, opens the RabbitMQ consume connection (retrying indefinitely until reachable), publishes an unconditional `bot_started` event (`{"type": "bot_started"}`, no other fields - fired on every startup regardless of cause, crash or routine redeploy alike, so `telegram_gateway` can resolve any session_reset it's still holding for this application), runs the crash-recovery sweep, starts the optional daily timed session reset schedule (`SESSION_RESET_TIME`, if configured - see "Session Reset" under Environment Variables below), then starts the background consumer thread.
 4. The main thread blocks until a shutdown signal is received.
 
 #### Runtime
@@ -46,6 +46,7 @@ The RabbitMQ consumer loop consumes from `Q_CHANNEL_IN` and routes each message 
 - `gateway_alert` - logged critically, counted in Redis, and notified by email (throttled).
 - `gateway_recover` - logged, clears the `gateway_alert` throttle.
 - `session_cleared` - stops and removes the corresponding `SessionWorker`, and clears its on-disk directory.
+- `session_clear_request` - the admin-triggered request for a global session reset, accepted or rejected depending on whether a reset sweep is already in progress - see "Global Session Reset" below.
 - Everything else (a task, `poll_timed_out`, `delivery_failed`) - routed to `get_or_create_session_worker(session_id)`.
 
 A message is acked once successfully registered with its `SessionWorker`, not once actually processed. A failed registration (full inbox) is nacked and requeued.
@@ -54,12 +55,21 @@ Each `SessionWorker` is a long-lived, per-`session_id` thread with its own inbox
 
 Crash recovery: every accepted `task_id` is durably recorded in Redis and cleared once resolved. At startup, before the consumer starts, any still-recorded tasks are grouped by session and a `session_reset` is requested per session.
 
+#### Global Session Reset
+
+Every session this application holds can be cleared in one of two ways: a whitelisted admin's `"${BOT_NAME} refresh yourself"` command in Telegram, relayed here as `session_clear_request`, or this application's own optional daily schedule (`SESSION_RESET_TIME`). Both share the same sweep, decided purely by whether an earlier sweep is still in progress - a `session_clear_request` arriving while one is running is rejected with an `error` reply so the requesting admin knows why nothing happened, while a conflicting scheduled trigger has no requester to notify and is simply skipped until its next daily occurrence.
+
+On acceptance, `session_reset` is published to `telegram_gateway` immediately - before any session is actually cleared - so the reset takes effect on that side without waiting for every session here to finish its own graceful shutdown first. Every currently active `SessionWorker` is then signalled to retire: finish whatever is already queued, then permanently remove itself from the session registry and clear its on-disk directory. A further reset request is only accepted again once every signalled session has finished retiring.
+
+Crash recovery for this feature relies on the unconditional `bot_started` broadcast rather than resuming an interrupted sweep - an in-progress sweep is purely in-memory state and is simply lost if the process restarts mid-sweep, with `telegram_gateway`'s own pending-reset ceiling acting as the eventual fallback.
+
 #### Shutdown
 
-1. Stop the RabbitMQ consumer.
-2. Signal every active `SessionWorker` to finish its queued work, and wait for each (bounded by `SESSION_SHUTDOWN_TIMEOUT_SECONDS`).
-3. Close the RabbitMQ connection.
-4. Close the Redis connection, if it was ever opened.
+1. Stop the timed session reset schedule, if it was ever started (harmless no-op otherwise).
+2. Stop the RabbitMQ consumer.
+3. Signal every active `SessionWorker` to finish its queued work, and wait for each (bounded by `SESSION_SHUTDOWN_TIMEOUT_SECONDS`).
+4. Close the RabbitMQ connection.
+5. Close the Redis connection, if it was ever opened.
 
 ## Getting Started
 
@@ -126,7 +136,8 @@ Exits `0` on success, `1` on failure - check the container logs either way for d
 - SMTP credentials are never logged in full, only whether a value is set.
 - Redis uses a separate ACL user from `telegram_gateway`, scoped to this application's own keys.
 - The `gateway_alert` throttle fails open on a Redis outage, favouring alert availability over perfect throttling.
-- `SessionWorker` has two stop paths: `stop()` abandons queued work immediately (used on `session_cleared`), `shutdown()` drains it fully (used at application shutdown).
+- `SessionWorker` has three stop paths: `stop()` abandons queued work immediately (used on `session_cleared`), `shutdown()` drains it fully with no further action (used at application shutdown), and `retire()` drains it fully and then permanently removes the session (used by a global session reset).
+- A global session reset's accept/reject decision is a single in-memory flag - whether an earlier sweep is still draining - not a comparison against the requesting admin or request identity; any request arriving while one is in progress is rejected the same way regardless of who or what triggered it.
 
 ### Limitations
 
@@ -135,6 +146,8 @@ Exits `0` on success, `1` on failure - check the container logs either way for d
 - The crash-recovery startup sweep currently over-triggers on every restart, not just a genuine crash, until the Call pipeline reliably marks tasks complete.
 - The `gateway_alert` throttle window is a rolling cooldown, not a calendar-day reset.
 - `qwen_interface.py`'s endpoint/model are unconfirmed assumptions, not verified against a real account.
+- A failed `session_reset`/rejection publish during a global session reset has no retry or backstop - the requesting admin's task may be left open on `telegram_gateway`'s side.
+- A session receiving a continuous, gapless stream of messages can delay its own retirement indefinitely during a global session reset, blocking every later reset request until it finishes.
 
 ### Environment Variables
 
@@ -202,6 +215,12 @@ Exits `0` on success, `1` on failure - check the container logs either way for d
 | SESSION_INBOX_MAX_SIZE | Bounds each `SessionWorker`'s own inbox (default 100). |
 | SESSION_SHUTDOWN_TIMEOUT_SECONDS | Maximum seconds to wait for each `SessionWorker` to finish on shutdown (default 30, `0` waits indefinitely). |
 
+#### Session Reset
+
+| Variable | Purpose |
+|---------|---------|
+| SESSION_RESET_TIME | Optional daily wall-clock time (e.g. `13:00` or `1:00pm`) at which this application fires a global session reset itself, on its own schedule - publishing `session_reset` (`task_id: null`) directly, the same as an accepted `session_clear_request` but with no requesting task to echo back. Empty (default) means no timed reset - `telegram_gateway` has no authority to trigger one on a schedule; only this timer or an admin command (via `session_clear_request`) ever starts one. Accepts a 24-hour value with no am/pm suffix, or a 12-hour value with one; `12:00am` and `12:00pm` are both read as noon - see `config.py::get_env_time()`. Timezone-naive - compared against the container's own local time. |
+
 #### Redis Connection
 
 | Variable | Purpose |
@@ -226,8 +245,10 @@ flowchart TD
     subgraph INIT["Startup"]
         Init --> LLMTest["test_llm_tokens() - smoke test per configured provider"]
         LLMTest --> RMQ["initialise_rabbitmq_connection() - retries until reachable"]
-        RMQ --> Resync["resync_orphaned_sessions() - request session_reset per orphaned session"]
-        Resync --> Consumer["start_queue_consumer()"]
+        RMQ --> BotStarted["_push_bot_started() - publish {type: bot_started}, best-effort"]
+        BotStarted --> Resync["resync_orphaned_sessions() - request session_reset per orphaned session"]
+        Resync --> Schedule["start_session_reset_schedule() - no-op unless SESSION_RESET_TIME is set"]
+        Schedule --> Consumer["start_queue_consumer()"]
     end
 
     Consumer --> Block(["Main thread blocks on shutdown_event.wait()"])
@@ -239,10 +260,12 @@ flowchart TD
         Q3 -- gateway_alert --> GA["_handle_gateway_alert()"]
         Q3 -- gateway_recover --> GR["_handle_gateway_recover()"]
         Q3 -- session_cleared --> SC["stop + remove SessionWorker"]
+        Q3 -- session_clear_request --> CR["handle_session_clear_request()"]
         Q3 -- "task / poll_timed_out / delivery_failed" --> SR["get_or_create_session_worker().submit()"]
         GA --> Q4["ack / nack + requeue up to Q_CONSUME_MAX_ATTEMPTS"]
         GR --> Q4
         SC --> Q4
+        CR --> Q4
         SR --> Q4
         Q4 --> Q1
     end
@@ -250,6 +273,7 @@ flowchart TD
     GA -.-> GA1
     GR -.-> GR1
     SR -.-> SW1
+    CR -.-> RS1
 
     subgraph GAFlow["_handle_gateway_alert()"]
         GA1["record occurrence in Redis"] --> GA2{"should notify? (Redis cooldown, fails open)"}
@@ -271,8 +295,20 @@ flowchart TD
         SW4 -.-> SW5["combine text, hand off to agent Call pipeline (not yet implemented)"]
     end
 
+    subgraph ResetFlow["Global session reset sweep (session_clear_request or SESSION_RESET_TIME)"]
+        RS1{"sweep already in progress?"} -- yes --> RS2["reject: publish error (session_clear_request) / skip (timed)"]
+        RS1 -- no --> RS3["snapshot every active SessionWorker, mark pending"]
+        RS3 --> RS4["publish session_reset immediately"]
+        RS4 --> RS5["signal retire() on every snapshotted SessionWorker, concurrently"]
+        RS5 --> RS6["each worker drains its queue, removes itself, reports retirement"]
+        RS6 --> RS1
+    end
+
+    Schedule -.->|daily at SESSION_RESET_TIME| RS1
+
     Block -- "SIGINT/SIGTERM" --> Term["terminate_application()"]
-    Term --> S1["stop_queue_consumer()"]
+    Term --> S0["stop_session_reset_schedule() - harmless no-op if never started"]
+    S0 --> S1["stop_queue_consumer()"]
     S1 --> S1b["shutdown_all_session_workers()"]
     S1b --> S2["close_rabbitmq_connection()"]
     S2 --> S3["close_redis_connection()"]
