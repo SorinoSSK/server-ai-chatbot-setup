@@ -1,16 +1,17 @@
 # =============================================================================
-# File        : deepseek_interface.py
-# Description : Interfaces with DeepSeek via its OpenAI-compatible chat completions API.
+# File        : qwen_interface.py
+# Description : Interfaces with Qwen via DashScope's OpenAI-compatible chat completions API.
 # Author      : SorinoSSK
 # Created On  : 2026-09-10
 #
 # Features    :
-#   - query_via_api()   - sends a prompt to DeepSeek, authenticated via a DeepSeek API key.
+#   - query_via_api()   - sends a prompt to Qwen, authenticated via a DashScope (or compatible) API key.
 #   - query_via_oauth() - not supported; always logs and returns None (see Notes).
 #
 # Notes       :
-#   - DeepSeek is API-key-only - it has no OAuth flow and no official CLI.
-#   - No DeepSeek Python SDK exists, so this calls its OpenAI-compatible REST endpoint directly via stdlib urllib, wrapped in asyncio.to_thread().
+#   - Qwen is API-key-only today - its former free OAuth login tier was discontinued.
+#   - No Qwen/DashScope Python SDK exists, so this calls its OpenAI-compatible REST endpoint directly via stdlib urllib, wrapped in asyncio.to_thread().
+#   - _API_URL/_MODEL default to DashScope's international endpoint and a general-purpose model - unverified against a real account, see CODE_TODO.md.
 #   - persona is delivered as its own leading "system" role message, not concatenated into prompt.
 #   - See agent_interface.py for the provider-agnostic dispatch that selects this module.
 #
@@ -23,27 +24,29 @@ import logging
 import urllib.error
 import urllib.request
 
+from pathlib import Path
+
 # =============================================================================
 # G L O B A L   V A R I A B L E
 
 logger = logging.getLogger(__name__)
 
-_API_URL = "https://api.deepseek.com/chat/completions"
-_MODEL = "deepseek-chat"
+_API_URL = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1/chat/completions"
+_MODEL = "qwen-plus"
 _REQUEST_TIMEOUT_SECONDS = 60
 
 # =============================================================================
 
 def _post_chat_completion(prompt: str, token: str, persona: str | None = None) -> str | None:
     """
-    Posts a single chat completion request to the DeepSeek API and returns the reply text.
+    Posts a single chat completion request to DashScope's OpenAI-compatible endpoint and returns the reply text.
 
     Args:
         prompt (str):
             The prompt to send.
 
         token (str):
-            The DeepSeek API key.
+            The DashScope (or compatible) API key.
 
         persona (str | None):
             Optional persona/system prompt for this call.
@@ -81,25 +84,30 @@ def _post_chat_completion(prompt: str, token: str, persona: str | None = None) -
             payload = json.loads(response.read().decode("utf-8"))
         return payload["choices"][0]["message"]["content"] or None
     except urllib.error.HTTPError as error:
-        logger.error(f"DeepSeek API returned HTTP {error.code}: {error.read().decode(errors='replace').strip()}")
+        logger.error(f"Qwen (DashScope) API returned HTTP {error.code}: {error.read().decode(errors='replace').strip()}")
         return None
     except Exception:
-        logger.exception("DeepSeek query failed - credential may be invalid/expired, the response was malformed, or the endpoint is unreachable.")
+        logger.exception("Qwen query failed - credential may be invalid/expired, the response was malformed, or the endpoint is unreachable.")
         return None
 
-async def query_via_api(prompt: str, token: str, persona: str | None = None) -> str | None:
+async def query_via_api(prompt: str, token: str, persona: str | None = None, cwd: Path | None = None) -> str | None:
     """
-    Sends a prompt to DeepSeek, authenticated via a DeepSeek API key.
+    Sends a prompt to Qwen, authenticated via a DashScope (or compatible) API key.
 
     Args:
         prompt (str):
             The prompt to send.
 
         token (str):
-            The DeepSeek API key.
+            The DashScope (or compatible) API key.
 
         persona (str | None):
             Optional persona/system prompt for this call.
+
+        cwd (Path | None):
+            Unused - accepted only for a uniform signature across every provider's query_via_oauth()/
+            query_via_api() (see agent_interface.py::query_llm()). Qwen has no session-continuity mechanism
+            wired yet - see claude_interface.py for the one provider that currently does something with this.
 
     Returns:
         str | None:
@@ -110,9 +118,9 @@ async def query_via_api(prompt: str, token: str, persona: str | None = None) -> 
     """
     return await asyncio.to_thread(_post_chat_completion, prompt, token, persona)
 
-async def query_via_oauth(prompt: str, token: str, persona: str | None = None) -> str | None:
+async def query_via_oauth(prompt: str, token: str, persona: str | None = None, cwd: Path | None = None) -> str | None:
     """
-    Not supported - DeepSeek has no OAuth/CLI login mechanism.
+    Not supported - Qwen's free OAuth login tier was discontinued.
 
     Args:
         prompt (str):
@@ -124,11 +132,14 @@ async def query_via_oauth(prompt: str, token: str, persona: str | None = None) -
         persona (str | None):
             Unused, same reason.
 
+        cwd (Path | None):
+            Unused, same reason.
+
     Returns:
         str | None:
             Always None.
     """
-    logger.warning("LLM_DEEPSEEK_ACCESS_TYPE=\"OAUTH\" is not supported - DeepSeek is API-key-only. Set LLM_DEEPSEEK_ACCESS_TYPE=\"API\" instead.")
+    logger.warning("LLM_QWEN_ACCESS_TYPE=\"OAUTH\" is not supported - Qwen's OAuth login tier was discontinued, it is API-key-only today. Set LLM_QWEN_ACCESS_TYPE=\"API\" instead.")
     return None
 
 # =============================================================================

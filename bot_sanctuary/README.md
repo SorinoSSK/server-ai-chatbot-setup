@@ -2,7 +2,7 @@
 
 Bot Sanctuary is the successor to `bot_orchestrator`'s routing role, merged with the AI agent pipeline itself - one consolidated Python application rather than a separate orchestrator container plus per-agent containers. It owns RabbitMQ consumption from `telegram_gateway`, per-session threading, the multi-agent "Call" pipeline, tool access, and error/alert routing. All application code runs inside a Docker container - there is no standalone execution path.
 
-**Status:** RabbitMQ connectivity, SMTP alerting, and per-session message routing/coalescing are implemented. The agent Call pipeline itself (the part that actually talks to an LLM and replies) is not yet built - see `CODE_TODO.md` for current status and design.
+**Status:** RabbitMQ connectivity, SMTP alerting, and per-session message routing/coalescing are implemented. A minimal agent Call pipeline is now wired end-to-end (each `SessionWorker`'s coalesced turn is handed to the Chat Call, and its reply/error published back to `telegram_gateway` via `utils_agents/agent_tools.py`) - but it is Chat-only, with no handoff between Calls and no LLM-decided tool-calling yet. See `CODE_TODO.md` for current status and design.
 
 ## Infrastructure
 
@@ -36,7 +36,7 @@ Python application root is located at `bot_sanctuary/bot_sanctuary_application`.
 
 1. Ensure `DATA_DIR`/`SESSION_DIR` exist and configure logging.
 2. Register `SIGINT`/`SIGTERM` handlers.
-3. `initialise_application()` runs a startup LLM credential smoke test, opens the RabbitMQ consume connection (retrying indefinitely until reachable), publishes an unconditional `bot_started` event (`{"type": "bot_started"}`, no other fields - fired on every startup regardless of cause, crash or routine redeploy alike, so `telegram_gateway` can resolve any session_reset it's still holding for this application), runs the crash-recovery sweep, starts the optional daily timed session reset schedule (`SESSION_RESET_TIME`, if configured - see "Session Reset" under Environment Variables below), then starts the background consumer thread.
+3. `initialise_application()` starts every LLM provider's own always-on service, if it has one (today, only Claude's `claude_session_service.py`, and only if Claude is configured for OAuth access - see `utils_agents/agent_interface.py::initialise_llm_services()`), runs a startup LLM credential smoke test, opens the RabbitMQ consume connection (retrying indefinitely until reachable), publishes an unconditional `bot_started` event (`{"type": "bot_started"}`, no other fields - fired on every startup regardless of cause, crash or routine redeploy alike, so `telegram_gateway` can resolve any session_reset it's still holding for this application), runs the crash-recovery sweep, starts the optional daily timed session reset schedule (`SESSION_RESET_TIME`, if configured - see "Session Reset" under Environment Variables below), then starts the background consumer thread.
 4. The main thread blocks until a shutdown signal is received.
 
 #### Runtime
@@ -51,9 +51,9 @@ The RabbitMQ consumer loop consumes from `Q_CHANNEL_IN` and routes each message 
 
 A message is acked once successfully registered with its `SessionWorker`, not once actually processed. A failed registration (full inbox) is nacked and requeued.
 
-Each `SessionWorker` is a long-lived, per-`session_id` thread with its own inbox and its own RabbitMQ publish connection. It coalesces whatever is already queued into one combined turn rather than firing one turn per message, closing out every task_id in a batch except the last immediately. The agent Call pipeline itself is not yet implemented - a worker currently only logs what it would send.
+Each `SessionWorker` is a long-lived, per-`session_id` thread with its own inbox and its own RabbitMQ publish connection. It coalesces whatever is already queued into one combined turn rather than firing one turn per message, closing out every task_id in a batch except the last immediately. The last task_id's combined text is then run through `utils_calls/turn_handler.py::run_turn()` (Chat Call only, no handoff yet) and the outcome published via `utils_agents/agent_tools.py::execute_tool()` - a reply as `text` followed by `completed`, a pipeline failure as `error`, and a reply that itself fails validation/publish falling back to `error` too, so a task_id is never left silently open.
 
-Crash recovery: every accepted `task_id` is durably recorded in Redis and cleared once resolved. At startup, before the consumer starts, any still-recorded tasks are grouped by session and a `session_reset` is requested per session.
+Crash recovery: every accepted `task_id` is durably recorded in Redis and cleared once resolved - including the final task_id of a coalesced batch now that the pipeline above actually closes it out. At startup, before the consumer starts, any still-recorded tasks are grouped by session and a `session_reset` is requested per session.
 
 #### Global Session Reset
 
@@ -68,8 +68,9 @@ Crash recovery for this feature relies on the unconditional `bot_started` broadc
 1. Stop the timed session reset schedule, if it was ever started (harmless no-op otherwise).
 2. Stop the RabbitMQ consumer.
 3. Signal every active `SessionWorker` to finish its queued work, and wait for each (bounded by `SESSION_SHUTDOWN_TIMEOUT_SECONDS`).
-4. Close the RabbitMQ connection.
-5. Close the Redis connection, if it was ever opened.
+4. Stop every LLM provider's own always-on service, if it was started - deliberately after every `SessionWorker` has finished, since a worker's last turn may still be mid-call against it.
+5. Close the RabbitMQ connection.
+6. Close the Redis connection, if it was ever opened.
 
 ## Getting Started
 
@@ -142,9 +143,9 @@ Exits `0` on success, `1` on failure - check the container logs either way for d
 
 ### Limitations
 
-- The agent Call pipeline itself is not implemented yet - see `CODE_TODO.md`.
+- The agent Call pipeline is Chat-only for now - no handoff between Calls, no whitelist/access-tier enforcement, and no LLM-decided tool-calling (a reply is always sent as plain "text", never chosen by the LLM itself from `utils_agents/agent_tools.py`'s tool set) - see `CODE_TODO.md`.
 - `gateway_alert` notification is dispatched synchronously on the RabbitMQ consumer thread.
-- The crash-recovery startup sweep currently over-triggers on every restart, not just a genuine crash, until the Call pipeline reliably marks tasks complete.
+- The crash-recovery startup sweep still over-triggers for any task predating this pipeline (or from an application version that never wired it) - `mark_task_complete()` is now called for a coalesced batch's final task_id too, on every exit path that actually closes it out on `telegram_gateway`'s side, but this only takes effect going forward.
 - The `gateway_alert` throttle window is a rolling cooldown, not a calendar-day reset.
 - `qwen_interface.py`'s endpoint/model are unconfirmed assumptions, not verified against a real account.
 - A failed `session_reset`/rejection publish during a global session reset has no retry or backstop - the requesting admin's task may be left open on `telegram_gateway`'s side.
@@ -250,7 +251,8 @@ flowchart TD
     Signals --> Init["initialise_application()"]
 
     subgraph INIT["Startup"]
-        Init --> LLMTest["test_llm_tokens() - smoke test per configured provider"]
+        Init --> LLMServices["initialise_llm_services() - starts each provider's own always-on service, if any (today, Claude's claude_session_service.py, gated on OAuth)"]
+        LLMServices --> LLMTest["test_llm_tokens() - smoke test per configured provider"]
         LLMTest --> RMQ["initialise_rabbitmq_connection() - retries until reachable"]
         RMQ --> BotStarted["_push_bot_started() - publish {type: bot_started}, best-effort"]
         BotStarted --> Resync["resync_orphaned_sessions() - request session_reset per orphaned session"]
@@ -299,7 +301,8 @@ flowchart TD
         SW2 --> SW3{"batch size > 1?"}
         SW3 -- yes --> SW4["close every task_id except the last"]
         SW3 -- no --> SW5
-        SW4 -.-> SW5["combine text, hand off to agent Call pipeline (not yet implemented)"]
+        SW4 -.-> SW5["combine text, run call_dispatch_handler.dispatch_call() (Chat Call only)"]
+        SW5 --> SW6["execute_tool(): publish text+completed, or error, via agent_tools.py"]
     end
 
     subgraph ResetFlow["Global session reset sweep (session_clear_request or SESSION_RESET_TIME)"]
@@ -317,12 +320,14 @@ flowchart TD
     Term --> S0["stop_session_reset_schedule() - harmless no-op if never started"]
     S0 --> S1["stop_queue_consumer()"]
     S1 --> S1b["shutdown_all_session_workers()"]
-    S1b --> S2["close_rabbitmq_connection()"]
+    S1b --> S1c["terminate_llm_services() - stops each provider's own always-on service, if started"]
+    S1c --> S2["close_rabbitmq_connection()"]
     S2 --> S3["close_redis_connection()"]
     S3 --> Exit(["Process exit"])
 
     RMQ -.->|depends on| RabbitMQ[("RabbitMQ")]
     LLMTest -.->|depends on| Claude[("LLM providers")]
+    LLMServices -.->|depends on| Claude
     GA4 -.->|depends on, optional| SMTP[("SMTP relay")]
     GA1 -.->|depends on, optional| Redis[("Redis")]
 ```

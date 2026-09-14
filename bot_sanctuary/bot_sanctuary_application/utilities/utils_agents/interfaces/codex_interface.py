@@ -21,6 +21,7 @@ import shutil
 import asyncio
 import logging
 import tempfile
+
 from pathlib import Path
 
 # =============================================================================
@@ -78,7 +79,7 @@ async def _run_query(prompt: str, env: dict[str, str], persona: str | None = Non
         if call_directory is not None:
             shutil.rmtree(call_directory, ignore_errors=True)
 
-async def query_via_oauth(prompt: str, token: str, persona: str | None = None) -> str | None:
+async def query_via_oauth(prompt: str, token: str, persona: str | None = None, cwd: Path | None = None) -> str | None:
     """
     Sends a prompt to Codex, authenticated via the CLI's existing ChatGPT/OAuth login session.
 
@@ -92,6 +93,11 @@ async def query_via_oauth(prompt: str, token: str, persona: str | None = None) -
         persona (str | None):
             Optional persona/system prompt for this call.
 
+        cwd (Path | None):
+            Unused - accepted only for a uniform signature across every provider's query_via_oauth()/
+            query_via_api() (see agent_interface.py::query_llm()). Codex has no session-continuity mechanism
+            wired yet - see claude_interface.py for the one provider that currently does something with this.
+
     Returns:
         str | None:
             The assistant's text reply, or None on failure.
@@ -102,7 +108,7 @@ async def query_via_oauth(prompt: str, token: str, persona: str | None = None) -
     env = {key: value for key, value in os.environ.items() if key != "OPENAI_API_KEY"}
     return await _run_query(prompt, env, persona)
 
-async def query_via_api(prompt: str, token: str, persona: str | None = None) -> str | None:
+async def query_via_api(prompt: str, token: str, persona: str | None = None, cwd: Path | None = None) -> str | None:
     """
     Sends a prompt to Codex, authenticated via an OpenAI API key.
 
@@ -115,6 +121,11 @@ async def query_via_api(prompt: str, token: str, persona: str | None = None) -> 
 
         persona (str | None):
             Optional persona/system prompt for this call.
+
+        cwd (Path | None):
+            Unused - accepted only for a uniform signature across every provider's query_via_oauth()/
+            query_via_api() (see agent_interface.py::query_llm()). Codex has no session-continuity mechanism
+            wired yet - see claude_interface.py for the one provider that currently does something with this.
 
     Returns:
         str | None:

@@ -10,11 +10,14 @@
 #   - Startup crash-recovery sweep requesting a session reset for sessions left dangling by a prior run.
 #   - Admin-triggered and optional scheduled global session resets, decided by whether a reset sweep is already in progress.
 #   - Graceful per-session and application-wide shutdown that drains and finishes outstanding work before exiting.
+#   - Hands each coalesced batch's combined turn off to utils_calls/call_dispatch_handler.py::execute_dispatch_call(),
+#     on this worker's own thread/publisher - the Call pipeline's own run-and-publish mechanics live there, not here.
 #
 # Notes       :
 #   - stop() abandons whatever remains queued; shutdown()/retire() both drain it fully before exiting.
 #   - Each SessionWorker gets a fresh, randomly-named session directory, so a future session-resume feature never reuses a stale working directory.
 #   - A global session reset may only ever be triggered by a whitelisted admin command or this application's own optional daily schedule - telegram_gateway has no authority to trigger one itself.
+#   - The Call pipeline handed off to is deliberately minimal (Chat only, no handoff) - see CODE_TODO.md §5 Phase 3/4.
 #   - See README.md for the full coalescing, crash-recovery, and session reset design.
 #
 # =============================================================================
@@ -30,6 +33,7 @@ from datetime import timedelta
 
 from ...config import settings
 from ..utilities import application_time
+from ..utils_calls import call_dispatch_handler
 from ..utils_redis.database import mark_task_active, mark_task_complete, sweep_orphaned_sessions
 
 # =============================================================================
@@ -518,6 +522,7 @@ class SessionWorker:
         self.session_dir = settings.SESSION_DIR / session_id / uuid.uuid4().hex
         self.session_dir.mkdir(parents=True, exist_ok=True)
         self.inbox: queue.Queue = queue.Queue(maxsize=settings.SESSION_INBOX_MAX_SIZE)
+        self.dispatch_queue: queue.Queue = queue.Queue()
         self._publisher = RabbitMQPublisher()
         self._stop_event = threading.Event()
         self._shutdown_event = threading.Event()
@@ -665,7 +670,7 @@ class SessionWorker:
 
     def _process_batch(self, batch: list[dict]) -> None:
         """
-        Coalesces a batch of queued messages into a single turn.
+        Coalesces a batch of queued messages into a single turn, then runs and publishes that turn.
 
         Args:
             batch (list[dict]):
@@ -677,7 +682,8 @@ class SessionWorker:
         Notes:
             - Every task_id in the batch except the last is closed out immediately, so it does not stay open on telegram_gateway's side for the turn's whole duration.
             - The batch's text fields are combined into one input, on the assumption that consecutive messages arriving before a turn starts represent one continued thought.
-            - The agent Call pipeline itself is not yet implemented - this currently only logs what would happen. See CODE_TODO.md §5.
+            - The combined turn itself is delegated to utils_calls/call_dispatch_handler.py::execute_dispatch_call(), passed this worker's own self.dispatch_queue - see its own docstring for what runs the pipeline and publishes the outcome. Kept out of this class deliberately - a SessionWorker's own job is thread/inbox/lifecycle management, not the Call pipeline's run-and-publish mechanics.
+            - self.session_dir is also passed through, purely so a Call/provider that wants continuity across turns (Claude's cwd-keyed session resume, today - see claude_interface.py) has a stable, per-generation directory to anchor it to. This SessionWorker never reads/writes anything in it itself.
         """
         task_ids = [item.get("task_id") for item in batch if item.get("task_id")]
         if not task_ids:
@@ -698,9 +704,8 @@ class SessionWorker:
 
             logger.info(
                 f"session_id={self.session_id}: coalesced {len(batch)} message(s) (task_ids={task_ids}) into one "
-                f"turn - agent Call pipeline not yet implemented. combined_text={combined_text!r}. "
-                f"The eventual reply must be published against task_id={final_task_id}."
+                f"turn (final task_id={final_task_id})."
             )
-            # TODO: invoke the agent Call pipeline, publish the reply, then mark_task_complete(final_task_id).
+            call_dispatch_handler.execute_dispatch_call(self._publisher, self.session_id, final_task_id, combined_text, self.dispatch_queue, self.session_dir)
 
 # =============================================================================

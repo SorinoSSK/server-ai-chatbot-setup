@@ -30,12 +30,14 @@ from . import review_call
 logger = logging.getLogger(__name__)
 
 _CALL_REGISTRY = {
-    chat_call.CALL_NAME: chat_call,
-    architect_call.CALL_NAME: architect_call,
-    coder_call.CALL_NAME: coder_call,
-    review_call.CALL_NAME: review_call,
-    documentation_call.CALL_NAME: documentation_call,
+    chat_call.CALL_NAME:            chat_call,
+    architect_call.CALL_NAME:       architect_call,
+    coder_call.CALL_NAME:           coder_call,
+    review_call.CALL_NAME:          review_call,
+    documentation_call.CALL_NAME:   documentation_call,
 }
+
+CALL_NAMES = list(_CALL_REGISTRY)
 
 # =============================================================================
 
@@ -53,7 +55,7 @@ def get_call(call_name: str):
     """
     return _CALL_REGISTRY.get(call_name)
 
-async def handoff_call(target_call: str, prompt: str) -> str | None:
+async def route_call(target_call: str, prompt: str) -> str | None:
     """
     Hands a prompt off to the named target Call.
 

@@ -18,9 +18,41 @@ import re
 
 from pathlib import Path
 from datetime import time
+from dataclasses import dataclass
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 # =============================================================================
+
+@dataclass
+class AgentPersona:
+    """
+    One agent's fully-parsed configuration, loaded from its own libraries/<llm_type>/<call_name>.json file.
+
+    Kept here, not inside any single provider's own interface/service file, since this same shape is meant to
+    be valid and reusable across every LLM provider (Claude, Codex, DeepSeek, Qwen) - not a Claude-specific
+    return type. Equality is field-by-field (the default dataclass behaviour), which is what lets a caller
+    detect "has this Call's agent definition changed since I last built something from it" with a plain !=.
+
+    Attributes:
+        body (str):
+            The fully-resolved system prompt text - any {{BOT_NAME}} placeholder already substituted for
+            settings.TELEGRAM_BOT_NAME, ready to hand to whichever provider's own "system prompt" mechanism.
+
+        tools (list[str] | None):
+            The agent definition's own declared tool list, if it declared one. None if absent/empty.
+
+        model (str | None):
+            The agent definition's own declared model name, if it declared one. None if absent.
+
+        persona (dict):
+            The raw, unprocessed parsed JSON object the other three fields were derived from - kept so a field
+            not yet formalised above (e.g. "name"/"description"), or a future provider-specific need, doesn't
+            require changing this shared class again.
+    """
+    body: str
+    tools: "list[str] | None"
+    model: "str | None"
+    persona: dict
 
 class Settings:
     """
@@ -59,6 +91,12 @@ class Settings:
         self.LLM_REVIEW_TYPE                                    = os.getenv("LLM_REVIEW_TYPE") or self.LLM_CHAT_TYPE
         self.LLM_DOCUMENTATION_TYPE                             = os.getenv("LLM_DOCUMENTATION_TYPE") or self.LLM_CHAT_TYPE
 
+        # Agent Call Pipeline (see utils_calls/call_dispatch_handler.py)
+        # Bounds a single turn's dispatch_queue-driven hop count (each handoff and each corrective retry both
+        # consume one hop) - so a misbehaving/looping Call chain can never run indefinitely.
+        DEFAULT_CALL_MAX_HOPS                                   = 5
+        self.CALL_MAX_HOPS                                      = get_env_int("CALL_MAX_HOPS", DEFAULT_CALL_MAX_HOPS)
+
         DEFAULT_LLM_CLAUDE_ACCESS_TYPE                          = ""
         DEFAULT_LLM_CLAUDE_TOKEN                                = ""
         DEFAULT_LLM_CODEX_ACCESS_TYPE                           = ""
@@ -75,6 +113,14 @@ class Settings:
         self.LLM_DEEPSEEK_TOKEN                                 = os.getenv("LLM_DEEPSEEK_TOKEN") or DEFAULT_LLM_DEEPSEEK_TOKEN
         self.LLM_QWEN_ACCESS_TYPE                               = os.getenv("LLM_QWEN_ACCESS_TYPE") or DEFAULT_LLM_QWEN_ACCESS_TYPE
         self.LLM_QWEN_TOKEN                                     = os.getenv("LLM_QWEN_TOKEN") or DEFAULT_LLM_QWEN_TOKEN
+
+        # Agent Session Platform (see utils_agents/services/claude_session_service.py)
+        # Global, provider-agnostic timeouts for any always-on, persistent-connection agent session platform -
+        # not specific to Claude, even though it's the only provider with one implemented today.
+        DEFAULT_AGENT_QUERY_TIMEOUT_SECONDS                     = 120
+        DEFAULT_AGENT_SHUTDOWN_TIMEOUT_SECONDS                  = 30
+        self.AGENT_QUERY_TIMEOUT_SECONDS                        = get_env_int("AGENT_QUERY_TIMEOUT_SECONDS", DEFAULT_AGENT_QUERY_TIMEOUT_SECONDS)
+        self.AGENT_SHUTDOWN_TIMEOUT_SECONDS                     = get_env_int("AGENT_SHUTDOWN_TIMEOUT_SECONDS", DEFAULT_AGENT_SHUTDOWN_TIMEOUT_SECONDS)
 
         # Bot Identity
         DEFAULT_TELEGRAM_BOT_NAME                               = ""
