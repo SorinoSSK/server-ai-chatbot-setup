@@ -27,6 +27,7 @@
 # I M P O R T   H E A D E R
 
 import json
+import re
 import queue
 import asyncio
 import logging
@@ -49,7 +50,32 @@ logger = logging.getLogger(__name__)
 
 _ENTRY_CALL_NAME = "chat"
 
+# Matches a reply wrapped in a ```json ... ``` (or plain ``` ... ```) code fence, capturing the content between
+# the fences - see _strip_code_fence()'s own docstring for why this is stripped before json.loads() is attempted.
+_CODE_FENCE_PATTERN = re.compile(r"^```(?:json)?\s*\n?(.*?)\n?```$", re.DOTALL)
+
 # =============================================================================
+
+def _strip_code_fence(text: str) -> str:
+    """
+    Strips a wrapping ```json ... ```/``` ... ``` code fence from text, if present.
+
+    Args:
+        text (str):
+            A Call's raw reply text, prior to any json.loads() attempt.
+
+    Returns:
+        str:
+            text with its wrapping code fence removed, if it had one; otherwise text unchanged.
+
+    Notes:
+        - A common LLM habit despite an explicit instruction not to (see libraries/claude/chat.json's own
+          "# JSON String Safety" section) - stripping it here is a cheap, safe normalisation that costs nothing
+          when no fence is present, and salvages an otherwise-valid JSON reply that would only fail
+          json.loads() because of the wrapping fence characters themselves, not the JSON content inside it.
+    """
+    match = _CODE_FENCE_PATTERN.match(text.strip())
+    return match.group(1).strip() if match else text
 
 def _drain(dispatch_queue: "queue.Queue") -> None:
     """
@@ -175,13 +201,20 @@ def execute_dispatch_call(publisher: "RabbitMQPublisher", session_id: str, task_
           telegram_gateway routes that same task_id's eventual poll_answer/poll_timed_out back here once the poll
           concludes (see its README's "Poll answers"/"poll_timed_out" sections) - closing it early here would
           contradict that. That later turn is responsible for actually closing it out.
+        - A "text" reply carrying buttons gets the same open-task_id treatment as a poll, for a related but
+          simpler reason - completing task_id the instant the buttons are sent would be wrong regardless of
+          whether/how a press is ever routed back; completion for this task_id happens whenever a future send for
+          this chat finally isn't itself a button/poll message, not on this send. Unlike poll, no dedicated
+          press-routing/expiry mechanism exists (or is needed) for this - it is a plain per-message rule, not a
+          cross-task_id tracking feature.
         - A message that itself fails validation/publish (agent_tools.execute_tool() returning a corrective
           message) falls back to publishing "error" instead, so task_id is never left silently open - a failed
           fallback too is logged and left for a future session reset to eventually clear.
         - mark_task_complete() is only called once task_id is actually closed out on telegram_gateway's side (a
           successful "completed" or "error" publish) - this is what wires up CODE_TODO.md §3's previously open
-          "not yet wired for a batch's final task_id" crash-recovery gap. Not called for a poll either, for the
-          same reason - task_id is still genuinely open from bot_sanctuary's own crash-recovery point of view too.
+          "not yet wired for a batch's final task_id" crash-recovery gap. Not called for a poll or a buttons-
+          carrying text reply either, for the same reason - task_id is still genuinely open from bot_sanctuary's
+          own crash-recovery point of view too.
         - Runs the (async) dispatch_call() synchronously via asyncio.run() - the caller (a SessionWorker's run
           loop) is plain, synchronous code, one batch at a time; there is no shared event loop to schedule onto
           instead. asyncio.run() runs its event loop on this same calling thread, never a new one - this is
@@ -223,13 +256,8 @@ def execute_dispatch_call(publisher: "RabbitMQPublisher", session_id: str, task_
                 logger.error(f"session_id={session_id}: failed to close task_id={task_id} via the error fallback too - {fallback_error}. task_id remains open until a future session reset.")
             else:
                 mark_task_complete(task_id)
-        elif message.get("type") == "poll":
-            # A poll's task_id is deliberately left open here, not closed - telegram_gateway routes its eventual
-            # poll_answer/poll_timed_out back to this same task_id once the poll concludes (see its own README's
-            # "Poll answers"/"poll_timed_out" sections), and it's that later turn's own job to actually close it
-            # out with "completed"/"error". mark_task_complete() is likewise skipped - task_id is still genuinely
-            # open, and bot_sanctuary's own crash-recovery sweep needs to keep treating it that way until then.
-            logger.info(f"session_id={session_id}: published poll for task_id={task_id} - leaving it open, awaiting telegram_gateway's poll_answer/poll_timed_out.")
+        elif message.get("type") == "poll" or (message.get("type") == "text" and message.get("buttons")):
+            logger.info(f"session_id={session_id}: published {message['type']} for task_id={task_id} - leaving it open (poll, or a text reply carrying buttons).")
         else:
             completed_error = agent_tools.execute_completed(publisher, task_id, session_id)
             if completed_error is not None:
@@ -263,16 +291,28 @@ def message_dissect(dispatch_queue: "queue.Queue", target_call: str, result: dic
             telegram_gateway.
             None - a call pass, or a corrective retry, has already been queued onto dispatch_queue.
             dispatch_call()'s loop should continue.
+
+    Notes:
+        - A str result has a wrapping ```json/``` code fence stripped (_strip_code_fence()) before json.loads()
+          is attempted - a cheap, safe normalisation, see that function's own docstring.
+        - A result that still isn't valid JSON after that is logged at WARNING with its raw text - direct
+          evidence for diagnosing what pattern (an unescaped quote, a literal newline, prose-only, a code
+          fence this stripping didn't catch) is actually occurring in practice, rather than only inferring it
+          from user-reported examples after the fact.
     """
-    try:
-        validate_msg = result if isinstance(result, dict) else json.loads(result)
-    except (json.JSONDecodeError, TypeError):
-        validate_msg = None
+    if isinstance(result, dict):
+        validate_msg = result
+    else:
+        try:
+            validate_msg = json.loads(_strip_code_fence(result))
+        except (json.JSONDecodeError, TypeError):
+            validate_msg = None
 
     if validate_msg is None:
+        logger.warning(f"{target_call} Call's reply was not valid JSON - queuing a corrective retry. Raw reply: {result!r}")
         dispatch_queue.put({
             "target_call": target_call,
-            "prompt": "Your response should be a `{target_call: <a call name>, message: <your input>`} or `{type: <tool type>, <tool_args>: <values>`}."
+            "prompt": "That reply was not valid JSON. Reply again with exactly one JSON object from your available tools - nothing else, no other text before or after it, no code fence (a call pass, `{target_call: <a call name>, message: <your input>}`, is also accepted if that's what you intended)."
         })
         return None
     elif "target_call" in validate_msg and "message" in validate_msg:

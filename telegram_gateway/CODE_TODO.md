@@ -841,3 +841,49 @@ Status: **Implemented, cross-service with `bot_sanctuary` (identical fix, both `
 
 - `telegram_gateway_application/config.py`: `get_env_timezone()`.
 - `bot_sanctuary/bot_sanctuary_application/config.py`: `get_env_timezone()` (see `bot_sanctuary/CODE_TODO.md` for that project's own copy of this entry).
+
+---
+
+## NEW — server-side Markdown → Telegram HTML conversion for `_handle_text()`
+
+Status: **Implemented 2026-09-15.** Item 2 of a three-part plan the user approved to fix `**bold**` rendering as literal asterisks in Telegram. Items 1 and 3 (rewording `bot_sanctuary`'s `chat.json` persona to hand-write Telegram-specific Markdown, and to write shorter/more scannable replies) were explicitly skipped by the user's own instruction — "proceed with option 2, however try to optimise it without affecting it's persona. I have yet to make use of coding rights of the user to perform call type" — `chat.json` is not touched by this entry at all.
+
+### Context
+
+An earlier, since-superseded fix wired `parse_mode="Markdown"` into `_handle_text()` and told the persona "Markdown formatting is fine" in `chat.json`'s `# JSON String Safety` section. The bug persisted — confirmed via WebSearch against Telegram's own Bot API docs, not assumed: both of Telegram's Markdown `parse_mode` dialects (`Markdown`, `MarkdownV2`) use a **single** asterisk for bold (`*bold*`), never `**bold**`. The persona (like essentially every LLM by default) naturally writes CommonMark/GitHub-style `**bold**`, which Telegram's Markdown parser doesn't recognise as anything special — it passes the literal asterisk characters straight through, or, depending on how the asterisks happen to pair up elsewhere in a given reply, could instead trigger an outright 400 "can't parse entities" rejection.
+
+Rather than depend on the persona reliably hand-writing Telegram-specific syntax turn after turn (already shown unreliable — it ignored the earlier general "Markdown is fine" wording), this converts server-side, deterministically, in `telegram_gateway` — the persona's own wording is left completely untouched.
+
+### Decisions
+
+- **New module, `utils_telegram/utilities/markdown_converter.py`, one public function `to_telegram_html(text: str) -> str`.** Placed alongside `typing_indicator.py`/`button_prompt_handler.py` in the existing `utils_telegram/utilities/` convention.
+- **No new pip dependency.** The construct set the persona actually produces is small and known (bold, italic, inline/fenced code, headers, bullet lists) — a fixed, ordered sequence of `re` substitutions covers it without pulling in a general-purpose Markdown parser.
+- **`parse_mode` switched from `"Markdown"` to `"HTML"`** in `message_handler.py`'s `_TEXT_PARSE_MODE` — HTML only requires escaping `&`/`<`/`>` (per Telegram's own docs), far less fragile than MarkdownV2's dozen-plus reserved characters, and every substitution here only ever emits a matched, balanced tag pair, so a stray/unmatched delimiter degrades to a harmless literal character instead of Telegram rejecting the whole send.
+- **Ordering is safety-critical, inside `to_telegram_html()`:** (1) the entire raw text is HTML-escaped exactly once, first, via `html.escape(text, quote=False)`, before any tag is ever inserted — a tag can only ever originate from this module's own substitutions afterwards; (2) fenced/inline code spans are then pulled out into opaque placeholders *before* header/bullet/bold/italic conversion runs, so a formatting character that happens to appear inside a code span (e.g. `**kwargs` in a Python snippet) is never itself reinterpreted, then restored verbatim at the end; (3) headers → a bold lead-in line (Telegram HTML has no header tag); (4) bullet markers (`-`/`*` at line start) → a plain `•` character, run before bold so a leading `*` list marker is never mistaken for an opening bold delimiter; (5) `**bold**` converted before single-asterisk `*bold*`, so a double-asterisk pair is never left with a leftover asterisk from a greedy single-asterisk match; (6) `_italic_` converted last, guarded with a "not flanked by a word character" pattern on both sides specifically so it does not mangle a snake_case identifier (e.g. `SESSION_ID_MARKER`) into italics — the persona is explicitly technology-focused (`chat.json`'s own "Technology Interests" section) and routinely discusses such identifiers.
+- **Deliberately narrow scope** — only the constructs the persona actually produces are converted. Telegram HTML also supports `<u>`/`<s>`/`<tg-spoiler>`/`<blockquote>`, none of which are handled, since nothing in the persona's instructions asks for them.
+- **Scoped to `_handle_text()` only** — poll/image/video/album/file each go through their own separate `send_*()` function in `gateway_outbound.py` and are untouched. A button's own `"text"` label (inline keyboard) is sent as-is, unconverted — Telegram button labels are plain UI text with no formatting support at all.
+- **`gateway_outbound.py`/`button_prompt_handler.py` needed no changes** — both already accepted and forwarded an optional `parse_mode` kwarg (added for `_handle_error()`'s existing `parse_mode="HTML"` usage), so this only required switching the value passed in and converting the text ahead of the call.
+
+### Implementation Notes
+
+- `telegram_gateway_application/utilities/utils_telegram/utilities/markdown_converter.py` (new): `to_telegram_html()`, `_extract_code_spans()`/`_restore_code_spans()`, and the module-level compiled patterns (`_FENCED_CODE_PATTERN`, `_INLINE_CODE_PATTERN`, `_HEADER_PATTERN`, `_BULLET_PATTERN`, `_BOLD_DOUBLE_PATTERN`, `_BOLD_SINGLE_PATTERN`, `_ITALIC_PATTERN`).
+- `telegram_gateway_application/utilities/utils_queue/message_handler.py`: `_TEXT_PARSE_MODE` changed `"Markdown"` → `"HTML"`; new import of `to_telegram_html`; `_handle_text()` now converts `message` via `to_telegram_html()` before either `send_message_with_buttons()`/`send_message()` call. Module-level comment and `_handle_text()`'s own docstring updated to match.
+- Never raises — a construct this module doesn't recognise is simply left as literal (already HTML-escaped) text, always safe to send regardless.
+
+### Open Questions
+
+1. Not yet exercised against a live Telegram send in this session — the plan's own Verification steps (re-send a web-search synthesis reply; deliberately test `**bold**`/`*bold*`/literal `<`/`&`; confirm only `_handle_text()`'s call sites changed) are still to be run manually against a real bot.
+2. Items 1 (`chat.json` Telegram-accurate syntax spec) and 3 (`chat.json` reply-length/source-list tightening) from the original plan remain deliberately unimplemented, per the user's explicit persona-preservation instruction — not tracked further here since they're out of scope for this entry; revisit only if this server-side conversion alone proves insufficient (e.g. a construct the persona produces that this module doesn't yet handle).
+
+### Follow-up fix (2026-09-15) — tag-nesting risk when bold/italic delimiters interleave
+
+Found while directly answering the user's own follow-up question, "is telegram_gateway ready to accept html?" — a full re-read of the send path against Telegram's documented HTML `parse_mode` rules turned up one real, previously-unflagged gap in the module above (everything else — `parse_mode` plumbing, `&`/`<`/`>` escaping, the tag set used, the buttons-path length check now measuring the actual post-conversion string — checked out as-is, no changes needed).
+
+- **Gap:** `_BOLD_DOUBLE_PATTERN`/`_BOLD_SINGLE_PATTERN`/`_ITALIC_PATTERN` originally used an unrestricted `(.+?)` capture group, which could match straight across a `<`/`>` character an *earlier* step in the same conversion had already inserted (a header's own `<b>...</b>`, or an earlier bold pass ahead of the italic pass that runs last). Concretely: `"**bold and _italic** text_"` converted to `"<b>bold and <i>italic</b> text</i>"` — invalid, overlapping tags. Telegram's HTML parser rejects a message like that outright (400 "can't parse entities"), not the graceful degrade-to-literal-text this module's own header Notes otherwise correctly describe for a single stray/unmatched delimiter. Not a silent failure — already caught by the existing Tier 1 `delivery_failed` path — but a real, avoidable send failure for a plausible reply shape (interleaved emphasis is ordinary prose).
+- **Fixed:** all three patterns' capture groups changed from `(.+?)` to `([^<\n]+?)` — excluding `<` stops a match the instant it would cross an already-inserted tag, leaving the outer delimiters as harmless literal text instead of an invalid overlapping tag; excluding `\n` as a side effect also stops emphasis from spanning multiple lines/paragraphs, shrinking the blast radius of any stray unmatched delimiter further.
+- No other file needed touching — `gateway_outbound.py`/`button_prompt_handler.py`/`message_handler.py` were all re-confirmed ready as-is during this same investigation.
+
+### Where
+
+- `telegram_gateway_application/utilities/utils_telegram/utilities/markdown_converter.py` (new; nesting-guard follow-up fix, same file, 2026-09-15).
+- `telegram_gateway_application/utilities/utils_queue/message_handler.py`: `_TEXT_PARSE_MODE`, `_handle_text()`.

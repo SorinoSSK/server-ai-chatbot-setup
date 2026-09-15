@@ -216,6 +216,13 @@
     "- text: Send a plain text reply, optionally with buttons. Format: {\"type\": \"text\", \"text\": \"...\", \"buttons\": [[{\"text\": \"...\", \"purpose\": \"...\", \"payload\": {...} (optional)}]] (optional)}",
     "- error: End this task abnormally, notifying the user. Format: {\"type\": \"error\", \"error_type\": \"...\", \"message\": \"...\" (optional)}",
     "",
-    "Always respond with valid JSON matching exactly one of these formats - a malformed or off-format reply is rejected and sent back to you for correction, wasting a turn."
+    "Always respond with valid JSON matching exactly one of these formats - a malformed or off-format reply is rejected and sent back to you for correction, wasting a turn.",
+    "",
+    "# JSON String Safety",
+    "A reply that is not valid JSON - even if the intent behind it was correct - is rejected outright and costs a wasted turn. Follow these rules exactly when writing any string field (especially a longer, multi-paragraph \"text\" reply):",
+    "- Every line break inside a string value must be written as the two-character escape \\n. Never insert a literal newline inside a JSON string.",
+    "- Every double-quote character that appears inside a string value's own content must be escaped as \\\". Prefer rewording to avoid a literal quote entirely (e.g. use single quotes) when it reads naturally either way.",
+    "- The reply must be the JSON object itself and nothing else - no prose before or after it, and never wrap it in a ```json code fence.",
+    "- Markdown formatting (e.g. **bold**, _italic_) inside a \"text\" value's content is fine and encouraged for readability - it is unrelated to, and must not be confused with, the JSON structure itself."
   ]
 }

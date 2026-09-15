@@ -10,6 +10,8 @@
 #   - session_reset is the one type that does not require a task_id - see utils_session/session_reset_handler.py::handle_session_reset_request().
 #   - bot_started requires no task_id/chat_id/session_id at all - an orchestrator restart signal, resolved via utils_session/session_reset_handler.py::resolve_pending_resets_on_bot_started().
 #   - text messages may carry inline keyboard buttons - see utils_telegram/utilities/button_prompt_handler.py.
+#   - text messages have their own Markdown-ish formatting converted to Telegram-safe HTML before sending - see
+#     utils_telegram/utilities/markdown_converter.py and _handle_text()'s own docstring.
 #   - poll messages start their answer-collection timer on send - see utils_telegram/utilities/poll_response_handler.py.
 #   - A send rejected by Telegram (or by local validation) is reported as a Tier 1 delivery_failed event, per task_id - see error_handling.py.
 #
@@ -39,6 +41,7 @@ from ..utils_telegram.gateway_outbound import (
     send_document
 )
 from ..utils_telegram.utilities.button_prompt_handler import register_bot_button, send_message_with_buttons
+from ..utils_telegram.utilities.markdown_converter import to_telegram_html
 from ..utils_telegram.utilities.typing_indicator import stop_typing
 from ..utils_telegram.utilities.poll_response_handler import start_poll_timer
 from ..utils_session.session_reset_handler import (
@@ -52,6 +55,16 @@ from .error_handling import push_tier1_delivery_failed
 # G L O B A L   V A R I A B L E
 
 logger = logging.getLogger(__name__)
+
+# Telegram parse_mode applied to every agent-produced "text" reply, once its own Markdown-ish formatting (e.g.
+# **bold**, _italic_ - see bot_sanctuary/bot_sanctuary_application/libraries/claude/chat.json's own
+# "# JSON String Safety" section) has been converted to HTML by to_telegram_html() - see _handle_text().
+# HTML rather than either Markdown parse_mode because the persona naturally writes CommonMark-style **bold**
+# (double asterisk), which neither of Telegram's own Markdown dialects recognise (both require a single
+# *asterisk*) - converting server-side sidesteps depending on the persona reliably hand-writing Telegram-
+# specific syntax turn after turn. Scoped to _handle_text() only - poll/image/video/album/file each go through
+# their own separate send_*() function and are unaffected by this.
+_TEXT_PARSE_MODE = "HTML"
 
 # =============================================================================
 
@@ -327,12 +340,19 @@ def _handle_text(task_id: str, chat_id: int, message: str, buttons: list[list[di
         - Falls back to a plain send_message() if buttons is missing/empty, or if every button fails to register.
         - A rejected send (Telegram, or local validation - see send_message_with_buttons()) is reported as a Tier 1 delivery_failed event - see error_handling.py.
           A connection failure or unauthorized token (Tier 2) is already recorded internally - nothing further to do here.
+        - message is run through to_telegram_html() first (see utils_telegram/utilities/markdown_converter.py),
+          converting the agent's own Markdown-ish formatting into Telegram-safe HTML, then sent with
+          parse_mode=_TEXT_PARSE_MODE ("HTML"). Deterministic by construction - see that module's own Notes -
+          so a malformed/unmatched formatting character can no longer cause Telegram to reject the whole send.
+        - Only message's own text is converted - a button's own "text" label is sent as-is, unconverted; inline
+          keyboard button labels are plain Telegram UI text with no formatting support in the first place.
     """
+    html_message = to_telegram_html(message)
     rows = _build_button_rows(chat_id, buttons) if buttons else []
     if rows:
-        result = send_message_with_buttons(chat_id, message, rows)
+        result = send_message_with_buttons(chat_id, html_message, rows, parse_mode=_TEXT_PARSE_MODE)
     else:
-        result = send_message(chat_id, message)
+        result = send_message(chat_id, html_message, parse_mode=_TEXT_PARSE_MODE)
 
     if isinstance(result, dict):
         push_tier1_delivery_failed(task_id, "text", result.get("status_code"), result.get("reason"))

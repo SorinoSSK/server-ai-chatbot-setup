@@ -66,6 +66,11 @@
 #         best-effort only: cancelling a Future returned by run_coroutine_threadsafe() does not guarantee the
 #         in-flight coroutine on the service's own loop actually stops - it may keep running to completion in
 #         the background, updating/holding its client's state, with nothing left to receive the eventual result.
+#         Fixed 2026-09-16, not left accepted-as-is: query_via_service()'s own timeout branch now also evicts
+#         session_dir's entry from the registry (fire-and-forget _drop_entry(), same as the broken-client bullet
+#         above) - the abandoned coroutine may still run to completion holding the old entry's own lock, but the
+#         *next* call for this session_dir is no longer at risk of queuing behind it, since it builds a brand
+#         new entry (and lock) instead. Diagnosed directly from a real occurrence - see CODE_TODO.md.
 #       - Unbounded growth of the registry between resets - bounded now, not accepted-and-ignored: every entry
 #         under a session's root is destroyed via destroy_sessions_under() whenever that session's on-disk
 #         directory is cleared (startup sweep, session_cleared, or a global reset - see
@@ -460,7 +465,9 @@ def query_via_service(session_dir: Path, prompt: str, timeout: float = settings.
         - A timeout cancels this call's own Future, but that is best-effort only - it stops this function from
           waiting any further, it does not guarantee the corresponding coroutine running on the service's own
           loop actually stops. It may continue running to completion in the background, still holding/updating
-          its client's state, with no one left waiting on its result.
+          its client's state, with no one left waiting on its result. To stop that abandoned state from
+          affecting the *next* call for this same session_dir, session_dir's own entry is also evicted from the
+          registry below (fire-and-forget, not waited on here) - see the timeout branch's own comment.
         - Never raises - every failure path (service not started, timeout, unexpected exception) is logged and
           returns None instead, matching this codebase's existing never-crash-on-a-failed-LLM-call convention.
     """
@@ -477,6 +484,14 @@ def query_via_service(session_dir: Path, prompt: str, timeout: float = settings.
                 f"Claude session service call for session_dir={session_dir} exceeded {timeout}s - abandoning it. "
                 f"The in-flight call on the service's own loop is not guaranteed to have actually stopped - see this function's own Notes."
             )
+            # The abandoned _run_turn() coroutine may still be running on the service's own loop, still holding
+            # session_dir's own entry.lock (see this function's own Notes above) - left alone, the *next* call
+            # for this same session_dir would block waiting on that same lock, and could time out identically.
+            # Evicting the entry here (fire-and-forget - not awaited, since this function has already exceeded
+            # its own timeout budget) guarantees the next call always builds a fresh client/lock instead of
+            # potentially queuing behind one that may never release. Mirrors _run_turn()'s own except-branch
+            # cleanup (_drop_entry()) for every other failure mode - this was the one path missing it.
+            asyncio.run_coroutine_threadsafe(_drop_entry(session_dir), _loop)
             return None
         except Exception:
             logger.exception(f"Claude session service call for session_dir={session_dir} raised unexpectedly.")
