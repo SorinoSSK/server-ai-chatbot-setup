@@ -13,17 +13,22 @@
 #   - query_via_service() - the platform's public entry point. Synchronous from any caller's own thread - hands
 #     a turn off to this service's persistent loop and blocks for the reply, the same shape as any other
 #     blocking provider call (a subprocess run, an HTTP request) elsewhere in utils_agents/.
-#   - destroy_session() - disconnects and discards a generation's client. Exists for a future session_reset
-#     hook to call, so an external client's own memory of a cleared conversation is destroyed alongside the
-#     on-disk state, not left to leak until process exit.
+#   - destroy_session() - disconnects and discards one exact generation's client, by its exact registry key.
+#   - destroy_sessions_under() - disconnects and discards every client whose key falls under a given root path -
+#     the one actually wired to a caller today (claude_interface.py::terminate_session(), called from
+#     utils_session/session_worker.py::clear_session_directory() on the startup sweep, a per-chat session_cleared
+#     confirmation, and a global session reset), so this platform's own in-memory memory of a cleared
+#     conversation is destroyed alongside the on-disk state, not left to leak until process exit.
 #
 # Notes       :
 #   - Built and hardened in isolation initially, per explicit instruction - see the module's own Created On
 #     date. Since wired in for real: claude_interface.py::query_via_oauth() routes here whenever session_dir
 #     is given, initialise_claude()/terminate_claude() call start_claude_session_service()/
 #     stop_claude_session_service() (gated on OAuth), and those two are in turn wired into
-#     utilities/initialise.py's own initialise_application()/terminate_application(). destroy_session() alone
-#     remains uncalled from anywhere - see its own docstring.
+#     utilities/initialise.py's own initialise_application()/terminate_application(). destroy_sessions_under()
+#     is wired too, via claude_interface.py::terminate_session() (see Features above) - destroy_session() is
+#     the one function in this module still uncalled from anywhere, remaining a valid lower-level primitive
+#     with no caller of its own - see its own docstring.
 #   - ToolUseBlock/ToolResultBlock content is now logged (name/input, and tool_use_id/is_error/content
 #     respectively) inside _run_turn() - added specifically to get direct, per-turn evidence of whether a tool
 #     (e.g. WebSearch) was actually invoked and what it returned, rather than relying on the model's own
@@ -61,8 +66,12 @@
 #         best-effort only: cancelling a Future returned by run_coroutine_threadsafe() does not guarantee the
 #         in-flight coroutine on the service's own loop actually stops - it may keep running to completion in
 #         the background, updating/holding its client's state, with nothing left to receive the eventual result.
-#       - Unbounded growth of the registry (many generations, none ever destroyed) - expected and accepted for
-#         now, since destroy_session() has no caller yet in this isolated build; not a defect of this module.
+#       - Unbounded growth of the registry between resets - bounded now, not accepted-and-ignored: every entry
+#         under a session's root is destroyed via destroy_sessions_under() whenever that session's on-disk
+#         directory is cleared (startup sweep, session_cleared, or a global reset - see
+#         utils_session/session_worker.py::clear_session_directory()). A session that is simply never reset at
+#         all still grows this registry by one entry per distinct Call/LLM combination actually used for it,
+#         which remains accepted - there is no per-turn/idle-timeout eviction, only reset-triggered eviction.
 #       - Credential setup (CLAUDE_CODE_OAUTH_TOKEN/ANTHROPIC_API_KEY) still mutates process-wide os.environ,
 #         same constraint already documented against claude_interface.py/agent_interface.py - inherited, not
 #         newly introduced here, and unchanged by this module's own single-Claude-credential-configured-at-once
@@ -264,6 +273,38 @@ async def _drop_entry(session_dir: Path) -> None:
     if entry is not None:
         await _disconnect_entry(entry)
 
+async def _drop_entries_under(root: Path) -> None:
+    """
+    Removes and disconnects every client entry whose key is equal to, or nested under, root.
+
+    Args:
+        root (Path):
+            The path every matching entry's own key must equal or fall under - typically a session's on-disk
+            root (SESSION_DIR/<session_id>) or one specific Call/LLM leaf beneath it.
+
+    Returns:
+        None
+
+    Notes:
+        - A plain string-prefix match on str(root) + "/" (plus an exact match on str(root) itself), not a
+          Path-object comparison - registry keys are already normalised str(session_dir) values (see
+          _get_or_create_entry()), so this is a cheap, sufficient boundary check without constructing a Path
+          per key. The trailing "/" is what prevents a false-positive match against an unrelated sibling
+          directory that merely shares root's own name as a prefix (e.g. root=".../chat" must not match
+          ".../chat_extra").
+        - Mirrors _disconnect_all()'s own shape (collect matching entries under the lock, clear them from the
+          registry, then disconnect each outside the lock) - just filtered to a subset rather than every entry.
+    """
+    root_str = str(root)
+    prefix = root_str + "/"
+    registry_lock = _get_registry_lock()
+    async with registry_lock:
+        matching_keys = [key for key in _clients if key == root_str or key.startswith(prefix)]
+        entries = [_clients.pop(key) for key in matching_keys]
+
+    for entry in entries:
+        await _disconnect_entry(entry)
+
 async def _get_or_create_entry(session_dir: Path) -> _ClientEntry:
     """
     Returns session_dir's own persistent Claude client entry, creating - or recreating, if the library file has
@@ -453,9 +494,11 @@ def destroy_session(session_dir: Path) -> None:
         None
 
     Notes:
-        - Exists for a future session_reset/session_cleared hook to call, so this service's own memory of a
-          cleared conversation is destroyed at the same moment as the on-disk generation directory, rather than
-          left to leak until process exit. Not called from anywhere yet - this module is built in isolation.
+        - Exact-key match only - matches one specific generation's own registry entry, nothing nested beneath
+          it. destroy_sessions_under() (below) is the root-scoped equivalent actually wired to a caller today
+          (claude_interface.py::terminate_session()); this function remains a valid lower-level primitive
+          (e.g. for a caller that already knows the one exact leaf it wants destroyed) but has no caller of its
+          own yet.
         - A no-op (logged at debug) if the service isn't running at all, or if session_dir has no client to
           begin with.
         - Best-effort, same convention as this codebase's other on-disk/connection cleanup (e.g.
@@ -469,6 +512,41 @@ def destroy_session(session_dir: Path) -> None:
             future.result(timeout=settings.AGENT_SHUTDOWN_TIMEOUT_SECONDS)
         except Exception:
             logger.exception(f"Failed to cleanly destroy the persistent Claude client for session_dir={session_dir}.")
+
+def destroy_sessions_under(root: Path) -> None:
+    """
+    Disconnects and discards every live Claude client whose key falls under root, if any exist.
+
+    Args:
+        root (Path):
+            The session root (or a specific Call/LLM leaf beneath it) whose live client(s) should be destroyed -
+            see _drop_entries_under()'s own docstring for the exact matching rule.
+
+    Returns:
+        None
+
+    Notes:
+        - Exists for utils_session/session_worker.py::clear_session_directory() to call (via
+          claude_interface.py::terminate_session()/agent_interface.py::terminate_session()) at the same moment
+          a session's on-disk directory is cleared - the startup sweep, a per-chat session_cleared confirmation,
+          or a global session reset - so this service's own in-memory memory of every conversation under root
+          is destroyed alongside the on-disk state, rather than left to leak until process exit.
+        - Root-scoped rather than a single exact-key match, unlike destroy_session() above - one session_id's
+          root can own more than one live client at once (one per Call/LLM combination actually used for that
+          session), all of which need destroying together.
+        - A no-op (logged at debug) if the service isn't running at all, or if nothing under root has a live
+          client.
+        - Best-effort, same convention as this codebase's other on-disk/connection cleanup (e.g.
+          utils_session/session_worker.py::clear_session_directory()) - a failure is logged, not raised.
+    """
+    if _loop is None:
+        logger.debug(f"Claude session service is not running - nothing to destroy under root={root}.")
+    else:
+        future = asyncio.run_coroutine_threadsafe(_drop_entries_under(root), _loop)
+        try:
+            future.result(timeout=settings.AGENT_SHUTDOWN_TIMEOUT_SECONDS)
+        except Exception:
+            logger.exception(f"Failed to cleanly destroy persistent Claude client(s) under root={root}.")
 
 def start_claude_session_service() -> None:
     """

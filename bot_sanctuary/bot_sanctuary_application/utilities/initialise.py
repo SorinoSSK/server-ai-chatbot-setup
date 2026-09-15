@@ -5,6 +5,8 @@
 # Created On  : 2026-09-06
 #
 # Features    :
+#   - Unconditional startup sweep clearing every leftover on-disk session directory (and any live LLM session
+#     anchored to one), ahead of everything else - see utils_session/session_worker.py::clear_all_session_directories().
 #   - Starts/stops every LLM provider's own always-on service (today, only Claude's claude_session_service.py), ahead of the LLM credential smoke test.
 #   - One-off LLM credential smoke test performed during startup.
 #   - RabbitMQ consume connection and background consumer lifecycle management.
@@ -39,6 +41,7 @@ from .utils_queue.queue import (
 )
 from .utils_redis.database import close_redis_connection
 from .utils_session.session_worker import (
+    clear_all_session_directories,
     resync_orphaned_sessions,
     shutdown_all_session_workers,
     start_session_reset_schedule,
@@ -91,11 +94,17 @@ def initialise_application() -> None:
         None
 
     Notes:
-        - initialise_llm_services() runs first, ahead of test_llm_tokens() - see this module's own header
+        - clear_all_session_directories() runs first, ahead of everything else - a pure local filesystem
+          sweep with no dependency on RabbitMQ/Redis/LLM services being up yet, and safe to run unconditionally
+          since no SessionWorker can possibly exist this early (see its own docstring). This is what guarantees
+          every session is reset on every bot_sanctuary startup, not only on an explicit session reset.
+        - initialise_llm_services() runs next, ahead of test_llm_tokens() - see this module's own header
           Notes for why that specific ordering matters (Claude's own credential is resolved once here, not
           per call, so the smoke test depends on this having already run).
         - See README.md for the full startup sequence and its design rationale.
     """
+    clear_all_session_directories()
+
     initialise_llm_services()
     test_llm_tokens()
 

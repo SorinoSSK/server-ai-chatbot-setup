@@ -15,7 +15,16 @@
 #
 # Notes       :
 #   - stop() abandons whatever remains queued; shutdown()/retire() both drain it fully before exiting.
-#   - Each SessionWorker gets a fresh, randomly-named session directory, so a future session-resume feature never reuses a stale working directory.
+#   - Each SessionWorker's session_dir is a stable root (SESSION_DIR/<session_id>), not a randomly-named
+#     per-generation directory - a session's own directory tree is only ever removed by clear_session_directory(),
+#     called on the startup sweep (clear_all_session_directories()) and on an actual session reset (retire()'s own
+#     exit path, or directly when no worker is active) - never merely because a new SessionWorker was constructed.
+#     See CODE_TODO.md's "per-session on-disk directory" entry for the full history of this decision.
+#   - retire()'s own exit-path cleanup (clear_session_directory()) is shared by two distinct callers: a global
+#     session reset sweep (session_clear_request/SESSION_RESET_TIME), and a per-chat session_cleared confirmation
+#     (utils_queue/message_handler.py::_handle_session_cleared()) - both need the same guarantee (drain whatever's
+#     already in flight, only clean up once that's genuinely finished), so both reuse this one exit path rather
+#     than each inventing their own.
 #   - A global session reset may only ever be triggered by a whitelisted admin command or this application's own optional daily schedule - telegram_gateway has no authority to trigger one itself.
 #   - The Call pipeline handed off to is deliberately minimal (Chat only, no handoff) - see CODE_TODO.md §5 Phase 3/4.
 #   - See README.md for the full coalescing, crash-recovery, and session reset design.
@@ -23,7 +32,6 @@
 # =============================================================================
 # I M P O R T   H E A D E R
 
-import uuid
 import shutil
 import logging
 import queue
@@ -33,6 +41,7 @@ from datetime import timedelta
 
 from ...config import settings
 from ..utilities import application_time
+from ..utils_agents.agent_interface import terminate_session
 from ..utils_calls import call_dispatch_handler
 from ..utils_redis.database import mark_task_active, mark_task_complete, sweep_orphaned_sessions
 
@@ -81,7 +90,8 @@ def get_or_create_session_worker(session_id: str) -> "SessionWorker":
 
 def clear_session_directory(session_id: str) -> None:
     """
-    Removes session_id's entire on-disk session directory (every generation), if one exists.
+    Removes session_id's entire on-disk session directory (every Call/LLM leaf beneath it), and terminates any
+    live LLM session(s) anchored to it, if either exists.
 
     Args:
         session_id (str):
@@ -91,9 +101,21 @@ def clear_session_directory(session_id: str) -> None:
         None
 
     Notes:
-        - Best-effort - a failure is logged but non-fatal.
+        - terminate_session() runs first, deliberately - it tears down a live, in-memory LLM connection (today,
+          only Claude's persistent per-generation client - see claude_session_service.py) still anchored to
+          session_root or one of its <call_type>/<llm_type> leaves, so nothing is left holding a reference to a
+          cwd that's about to be deleted out from under it. Best-effort itself, same convention as the rmtree
+          below - a provider-side failure is logged internally by terminate_session()'s own call chain, not
+          raised here.
+        - Best-effort - a failure to remove the directory itself is logged but non-fatal.
+        - The only two callers of this function are clear_all_session_directories() (the startup sweep) and
+          whichever path decided this session_id's turn(s) have already finished - never while a turn could
+          still be in flight. See this module's own header Notes and utils_queue/message_handler.py's
+          _handle_session_cleared() for how that guarantee is maintained.
     """
     session_root = settings.SESSION_DIR / session_id
+    terminate_session(session_root)
+
     try:
         shutil.rmtree(session_root)
     except FileNotFoundError:
@@ -102,6 +124,41 @@ def clear_session_directory(session_id: str) -> None:
         logger.exception(f"Failed to remove on-disk session directory for session_id={session_id}.")
     else:
         logger.info(f"Removed on-disk session directory for session_id={session_id}.")
+
+def clear_all_session_directories() -> None:
+    """
+    Removes every on-disk session directory under SESSION_DIR, unconditionally - the startup sweep that
+    guarantees a session is reset on every bot_sanctuary startup, not only on an explicit session reset.
+
+    Args:
+        None
+
+    Returns:
+        None
+
+    Notes:
+        - Intended to run once, as the very first step of initialise_application() - before RabbitMQ connects,
+          before the message consumer starts, and before any SessionWorker can possibly exist. Every directory
+          found at that point is therefore guaranteed to be left over from a prior process lifetime - nothing in
+          this process could be using any of them yet, so this is safe regardless of whether a prior turn
+          finished cleanly or not (see this module's own header Notes).
+        - Delegates per-session_id removal to the existing clear_session_directory() - same best-effort
+          behaviour, same terminate_session() + rmtree pairing, just swept across every session_id found rather
+          than one at a time.
+        - A no-op (logged) if SESSION_DIR doesn't exist yet - main.py already creates it before
+          initialise_application() ever runs, but this guards against being called in a context where that
+          ordering doesn't hold.
+    """
+    if not settings.SESSION_DIR.is_dir():
+        logger.info("SESSION_DIR does not exist yet - nothing to clear at startup.")
+    else:
+        cleared = 0
+        for session_root in settings.SESSION_DIR.iterdir():
+            if session_root.is_dir():
+                clear_session_directory(session_root.name)
+                cleared += 1
+
+        logger.info(f"Startup sweep cleared {cleared} leftover session director{'y' if cleared == 1 else 'ies'} under SESSION_DIR.")
 
 def remove_session_worker(session_id: str) -> "SessionWorker | None":
     """
@@ -519,8 +576,7 @@ class SessionWorker:
         from ..utils_queue.queue import RabbitMQPublisher
 
         self.session_id = session_id
-        self.session_dir = settings.SESSION_DIR / session_id / uuid.uuid4().hex
-        self.session_dir.mkdir(parents=True, exist_ok=True)
+        self.session_dir = settings.SESSION_DIR / session_id
         self.inbox: queue.Queue = queue.Queue(maxsize=settings.SESSION_INBOX_MAX_SIZE)
         self.dispatch_queue: queue.Queue = queue.Queue()
         self._publisher = RabbitMQPublisher()
@@ -607,9 +663,15 @@ class SessionWorker:
 
     def retire(self) -> None:
         """
-        Signals this worker to finish processing whatever is currently queued, then permanently retire - removing itself from the session registry and clearing its on-disk session directory.
+        Signals this worker to finish processing whatever is currently queued - including a batch already in
+        progress - then permanently retire: removing itself from the session registry and clearing its on-disk
+        session directory (and terminating any live LLM session anchored to it - see clear_session_directory()).
 
-        A third terminal path alongside stop()/shutdown() - the per-session exit action a global session_clear_request sweep signals every session with.
+        A third terminal path alongside stop()/shutdown(). Has two distinct callers today, both of which need the
+        same guarantee (nothing torn down while a turn could still be in flight - see this module's own header
+        Notes): the per-session exit action a global session_clear_request/SESSION_RESET_TIME sweep signals every
+        session with, and the exit action utils_queue/message_handler.py::_handle_session_cleared() signals a
+        single session with once telegram_gateway confirms that specific session_id has already been reset.
 
         Args:
             None
@@ -618,10 +680,20 @@ class SessionWorker:
             None
 
         Notes:
-            - Same draining behaviour as shutdown() - finishes whatever is already queued rather than abandoning it. Differs only in its exit action: shutdown() simply stops, retire() also removes this session from the registry and clears its on-disk directory.
-            - Does not publish session_reset itself - that publish already happened once, at accept-time, for the whole sweep this retirement is part of.
-            - Does not block - the caller is not expected to join this worker's thread; a retiring session simply removes itself from the registry once it finishes.
-            - Reports its own retirement once finished, which is what allows a future global session reset to be accepted again once every currently-pending session has done the same.
+            - Same draining behaviour as shutdown() - finishes whatever is already queued (including anything
+              already in progress) rather than abandoning it. Differs only in its exit action: shutdown() simply
+              stops, retire() also removes this session from the registry and clears its on-disk directory.
+            - Does not publish anything itself - for a global sweep, session_reset already happened once, at
+              accept-time, for the whole sweep this retirement is part of; for a per-chat session_cleared
+              confirmation, telegram_gateway has already applied that reset on its own side by the time this is
+              ever signalled, so there is nothing further to publish either way.
+            - Does not block - the caller is not expected to join this worker's thread; a retiring session simply
+              removes itself from the registry once it finishes.
+            - Reports its own retirement once finished (_report_retirement()) - a no-op (logged at debug) unless
+              this retirement is actually part of a currently in-progress global sweep, which is what allows a
+              future global session reset to be accepted again once every currently-pending session in that
+              sweep has done the same. A session_cleared-triggered retirement is never part of any sweep, so this
+              is always a harmless no-op on that path.
         """
         self._clear_event.set()
 
@@ -664,7 +736,7 @@ class SessionWorker:
             remove_session_worker(self.session_id)
             clear_session_directory(self.session_id)
             _report_retirement(self.session_id)
-            logger.info(f"SessionWorker for session_id={self.session_id} finished its last queued task and retired (session_clear_request sweep).")
+            logger.info(f"SessionWorker for session_id={self.session_id} finished its last queued task and retired (session_cleared or a global session reset).")
         else:
             logger.info(f"SessionWorker for session_id={self.session_id} stopped.")
 

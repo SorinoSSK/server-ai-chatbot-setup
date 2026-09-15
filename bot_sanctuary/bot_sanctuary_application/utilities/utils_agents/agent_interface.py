@@ -9,6 +9,7 @@
 #   - load_persona() - loads a provider/Call-specific persona file, if one has been written.
 #   - test_llm_tokens() - one-off startup smoke test, run once per provider with a configured credential.
 #   - initialise_llm_services()/terminate_llm_services() - provider-agnostic lifecycle for whichever LLM providers have their own always-on service to start/stop (today, only Claude's claude_session_service.py, via claude_interface.py's own initialise_claude()/terminate_claude()).
+#   - terminate_session(session_dir) - provider-agnostic teardown of a live, in-memory LLM session anchored to a specific session_dir, for whichever providers have such a concept (today, only Claude, via claude_interface.py's own terminate_session()).
 #
 # Notes       :
 #   - More than one provider can be configured and used at once - callers pass llm_type explicitly rather than reading a single global setting.
@@ -237,5 +238,36 @@ def terminate_llm_services() -> None:
           further runs for them yet.
     """
     claude_interface.terminate_claude()
+
+def terminate_session(session_dir: Path) -> None:
+    """
+    Terminates any live, in-memory LLM session anchored to session_dir, for whichever provider(s) actually have
+    such a concept.
+
+    Args:
+        session_dir (Path):
+            The Call/LLM-scoped leaf directory (or a session root covering several such leaves) whose live
+            session(s), if any, should be torn down - typically utils_session/session_worker.py's own
+            session_dir, passed here from clear_session_directory() at the same moment its on-disk state is
+            removed.
+
+    Returns:
+        None
+
+    Notes:
+        - Provider-agnostic entry point, same rationale as initialise_llm_services()/terminate_llm_services()
+          above - delegates to whichever provider module(s) expose their own terminate_session(), rather than
+          deciding anything provider-specific itself. A future provider's own persistent-session concept would
+          add its own terminate_session() to its own <provider>_interface.py and a further call here, rather
+          than this module growing new provider-specific logic of its own.
+        - Claude: delegates to claude_interface.terminate_session(session_dir), which tears down every live
+          claude_session_service.py client anchored anywhere under session_dir (see that module's own
+          destroy_sessions_under()) - safe to call unconditionally even if session_dir never had a live Claude
+          session at all, or if Claude's own always-on platform was never started (API access, or Claude not
+          configured) - both degrade to a harmless no-op internally.
+        - Codex/DeepSeek/Qwen have no equivalent persistent-session concept today - nothing further runs for
+          them yet.
+    """
+    claude_interface.terminate_session(session_dir)
 
 # =============================================================================

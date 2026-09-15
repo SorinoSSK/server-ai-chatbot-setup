@@ -8,6 +8,7 @@
 #   - query_via_oauth() - sends a prompt to Claude, authenticated via a Claude Code OAuth token. Routed through claude_session_service.py's persistent per-generation platform whenever a session_dir is given; falls back to this module's own one-shot _run_query() otherwise.
 #   - query_via_api()   - sends a prompt to Claude, authenticated via an Anthropic API key. Always one-shot (_run_query()) - claude_session_service.py has no API-key equivalent.
 #   - initialise_claude()/terminate_claude() - starts/stops claude_session_service.py's persistent Claude session platform, called from agent_interface.py's own initialise_llm_services()/terminate_llm_services().
+#   - terminate_session(session_dir) - tears down every live, in-memory Claude client anchored anywhere under session_dir, called from agent_interface.py's own terminate_session().
 #
 # Notes       :
 #   - query_via_api() always uses this module's own one-shot claude_agent_sdk.query() call
@@ -58,7 +59,7 @@ from pathlib import Path
 from claude_agent_sdk import AssistantMessage, ClaudeAgentOptions, ResultMessage, TextBlock, ToolResultBlock, ToolUseBlock, query as claude_query
 
 from ....config import settings
-from ..services.claude_session_service import query_via_service, start_claude_session_service, stop_claude_session_service
+from ..services.claude_session_service import destroy_sessions_under, query_via_service, start_claude_session_service, stop_claude_session_service
 
 # =============================================================================
 # G L O B A L   V A R I A B L E
@@ -466,5 +467,34 @@ def terminate_claude() -> None:
           any other caller, though nothing in this function's own signature prevents it.
     """
     stop_claude_session_service()
+
+def terminate_session(session_dir: Path) -> None:
+    """
+    Tears down every live, in-memory Claude client anchored anywhere under session_dir - thin delegate onto
+    claude_session_service.py::destroy_sessions_under().
+
+    Args:
+        session_dir (Path):
+            The Call/LLM-scoped leaf directory (e.g. .../chat/claude), or a session root covering several such
+            leaves (e.g. .../<session_id>, once more than one Call/LLM combination has been used for the same
+            session), whose live client(s) should be destroyed.
+
+    Returns:
+        None
+
+    Notes:
+        - Called from agent_interface.py::terminate_session() - the provider-agnostic hook
+          utils_session/session_worker.py::clear_session_directory() calls whenever a session's on-disk
+          directory is cleared (the startup sweep, a per-chat session_cleared confirmation, or a global session
+          reset), so this service's own in-memory memory of every conversation under session_dir is destroyed
+          at the same moment as the on-disk state, rather than left to leak until process exit.
+        - Root-scoped, not a single exact-key match - destroy_sessions_under() matches every registry entry
+          equal to or nested under session_dir, since one session_id's root can now own more than one live
+          client at once (one per Call/LLM combination actually used).
+        - A no-op (logged at debug, inside destroy_sessions_under() itself) if the service isn't running at
+          all, or if nothing under session_dir has a live client - safe to call unconditionally, same
+          convention as terminate_claude() above.
+    """
+    destroy_sessions_under(session_dir)
 
 # =============================================================================

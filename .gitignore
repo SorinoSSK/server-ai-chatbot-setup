@@ -2,3 +2,5 @@
 config.ini
 __pycache__/
 **/data/logs/
+**/bot_directory/
+**/bot_sanctuary_application/data/sessions/

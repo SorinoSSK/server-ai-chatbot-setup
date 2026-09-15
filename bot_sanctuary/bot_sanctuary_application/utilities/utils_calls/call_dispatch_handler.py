@@ -86,8 +86,9 @@ async def dispatch_call(dispatch_queue: "queue.Queue", session_dir: Path) -> dic
             entry hop ({"target_call": "chat", "prompt": <the turn's prompt>}) by execute_dispatch_call().
 
         session_dir (Path):
-            This session's own on-disk directory (SessionWorker.session_dir), passed straight through to every
-            Call's handle() - see chat_call.py's own Notes for what it's actually used for today.
+            This session's own on-disk root directory (SessionWorker.session_dir, i.e. SESSION_DIR/<session_id>),
+            passed straight through to every Call's handle() - see chat_call.py's own Notes for how it derives
+            its own Call/LLM-scoped leaf directory from this root.
 
     Returns:
         dict:
@@ -157,7 +158,7 @@ def execute_dispatch_call(publisher: "RabbitMQPublisher", session_id: str, task_
             same as publisher.
 
         session_dir (Path):
-            The calling SessionWorker's own on-disk session directory (SessionWorker.session_dir), passed
+            The calling SessionWorker's own on-disk session root directory (SessionWorker.session_dir), passed
             straight through to dispatch_call() and from there to every Call's handle().
 
     Returns:

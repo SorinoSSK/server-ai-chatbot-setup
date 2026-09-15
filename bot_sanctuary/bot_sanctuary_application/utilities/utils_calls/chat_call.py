@@ -49,9 +49,9 @@ async def handle(prompt: str, session_dir: Path) -> str | None:
             The prompt/context for this turn.
 
         session_dir (Path):
-            This session's own on-disk directory (SessionWorker.session_dir), passed straight through to
-            query_llm() as session_dir - see its own Notes for what a given provider actually does with it
-            (today, only Claude's session continuity consumes it at all).
+            This session's own on-disk root directory (SessionWorker.session_dir, i.e. SESSION_DIR/<session_id>)
+            - not yet a leaf anchor itself. This function derives its own Call/LLM-scoped leaf directory
+            (session_dir/CALL_NAME/<llm_type>) before passing it on to query_llm() - see Notes below for why.
 
     Returns:
         str | None:
@@ -64,16 +64,25 @@ async def handle(prompt: str, session_dir: Path) -> str | None:
         - The LLM decides the tool (or handoff), not this function - agent_tools.build_tool_prompt() appends
           the available tools/formats to prompt. Whatever the LLM sends back is returned as-is, unexamined.
         - Persona content is loaded fresh on every call, so an LLM_CHAT_TYPE change takes effect immediately.
-        - session_dir is forwarded regardless of which provider LLM_CHAT_TYPE names - only claude_interface.py
-          currently does anything with it (routes to claude_session_service.py's persistent, per-session_dir
-          ClaudeSDKClient platform for OAuth access, or its own resume=<session_id> marker-file mechanism for
-          API access). codex/deepseek/qwen accept and ignore it today.
+        - Leaf directory is session_dir/CALL_NAME/<llm_type> (e.g. .../chat/claude), created here
+          (mkdir(parents=True, exist_ok=True)) rather than by SessionWorker itself - the session root alone is
+          no longer a valid anchor once more than one Call and/or more than one LLM provider can be reused for
+          the same session_id (e.g. Architect and Coder both resolving to Claude would otherwise collide on one
+          shared cwd/persistent-client key - see claude_session_service.py). Every <call>_call.py that ever
+          consumes session_dir is expected to derive its own leaf the same way, keyed by its own CALL_NAME and
+          resolved llm_type - this is the one Call actually doing so today (see CODE_TODO.md).
+        - The derived leaf is forwarded regardless of which provider LLM_CHAT_TYPE names - only
+          claude_interface.py currently does anything with it (routes to claude_session_service.py's
+          persistent, per-leaf ClaudeSDKClient platform for OAuth access, or its own resume=<session_id>
+          marker-file mechanism for API access). codex/deepseek/qwen accept and ignore it today.
     """
     if not settings.LLM_CHAT_TYPE:
         logger.warning(f"{CALL_NAME} Call has no LLM_CHAT_TYPE configured - skipping.")
         return None
     else:
         persona = load_persona(settings.LLM_CHAT_TYPE, CALL_NAME)
-        return await query_llm(settings.LLM_CHAT_TYPE, agent_tools.build_tool_prompt(prompt), persona=persona, session_dir=session_dir)
+        call_session_dir = session_dir / CALL_NAME / settings.LLM_CHAT_TYPE
+        call_session_dir.mkdir(parents=True, exist_ok=True)
+        return await query_llm(settings.LLM_CHAT_TYPE, agent_tools.build_tool_prompt(prompt), persona=persona, session_dir=call_session_dir)
 
 # =============================================================================

@@ -36,7 +36,7 @@ Python application root is located at `bot_sanctuary/bot_sanctuary_application`.
 
 1. Ensure `DATA_DIR`/`SESSION_DIR` exist and configure logging.
 2. Register `SIGINT`/`SIGTERM` handlers.
-3. `initialise_application()` starts every LLM provider's own always-on service, if it has one (today, only Claude's `claude_session_service.py`, and only if Claude is configured for OAuth access - see `utils_agents/agent_interface.py::initialise_llm_services()`), runs a startup LLM credential smoke test, opens the RabbitMQ consume connection (retrying indefinitely until reachable), publishes an unconditional `bot_started` event (`{"type": "bot_started"}`, no other fields - fired on every startup regardless of cause, crash or routine redeploy alike, so `telegram_gateway` can resolve any session_reset it's still holding for this application), runs the crash-recovery sweep, starts the optional daily timed session reset schedule (`SESSION_RESET_TIME`, if configured - see "Session Reset" under Environment Variables below), then starts the background consumer thread.
+3. `initialise_application()` first clears every leftover on-disk session directory (and any live LLM session anchored to one) unconditionally - see `utils_session/session_worker.py::clear_all_session_directories()` - then starts every LLM provider's own always-on service, if it has one (today, only Claude's `claude_session_service.py`, and only if Claude is configured for OAuth access - see `utils_agents/agent_interface.py::initialise_llm_services()`), runs a startup LLM credential smoke test, opens the RabbitMQ consume connection (retrying indefinitely until reachable), publishes an unconditional `bot_started` event (`{"type": "bot_started"}`, no other fields - fired on every startup regardless of cause, crash or routine redeploy alike, so `telegram_gateway` can resolve any session_reset it's still holding for this application), runs the crash-recovery sweep, starts the optional daily timed session reset schedule (`SESSION_RESET_TIME`, if configured - see "Session Reset" under Environment Variables below), then starts the background consumer thread.
 4. The main thread blocks until a shutdown signal is received.
 
 #### Runtime
@@ -45,7 +45,7 @@ The RabbitMQ consumer loop consumes from `Q_CHANNEL_IN` and routes each message 
 
 - `gateway_alert` - logged critically, counted in Redis, and notified by email (throttled).
 - `gateway_recover` - logged, clears the `gateway_alert` throttle.
-- `session_cleared` - stops and removes the corresponding `SessionWorker`, and clears its on-disk directory.
+- `session_cleared` - signals the corresponding `SessionWorker` to finish any in-flight turn and retire (removing itself from the registry, clearing its on-disk directory, and terminating any live LLM session anchored to it), or clears directly if no worker is currently active.
 - `session_clear_request` - the admin-triggered request for a global session reset, accepted or rejected depending on whether a reset sweep is already in progress - see "Global Session Reset" below.
 - Everything else (a task, `poll_timed_out`, `delivery_failed`) - routed to `get_or_create_session_worker(session_id)`.
 
@@ -137,7 +137,9 @@ Exits `0` on success, `1` on failure - check the container logs either way for d
 - SMTP credentials are never logged in full, only whether a value is set.
 - Redis uses a separate ACL user from `telegram_gateway`, scoped to this application's own keys.
 - The `gateway_alert` throttle fails open on a Redis outage, favouring alert availability over perfect throttling.
-- `SessionWorker` has three stop paths: `stop()` abandons queued work immediately (used on `session_cleared`), `shutdown()` drains it fully with no further action (used at application shutdown), and `retire()` drains it fully and then permanently removes the session (used by a global session reset).
+- `SessionWorker` has three stop paths: `stop()` abandons queued work immediately (currently unused, kept as a documented primitive), `shutdown()` drains it fully with no further action (used at application shutdown), and `retire()` drains it fully - including anything already in progress - and then permanently removes the session, clears its on-disk directory, and terminates any live LLM session anchored to it (used both by a global session reset and by a per-chat `session_cleared` confirmation).
+- Every on-disk session directory is also cleared unconditionally on every `bot_sanctuary` startup (`clear_all_session_directories()`, the first step of `initialise_application()`), not only on an explicit reset.
+- A session's on-disk directory is laid out `SESSION_DIR/<session_id>/<call_type>/<llm_type>` (e.g. `.../chat/claude`) - a stable root per `session_id`, with one leaf subdirectory per Call/LLM-provider combination actually used for it, rather than a single directory per session. This is what lets two different Calls (or the same LLM reused by two different Calls) each keep their own isolated Claude working-directory/session anchor for the same `session_id`, once handoff between Calls is wired (see `CODE_TODO.md`).
 - A global session reset's accept/reject decision is a single in-memory flag - whether an earlier sweep is still draining - not a comparison against the requesting admin or request identity; any request arriving while one is in progress is rejected the same way regardless of who or what triggered it.
 - All wall-clock timing - log timestamps, `SESSION_RESET_TIME` scheduling, throttle timestamps - is anchored to one configurable timezone (`TZ`) via a single shared time-retrieval helper, rather than each module reading the container's own local time independently.
 
@@ -251,7 +253,8 @@ flowchart TD
     Signals --> Init["initialise_application()"]
 
     subgraph INIT["Startup"]
-        Init --> LLMServices["initialise_llm_services() - starts each provider's own always-on service, if any (today, Claude's claude_session_service.py, gated on OAuth)"]
+        Init --> SessionWipe["clear_all_session_directories() - wipes every leftover SESSION_DIR entry + terminates any live LLM session anchored to one"]
+        SessionWipe --> LLMServices["initialise_llm_services() - starts each provider's own always-on service, if any (today, Claude's claude_session_service.py, gated on OAuth)"]
         LLMServices --> LLMTest["test_llm_tokens() - smoke test per configured provider"]
         LLMTest --> RMQ["initialise_rabbitmq_connection() - retries until reachable"]
         RMQ --> BotStarted["_push_bot_started() - publish {type: bot_started}, best-effort"]
@@ -268,7 +271,7 @@ flowchart TD
         Q2 --> Q3{"type"}
         Q3 -- gateway_alert --> GA["_handle_gateway_alert()"]
         Q3 -- gateway_recover --> GR["_handle_gateway_recover()"]
-        Q3 -- session_cleared --> SC["stop + remove SessionWorker"]
+        Q3 -- session_cleared --> SC["retire() SessionWorker (or clear directly if none active)"]
         Q3 -- session_clear_request --> CR["handle_session_clear_request()"]
         Q3 -- "task / poll_timed_out / delivery_failed" --> SR["get_or_create_session_worker().submit()"]
         GA --> Q4["ack / nack + requeue up to Q_CONSUME_MAX_ATTEMPTS"]

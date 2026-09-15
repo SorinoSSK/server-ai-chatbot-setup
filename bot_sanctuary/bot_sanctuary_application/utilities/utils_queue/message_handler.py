@@ -127,7 +127,8 @@ def _handle_gateway_recover(data: dict) -> None:
 
 def _handle_session_cleared(data: dict) -> None:
     """
-    Handles a session_cleared acknowledgement, stopping any worker owning the named session and removing its on-disk session directory.
+    Handles a session_cleared acknowledgement, signalling any worker owning the named session to finish its
+    in-flight work and retire, or clearing its on-disk session directory directly if no worker is active.
 
     Args:
         data (dict):
@@ -137,8 +138,15 @@ def _handle_session_cleared(data: dict) -> None:
         None
 
     Notes:
-        - No active worker for the named session is a normal, expected case.
-        - The on-disk directory is removed unconditionally, even if no worker was active.
+        - No active worker for the named session is a normal, expected case - the on-disk directory (and any
+          live LLM session anchored to it) is still cleared directly in that case, since nothing could possibly
+          be in flight for a session with no active worker.
+        - When a worker *is* active, retire() is used rather than stop() + an immediate clear - stop() only
+          prevents a further batch from starting, it does not pause a batch already in progress on the worker's
+          own thread, so clearing immediately from this (the consumer) thread could race a still-in-flight turn.
+          retire() already guarantees whatever's in flight finishes - including publishing its reply - before its
+          own exit path clears the directory (see utils_session/session_worker.py's own header Notes and
+          retire()'s own docstring for the full reasoning).
     """
     session_id = data.get("session_id")
     if not session_id:
@@ -146,12 +154,11 @@ def _handle_session_cleared(data: dict) -> None:
     else:
         worker = remove_session_worker(session_id)
         if worker is not None:
-            worker.stop()
-            logger.info(f"Stopped SessionWorker for session_id={session_id} following session_cleared (chat_id={data.get('chat_id')}).")
+            worker.retire()
+            logger.info(f"Signalled SessionWorker for session_id={session_id} to finish its in-flight work and retire, following session_cleared (chat_id={data.get('chat_id')}).")
         else:
-            logger.info(f"Received session_cleared for session_id={session_id} (chat_id={data.get('chat_id')}) - no active SessionWorker found, nothing to stop.")
-
-        clear_session_directory(session_id)
+            logger.info(f"Received session_cleared for session_id={session_id} (chat_id={data.get('chat_id')}) - no active SessionWorker found, clearing its directory directly.")
+            clear_session_directory(session_id)
 
 def _handle_session_clear_request(data: dict) -> None:
     """
