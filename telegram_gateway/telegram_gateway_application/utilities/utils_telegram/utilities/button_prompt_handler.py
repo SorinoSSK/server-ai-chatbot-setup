@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 
 _lock = threading.RLock()
 
-# callback_data -> {"chat_id": int, "purpose": str, "payload": dict, "created_at": float}
+# callback_data -> {"chat_id": int, "task_id": str, "purpose": str, "payload": dict, "created_at": float}
 _registered_callbacks: dict[str, dict] = {}
 
 # =============================================================================
@@ -52,7 +52,7 @@ def _prune_expired_callbacks() -> None:
             if now - entry["created_at"] > settings.TELEGRAM_CALLBACK_TTL_SECONDS:
                 _registered_callbacks.pop(token, None)
 
-def register_bot_button(text: str, purpose: str, chat_id: int, payload: dict | None = None) -> dict | None:
+def register_bot_button(text: str, purpose: str, chat_id: int, task_id: str | None = None, payload: dict | None = None) -> dict | None:
     """
     Generates a bot-issued callback_data token and registers it, ready to slot into a keyboard row.
 
@@ -66,6 +66,12 @@ def register_bot_button(text: str, purpose: str, chat_id: int, payload: dict | N
         chat_id (int):
             Chat the button is sent to - a press is only valid from the same chat.
 
+        task_id (str | None, optional):
+            The task_id the buttoned message was published against - read back from
+            validate_bot_callback() so a press can be routed back onto that same task_id, mirroring
+            poll_response_handler.py::_push_poll_answer()'s existing task_id-reuse pattern for polls.
+            None for a purpose that is never routed back to a task at all. Defaults to None.
+
         payload (dict | None, optional):
             Caller-defined context retrieved alongside the press.
 
@@ -74,7 +80,7 @@ def register_bot_button(text: str, purpose: str, chat_id: int, payload: dict | N
             {"text": text, "callback_data": token} or None if text is empty.
 
     Notes:
-        - Token is a random opaque string, not derived from purpose/payload.
+        - Token is a random opaque string, not derived from purpose/payload/task_id.
     """
     if not text:
         logger.error("Refused to register a button with empty text.")
@@ -86,6 +92,7 @@ def register_bot_button(text: str, purpose: str, chat_id: int, payload: dict | N
         with _lock:
             _registered_callbacks[token] = {
                 "chat_id": chat_id,
+                "task_id": task_id,
                 "purpose": purpose,
                 "payload": payload or {},
                 "created_at": time.monotonic()
@@ -186,7 +193,7 @@ def validate_bot_callback(callback_data: str, chat_id: int) -> dict | None:
 
     Returns:
         dict | None:
-            {"purpose": str, "payload": dict} if valid; otherwise None (logged).
+            {"purpose": str, "payload": dict, "task_id": str} if valid; otherwise None (logged).
 
     Notes:
         - Single-use: removed from the registry regardless of outcome, so a replay can't be validated twice.
@@ -204,6 +211,6 @@ def validate_bot_callback(callback_data: str, chat_id: int) -> dict | None:
         return None
     else:
         logger.info(f"Validated button press from chat_id={chat_id} (purpose={entry['purpose']!r}).")
-        return {"purpose": entry["purpose"], "payload": entry["payload"]}
+        return {"purpose": entry["purpose"], "payload": entry["payload"], "task_id": entry["task_id"]}
 
 # =============================================================================

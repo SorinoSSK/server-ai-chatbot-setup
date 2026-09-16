@@ -397,6 +397,55 @@ def _push_task(chat_id: int, user_id: int, text: str, image_url: str = "", video
             start_typing(task_id, chat_id)
             logger.info(f"Pushed task_id={task_id} for chat_id={chat_id} to the outbound queue.")
 
+def _push_button_press(chat_id: int, purpose: str, payload: dict, task_id: str | None) -> None:
+    """
+    Pushes a validated button press to the outbound queue, against the task_id it was originally sent on.
+
+    Args:
+        chat_id (int)
+
+        purpose (str):
+            The button's caller-defined purpose tag (see button_prompt_handler.py::register_bot_button()).
+
+        payload (dict):
+            The button's caller-defined payload, carried through unchanged.
+
+        task_id (str | None):
+            The task_id the buttoned message was published against - None if the button was registered
+            with no task_id at all (not expected for a bot_sanctuary-issued button - see
+            register_bot_button()'s own Notes; only "draft_continue" registers with task_id=None, and
+            that purpose never reaches this function, see _handle_update()).
+
+    Returns:
+        None
+
+    Notes:
+        - Mirrors utils_telegram/utilities/poll_response_handler.py::_push_poll_answer()'s existing
+          task_id-reuse pattern for polls - never mints a new task_id, since bot_sanctuary already has
+          this one open (see its own call_dispatch_handler.py: a text reply carrying buttons is left
+          open exactly like a poll, awaiting this eventual response).
+        - session_id is resolved via generate_session() and is mandatory on every outbound payload -
+          see utils_redis/database.py.
+    """
+    if not task_id:
+        logger.error(f"Validated callback_query from chat_id={chat_id} for purpose={purpose!r} carries no task_id - button_press dropped.")
+    else:
+        session_id = generate_session(task_id=task_id)
+        if not session_id:
+            logger.error(f"Failed to resolve session_id for task_id={task_id}. Button press dropped.")
+        elif not queue_push_task({
+            "task_id": task_id,
+            "session_id": session_id,
+            "text": "",
+            "image_url": "",
+            "video_url": "",
+            "file_url": "",
+            "button_press": {"purpose": purpose, "payload": payload}
+        }):
+            logger.error(f"Failed to push button_press for task_id={task_id} to RabbitMQ. Dropped.")
+        else:
+            logger.info(f"Pushed button_press (purpose={purpose!r}) for task_id={task_id} to RabbitMQ.")
+
 def _handle_poll_answer(poll_answer: dict) -> None:
     """
     Routes a poll_answer update to poll_response_handler.py's debounce loop.
@@ -440,7 +489,7 @@ def _handle_update(chat_id: int, user_id: int, update: dict) -> None:
         - See module Notes above for the overall draft flow.
         - Prunes _recent_media_groups on every update, not just album items.
         - callback_query updates are validated via validate_bot_callback() here, rather than falling through to the text branch (which would otherwise read them as empty-text).
-        - "draft_continue" (see utils_telegram/utilities/image_draft_handler.py) is the only callback purpose currently wired up; any other purpose is logged and otherwise ignored.
+        - Any purpose not otherwise handled above is pushed back onto the outbound queue as a button_press, against the same task_id the buttoned message was originally published on - mirrors utils_telegram/utilities/poll_response_handler.py::_push_poll_answer()'s existing task_id-reuse pattern for polls.
         - The global-reset admin command (_is_reset_command()/_handle_reset_command(), CODE_TODO.md's Part 1) is only checked on a plain text message with no draft pending - never against a draft-finalising instruction. A draft's media always takes priority; the finalising text is only ever read as an instruction for that media, never as this command, even in the coincidental case where it happens to match the phrase exactly.
     """
     _prune_recent_media_groups()
@@ -454,10 +503,7 @@ def _handle_update(chat_id: int, user_id: int, update: dict) -> None:
             if not continue_draft_timer(chat_id):
                 logger.warning(f"Received draft_continue callback for chat_id={chat_id} but no active draft timer.")
         else:
-            logger.info(
-                f"Validated callback_query from chat_id={chat_id} for purpose={result['purpose']!r} "
-                f"- no handler wired up for this purpose yet."
-            )
+            _push_button_press(chat_id, result["purpose"], result["payload"], result["task_id"])
         return
     else:
         message = update.get("message") or update.get("edited_message") or {}

@@ -887,3 +887,111 @@ Found while directly answering the user's own follow-up question, "is telegram_g
 
 - `telegram_gateway_application/utilities/utils_telegram/utilities/markdown_converter.py` (new; nesting-guard follow-up fix, same file, 2026-09-15).
 - `telegram_gateway_application/utilities/utils_queue/message_handler.py`: `_TEXT_PARSE_MODE`, `_handle_text()`.
+
+---
+
+## BUG — a validated button press produces no response when its `purpose` isn't `draft_continue` (e.g. `select_shoe`)
+
+Status: **Scoped (2026-09-16) - not yet implemented.** Raised directly by the user testing the live bot ("bot did not provide any response when clicking on a button", ~07:13am) - traced against `telegram_gateway.log`/`bot_sanctuary.log` for that morning (both logs read in full, cross-referenced by timestamp/`task_id`) before any fix was scoped, per explicit follow-up instruction to scope all three issues found that morning and log them here.
+
+### Context
+
+`bot_sanctuary`'s persona is free to send a `text` reply with `buttons`, each carrying a caller-defined `purpose` string (see `chat.json`'s own `text` format: `{"type": "text", "text": "...", "buttons": [[{"text": "...", "purpose": "...", "payload": {...}}]]}`) - `purpose` is never validated or constrained to a fixed set anywhere in either codebase. `telegram_gateway`'s own `gateway_inbound.py::_handle_update()` docstring already states plainly: *"`draft_continue` ... is the only callback purpose currently wired up; any other purpose is logged and otherwise ignored."* This morning the persona sent a shoe-selection prompt with `purpose='select_shoe'` - a purpose that has never had a wired handler on this side, so the press was silently swallowed.
+
+### Symptom / Evidence
+
+`telegram_gateway.log`, 07:13:47-08:07:53 (chat_id=543086109):
+
+- `07:13:47` - `bot_sanctuary` sends a text reply with 3 buttons, `purpose='select_shoe'`; `bot_sanctuary.log` confirms it left that task_id open ("leaving it open (poll, or a text reply carrying buttons)").
+- `07:13:52` - user taps one. `button_prompt_handler.validate_bot_callback()` correctly validates it as genuine, single-use, not expired/forged - then `_handle_update()`'s own `else` branch logs *"Validated callback_query ... no handler wired up for this purpose yet"* and returns. Nothing is pushed onward; the open task_id from 07:13:47 never receives a `completed`/`error`, so nothing is ever sent back to Telegram.
+- `07:14:11` onward, and again at `08:07:53` - further `callback_query` updates are correctly rejected as stale/already-consumed/expired (`validate_bot_callback()`'s own single-use/TTL behaviour, working as designed) - consistent with the user re-tapping a button that already silently failed once, or an older message's buttons.
+
+### Root Cause
+
+Confirmed in code, not just inferred from logs: `_handle_update()`'s callback branch (`gateway_inbound.py`) only has a real handler for `purpose == "draft_continue"`; every other purpose falls into the deliberate, logged no-op `else`. This is an incomplete integration, not a crash or race - the persona-side feature (buttons with an arbitrary `purpose`) was built assuming the gateway would route the press back into a task, but no generic mechanism for that exists; only the one purpose `telegram_gateway` itself needed (`draft_continue`, for its own media-draft-expiry feature) was ever wired.
+
+### Decisions (scoped fix, elaborated 2026-09-16 against a direct precedent already in this codebase - not yet implemented)
+
+- **Preferred direction, unchanged: a generic callback-to-task routing path, not a second hardcoded purpose.** Hardcoding `select_shoe` the same way `draft_continue` is wired today was considered and rejected - the persona can invent any `purpose` string at any time (nothing constrains it to a known set), so a second hardcoded branch would only fix today's specific case and leave the same silent-drop gap for the next new purpose the persona ever tries.
+- **Open design question from the original scoping - now resolved by precedent: a button press resolves back onto the *same* `task_id` the buttoned message was published against, exactly like a poll answer already does.** `utils_telegram/utilities/poll_response_handler.py::_push_poll_answer(task_id, option_ids)` is the *identical* problem, already solved and already implemented for polls: it pushes `{"task_id": <the poll's own task_id>, "session_id": ..., "text": "", ..., "poll_answer": option_ids}` back onto the outbound queue against the task_id that was already open when the poll was sent - never a freshly-minted one. Buttons should follow the same shape, not the alternative (mint a new task_id via `create_task_mapping()`/`_push_task()`) - that alternative was never seriously in the running once this precedent was found; it would need a second, parallel task_id-minting path with no clear benefit over reusing the one `bot_sanctuary` is already holding open.
+- **Concrete mechanism, modelled directly on `create_poll_mapping()`/`get_poll_mapping()`'s existing shape:**
+  1. `register_bot_button()` (`button_prompt_handler.py`) gains a new required `task_id` parameter, stored in `_registered_callbacks[token]` alongside the existing `chat_id`/`purpose`/`payload`/`created_at` - mirrors `create_poll_mapping()` storing `task_id` keyed by `poll_id`, just in-memory rather than Redis (this registry already is - see the module's own header Notes, "in-memory only, resets on application restart").
+  2. `_build_button_rows()` (`message_handler.py`) already has `task_id` in scope at its one call site (`_handle_text(task_id, chat_id, message, buttons)`) - just needs to thread it through into each `register_bot_button()` call it makes.
+  3. `validate_bot_callback()` returns `task_id` alongside `purpose`/`payload` in its result dict, once popped from `_registered_callbacks`.
+  4. `_handle_update()`'s callback branch, for any `result["purpose"]` other than `"draft_continue"`, pushes a new payload back onto the outbound queue via `queue_push_task()` - `{"task_id": result["task_id"], "session_id": generate_session(task_id=result["task_id"]), "text": "", "image_url": "", "video_url": "", "file_url": "", "button_press": {"purpose": result["purpose"], "payload": result["payload"]}}` - the same shape/call pattern as `_push_poll_answer()`, just with a `button_press` key instead of `poll_answer`. No `_handle_text()`-side change needed beyond passing `task_id` through, and no `create_task_mapping()` call at all for this path - the mapping already exists from when the buttoned message was first pushed.
+- **The button's `payload` dict is carried through unchanged** by the mechanism above (item 4) - it is no longer silently discarded once `validate_bot_callback()` returns it, closing the gap flagged in the original scoping.
+- **New finding, found while tracing this fix through to its actual consumer - changes this entry's scope materially: `bot_sanctuary`'s own turn-building step doesn't read anything but `text` from a task payload today.** `utils_session/session_worker.py::_process_batch()` builds its combined prompt with `combined_text = "\n".join(text for text in ((item.get("text") or "") for item in batch) if text.strip())` - `image_url`/`video_url`/`file_url`/`poll_answer` are *all* already just as inert as a hypothetical `button_press` field would be; none of them are read anywhere in `_process_batch()` or downstream in `call_dispatch_handler.py`. This means `telegram_gateway`'s side of the poll-answer round trip (`_push_poll_answer()`) has apparently never had a working consumer on `bot_sanctuary`'s side either - the same gap this entry originally found for buttons turns out to already exist for polls, undocumented until now. **This fix is therefore a two-repo change, not a `telegram_gateway`-only one**: `_process_batch()` (or wherever the final prompt is actually assembled before reaching Claude) needs a new branch that recognises a `button_press` (and, while there, arguably `poll_answer`) key on a batch item and folds it into the turn's prompt as something like "the user selected: <purpose>/<payload>" - otherwise the press would arrive, be correctly resolved back onto its `task_id`, and still produce no visible effect, for exactly the same reason poll answers already don't today.
+
+### Open Questions
+
+1. ~~Whether a button press resolves onto the same task_id or a new one.~~ **Resolved above - same task_id, mirroring `_push_poll_answer()`.**
+2. ~~Exact task payload shape.~~ **Resolved above - `button_press: {"purpose", "payload"}` alongside the existing poll_answer-style envelope fields.**
+3. Whether to fix `_process_batch()`'s "only reads `text`" gap generally (covering `poll_answer`/media too, since all are equally affected) as part of this same change, or narrowly (just enough to make `button_press` visible to the prompt) and leave `poll_answer`/media as a separately-tracked pre-existing gap - **see the new cross-referenced entry in `bot_sanctuary/CODE_TODO.md`**, not yet decided which repo's TODO should own that broader fix.
+4. Whether any button `purpose` besides `select_shoe`/`draft_continue` is expected soon - affects only how the persona-facing wording of the folded-in prompt ("the user selected: ...") should be phrased generically enough to cover future purposes, not whether the mechanism itself is worth building.
+
+### Follow-up Work
+
+- Implement the four-step mechanism above (`register_bot_button()` → `_build_button_rows()` → `validate_bot_callback()` → `_handle_update()`'s callback branch), reusing `generate_session(task_id=...)`/`queue_push_task()` exactly as `_push_poll_answer()` already does.
+- Coordinate with `bot_sanctuary/CODE_TODO.md`'s new cross-referenced entry on `_process_batch()` actually reading `button_press` (and deciding the `poll_answer`/media scope question above) - this fix does not work end-to-end without that half landing too.
+- Retest the exact `select_shoe` flow end-to-end once both halves are implemented.
+
+### Where
+
+- `telegram_gateway_application/utilities/utils_telegram/utilities/button_prompt_handler.py`: `register_bot_button()` (new `task_id` param), `validate_bot_callback()` (return `task_id`).
+- `telegram_gateway_application/utilities/utils_queue/message_handler.py`: `_build_button_rows()` (thread `task_id` through).
+- `telegram_gateway_application/utilities/utils_telegram/gateway_inbound.py::_handle_update()` (callback branch - new `button_press` push, modelled on `poll_response_handler.py::_push_poll_answer()`).
+- Cross-reference (required, not optional): `bot_sanctuary/CODE_TODO.md`'s new entry on `_process_batch()`'s "only reads `text`" gap - this fix is incomplete without that side landing too.
+- Cross-reference: `bot_sanctuary/CODE_TODO.md` (no counterpart entry added there for this issue - the gap is entirely `telegram_gateway`-side; `bot_sanctuary` already assumes a button press round-trips somehow, it just doesn't yet).
+
+---
+
+## BUG — a Tier 1 `delivery_failed` retry can never resolve once the task's `completed` marker has already run; plain `send_message()` has no pre-send length guard unlike `send_message_with_buttons()`
+
+Status: **Scoped (2026-09-16) - not yet implemented.** Raised directly by the user ("bot failed to respond to a message", ~09:17am) - traced against both logs for `task_id=9478f79c8fd74cdbb6dd71aa1f0ec650`, per the same instruction as the entry above.
+
+### Context
+
+`bot_sanctuary` publishes a `text` message and its terminal `completed` marker back-to-back, immediately after generating a reply - it does not wait to learn whether the send to Telegram actually succeeded before marking the task done (there is no contract anywhere that says it should - `completed` means "no further payloads are expected for this `task_id`," not "the last payload was confirmed delivered"). Separately, `send_message_with_buttons()` (`button_prompt_handler.py`) explicitly pre-checks `len(text) > TELEGRAM_MESSAGE_MAX_LENGTH` (4096, Telegram's own hard cap) before ever calling Telegram - but the plain `send_message()` path, which `_handle_text()` uses whenever a reply carries no buttons, has no equivalent check anywhere. These two facts combine into a real, reproduced failure mode.
+
+### Symptom / Evidence
+
+Both logs, 09:17:33-09:18:36, `task_id=9478f79c8fd74cdbb6dd71aa1f0ec650`:
+
+1. `bot_sanctuary` runs 4 `WebSearch` calls, self-corrects a non-JSON first draft (per `chat.json`'s enforced JSON-only contract), then publishes `text` (a long, multi-paragraph reply with ~10 citation links) followed immediately by `completed` for the task.
+2. `telegram_gateway` attempts the send via plain `send_message()` (no buttons on this reply) - Telegram rejects it with **400 Bad Request**, logged and *not retried* (`gateway_outbound.py`'s own documented Tier 1 behaviour for a non-connection rejection). A Tier 1 `delivery_failed` event is pushed for this `task_id`.
+3. `telegram_gateway` then processes the already-queued `completed` marker from step 1 - `_handle_completed()` deletes the task's Redis mapping unconditionally (`"Task ... completed. Is mapping deleted successfully: True"`).
+4. `bot_sanctuary` receives the `delivery_failed` event, runs a third Claude turn for the same `task_id`, and republishes `text` + `completed` for it - but the mapping is already gone (step 3). Both are dropped: *"No task mapping found in Redis for task_id=... Message dropped."* The user receives nothing for this exchange.
+
+### Root Cause
+
+Two independent, compounding gaps, confirmed against source:
+
+1. **No pre-send length guard on the plain-text path.** `send_message()` (`gateway_outbound.py`) has no equivalent of `send_message_with_buttons()`'s own `len(text) > settings.TELEGRAM_MESSAGE_MAX_LENGTH` check - an overlong reply with no buttons attached is sent straight to Telegram and only ever caught by Telegram's own 400 rejection, after the fact, rather than being pre-empted or split the way an overlong media caption already is (`_send_media_with_caption()`'s existing caption-overflow-into-follow-up pattern).
+2. **A `task_id`'s Redis mapping is deleted unconditionally on `completed`, with no awareness that a `delivery_failed` event for the same `task_id` might still be in flight and expecting an answer.** Once `_handle_completed()` runs, that `task_id` is permanently unusable for any further reply - including one the gateway's own Tier 1 mechanism explicitly asked `bot_sanctuary` to retry.
+
+### Decisions (scoped fix, not yet implemented)
+
+- **(a) - lower-risk, addresses the specific trigger seen today: give `_handle_text()`'s plain-send path the same length awareness `send_message_with_buttons()` already has**, most likely by extending `_send_media_with_caption()`'s existing "split the overflow into a follow-up message" pattern to plain text too, rather than only rejecting outright the way the buttoned path does today (a buttoned reply can't be split without detaching the buttons from the text; a plain reply has no such constraint). This alone would have prevented today's specific 400, without touching the `completed`/`delivery_failed` ordering at all.
+- **(b) - deeper structural fix, covers *any* Tier 1 rejection reason, not just length: stop the `completed`/`delivery_failed` race from being able to happen at all.** Two candidate shapes, neither committed yet:
+  - **(b1) - a `delivery_failed`-triggered corrective retry targets a *fresh* `task_id`**, rather than trying to republish against the original (already-closeable) one - mirrors how `bot_sanctuary`'s own coalescing mechanism already mints/reuses `task_id`s deliberately (see `bot_sanctuary/CODE_TODO.md`'s "message coalescing" entry) rather than assuming one is always safe to reuse. Needs no new state on `telegram_gateway`'s side.
+  - **(b2) - `telegram_gateway` withholds deleting a `task_id`'s mapping on `completed` if a `delivery_failed` for that same `task_id` was just pushed and hasn't yet been superseded by a later reply.** Would need new tracking state (e.g. "this `task_id` has an outstanding Tier 1 retry expected") and a decision on how long to hold it open - more invasive than (b1), not preferred without a reason (b1) doesn't already cover.
+  - **(b1) is the currently-preferred direction** - it requires a change only on `bot_sanctuary`'s side (which already owns `task_id` minting for a turn) rather than new gateway-side state, and doesn't need `telegram_gateway` to reason about "is a retry still pending for this closed task_id" at all.
+- **(a) and (b) are independent and both worth doing** - (a) closes the length-specific trigger outright; (b) closes the general shape of the race for every other Tier 1 rejection reason (a bad `chat_id`, an unexpected Telegram-side validation failure, etc.), which (a) alone would not cover.
+
+### Open Questions
+
+1. Whether (b) is worth building immediately given (a) closes today's specific trigger, or whether it's acceptable to land (a) first and revisit (b) only if a non-length Tier 1 rejection is ever actually observed in practice.
+2. If (b1) is adopted, the exact mechanism `bot_sanctuary`'s `delivery_failed` handling would use to obtain a fresh `task_id` for its corrective retry - this is a cross-service decision, not something this side can finalise alone.
+
+### Follow-up Work
+
+- Implement (a): length-aware overflow handling for `_handle_text()`'s plain-send path.
+- Once (b1) vs (b2) is decided (jointly with whoever owns `bot_sanctuary`'s `call_dispatch_handler.py`/`session_worker.py`), implement whichever side of it belongs here.
+- Add a matching entry to `bot_sanctuary/CODE_TODO.md` once (b1)'s exact shape is agreed, since it requires a change on that side too.
+
+### Where
+
+- `telegram_gateway_application/utilities/utils_telegram/gateway_outbound.py::send_message()`.
+- `telegram_gateway_application/utilities/utils_telegram/utilities/button_prompt_handler.py::send_message_with_buttons()` (existing length-check pattern to extend/mirror).
+- `telegram_gateway_application/utilities/utils_queue/message_handler.py::_handle_text()`, `_send_media_with_caption()` (existing overflow-split pattern to extend to plain text), `_handle_completed()`.
+- Cross-reference: `bot_sanctuary/CODE_TODO.md` (a counterpart entry is still needed once (b1)'s shape is agreed - not added yet, since the exact mechanism isn't decided).

@@ -534,6 +534,55 @@ def shutdown_all_session_workers() -> None:
             else:
                 logger.info(f"SessionWorker for session_id={worker.session_id} finished its last task and stopped cleanly.")
 
+def _extract_item_text(item: dict) -> str:
+    """
+    Resolves the readable instruction text for a single coalesced batch item.
+
+    Args:
+        item (dict):
+            One task payload from a coalesced batch.
+
+    Returns:
+        str:
+            item["text"] if non-empty; otherwise a description built from item["button_press"] if
+            present; otherwise a description built from item["poll_answer"] if present; otherwise "".
+
+    Notes:
+        - button_press/poll_answer are telegram_gateway's own gateway_inbound.py::_push_button_press()/
+          poll_response_handler.py::_push_poll_answer() payloads - each always accompanied by text=""
+          on that same payload (see their own Notes), so checking text first and falling back to
+          whichever of the two is present is safe and requires no ordering assumption between them -
+          a single payload never carries both at once.
+        - button_press carries {"purpose", "payload"} exactly as the persona itself defined when it
+          built the button (chat.json's button spec) - unlike poll_answer below, this can directly
+          embed identifying content (e.g. {"shoe_name": "Cloud 5"}) rather than relying on the
+          persona's own conversation history to make sense of a bare index.
+        - poll_answer carries Telegram's own selected option *indices* (option_ids), not the option's
+          own text - telegram_gateway has no lookup back to the original poll's question/options at
+          this point, so this can only describe the answer by index. Relies on the persona's own
+          conversation history (the poll it just sent, moments earlier in the same session) to make
+          sense of which index means what.
+        - poll_timed_out (a distinct payload - {"task_id", "type": "poll_timed_out"}, no "text"/
+          "button_press"/"poll_answer" at all) still resolves to "" here - not handled by this
+          function, out of scope of this change.
+    """
+    text = item.get("text") or ""
+    if text:
+        return text
+    else:
+        button_press = item.get("button_press")
+        if button_press:
+            purpose = button_press.get("purpose")
+            payload = button_press.get("payload") or {}
+            return f"[The user pressed a button - purpose: {purpose!r}, payload: {payload}.]"
+        else:
+            poll_answer = item.get("poll_answer")
+            if poll_answer:
+                indices = ", ".join(str(option_id) for option_id in poll_answer)
+                return f"[The user answered the poll by selecting option index/indices: {indices}.]"
+            else:
+                return ""
+
 def _close_intermediate_task_ids(task_ids: list[str]) -> None:
     """
     Publishes a silent completion marker for every task_id, on a dedicated, disposable publish connection.
@@ -753,7 +802,7 @@ class SessionWorker:
 
         Notes:
             - Every task_id in the batch except the last is closed out immediately, so it does not stay open on telegram_gateway's side for the turn's whole duration.
-            - The batch's text fields are combined into one input, on the assumption that consecutive messages arriving before a turn starts represent one continued thought.
+            - The batch's text fields (falling back to a poll_answer description via _extract_item_text() when text is empty - see that function's own Notes) are combined into one input, on the assumption that consecutive messages arriving before a turn starts represent one continued thought.
             - The combined turn itself is delegated to utils_calls/call_dispatch_handler.py::execute_dispatch_call(), passed this worker's own self.dispatch_queue - see its own docstring for what runs the pipeline and publishes the outcome. Kept out of this class deliberately - a SessionWorker's own job is thread/inbox/lifecycle management, not the Call pipeline's run-and-publish mechanics.
             - self.session_dir is also passed through, purely so a Call/provider that wants continuity across turns (Claude's cwd-keyed session resume, today - see claude_interface.py) has a stable, per-generation directory to anchor it to. This SessionWorker never reads/writes anything in it itself.
         """
@@ -772,7 +821,7 @@ class SessionWorker:
                 logger.debug(f"session_id={self.session_id}: single-message batch (task_id={task_ids[0]}) - no intermediate task_ids to close.")
 
             final_task_id = task_ids[-1]
-            combined_text = "\n".join(text for text in ((item.get("text") or "") for item in batch) if text.strip())
+            combined_text = "\n".join(text for text in (_extract_item_text(item) for item in batch) if text.strip())
 
             logger.info(
                 f"session_id={self.session_id}: coalesced {len(batch)} message(s) (task_ids={task_ids}) into one "

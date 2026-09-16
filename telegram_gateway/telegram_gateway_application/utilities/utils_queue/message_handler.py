@@ -285,12 +285,16 @@ def _handle_file(task_id: str, chat_id: int, url: str, message: str) -> None:
     """
     _send_media_with_caption(send_document, "file", task_id, chat_id, url, message)
 
-def _build_button_rows(chat_id: int, rows: list[list[dict]]) -> list[list[dict]]:
+def _build_button_rows(chat_id: int, task_id: str, rows: list[list[dict]]) -> list[list[dict]]:
     """
     Registers each button spec into a bot-issued callback_data token, ready for send_message_with_buttons().
 
     Args:
         chat_id (int)
+
+        task_id (str):
+            The task_id this buttoned message is being published against - threaded through to
+            register_bot_button() so a later press can be routed back onto this same task_id.
 
         rows (list[list[dict]]):
             Rows of button specs, each {"text": str, "purpose": str, "payload": dict (optional)}.
@@ -311,6 +315,7 @@ def _build_button_rows(chat_id: int, rows: list[list[dict]]) -> list[list[dict]]
                 button.get("text"),
                 button.get("purpose"),
                 chat_id,
+                task_id,
                 button.get("payload")
             )) is not None
         ]
@@ -348,7 +353,7 @@ def _handle_text(task_id: str, chat_id: int, message: str, buttons: list[list[di
           keyboard button labels are plain Telegram UI text with no formatting support in the first place.
     """
     html_message = to_telegram_html(message)
-    rows = _build_button_rows(chat_id, buttons) if buttons else []
+    rows = _build_button_rows(chat_id, task_id, buttons) if buttons else []
     if rows:
         result = send_message_with_buttons(chat_id, html_message, rows, parse_mode=_TEXT_PARSE_MODE)
     else:
