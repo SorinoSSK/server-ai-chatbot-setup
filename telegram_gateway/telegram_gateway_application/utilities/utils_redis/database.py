@@ -420,6 +420,45 @@ def delete_task_mapping(task_id: str, chat_id: int | None = None) -> bool:
 
     return deleted
 
+def set_pending_retry(task_id: str) -> bool:
+    """
+    Marks task_id as having a Tier 1 delivery retry outstanding.
+
+    Args:
+        task_id (str)
+
+    Returns:
+        bool:
+            True if written successfully; otherwise False.
+
+    Notes:
+        - Stored as pending_retry:<task_id> -> a fixed marker value, TTL'd via REDIS_TASK_MAPPING_TTL_SECONDS - the same lifetime as the task mapping itself, since this marker is meaningless once that mapping would have expired anyway.
+        - Called only by utils_queue/error_handling.py::push_tier1_delivery_failed(), and only once its delivery_failed event has actually been pushed - so a retry is genuinely expected. Consumed by pop_pending_retry() - see utils_queue/message_handler.py::_handle_completed().
+    """
+    return _redis_write(f"pending_retry:{task_id}", "1", settings.REDIS_TASK_MAPPING_TTL_SECONDS)
+
+def pop_pending_retry(task_id: str) -> bool:
+    """
+    Checks whether a Tier 1 delivery retry is outstanding for task_id, clearing the marker if so.
+
+    Args:
+        task_id (str)
+
+    Returns:
+        bool:
+            True if a retry was outstanding (marker consumed); otherwise False.
+
+    Notes:
+        - Single-use: cleared regardless of outcome once found, so it doesn't linger to affect a later, unrelated reuse of the same task_id.
+        - Read-then-delete, not atomic - safe here since its only two callers (set_pending_retry()'s write and this function's own read) never run concurrently for the same task_id, given utils_queue/queue.py::queue_consume_task()'s single-threaded, serial consumption.
+    """
+    value = _redis_read(f"pending_retry:{task_id}")
+    if value is None:
+        return False
+    else:
+        _redis_delete(f"pending_retry:{task_id}")
+        return True
+
 def create_task_mapping(
     chat_id: int,
     user_id: int,

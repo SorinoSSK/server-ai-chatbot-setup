@@ -545,7 +545,8 @@ def _extract_item_text(item: dict) -> str:
     Returns:
         str:
             item["text"] if non-empty; otherwise a description built from item["button_press"] if
-            present; otherwise a description built from item["poll_answer"] if present; otherwise "".
+            present; otherwise a description built from item["poll_answer"] if present; otherwise a
+            description built from item["type"] == "delivery_failed" if that's what item is; otherwise "".
 
     Notes:
         - button_press/poll_answer are telegram_gateway's own gateway_inbound.py::_push_button_press()/
@@ -562,9 +563,13 @@ def _extract_item_text(item: dict) -> str:
           this point, so this can only describe the answer by index. Relies on the persona's own
           conversation history (the poll it just sent, moments earlier in the same session) to make
           sense of which index means what.
+        - delivery_failed carries {"attempted_type", "status_code", "reason"} - telegram_gateway's own
+          Tier 1 report of a rejected send (see error_handling.py::push_tier1_delivery_failed()). Also
+          keeps that same task_id's mapping alive on telegram_gateway's side specifically so this
+          description's resulting retry has somewhere to land - see message_handler.py::_handle_completed().
         - poll_timed_out (a distinct payload - {"task_id", "type": "poll_timed_out"}, no "text"/
-          "button_press"/"poll_answer" at all) still resolves to "" here - not handled by this
-          function, out of scope of this change.
+          "button_press"/"poll_answer"/"delivery_failed" at all) still resolves to "" here - not handled
+          by this function, out of scope of this change.
     """
     text = item.get("text") or ""
     if text:
@@ -580,6 +585,14 @@ def _extract_item_text(item: dict) -> str:
             if poll_answer:
                 indices = ", ".join(str(option_id) for option_id in poll_answer)
                 return f"[The user answered the poll by selecting option index/indices: {indices}.]"
+            elif item.get("type") == "delivery_failed":
+                attempted_type = item.get("attempted_type")
+                status_code = item.get("status_code")
+                reason = item.get("reason")
+                return (
+                    f"[Your previous {attempted_type!r} reply failed to send - status_code={status_code}, "
+                    f"reason: {reason}. Please try again, correcting the issue if possible.]"
+                )
             else:
                 return ""
 
@@ -802,7 +815,7 @@ class SessionWorker:
 
         Notes:
             - Every task_id in the batch except the last is closed out immediately, so it does not stay open on telegram_gateway's side for the turn's whole duration.
-            - The batch's text fields (falling back to a poll_answer description via _extract_item_text() when text is empty - see that function's own Notes) are combined into one input, on the assumption that consecutive messages arriving before a turn starts represent one continued thought.
+            - The batch's text fields (falling back to a button_press/poll_answer/delivery_failed description via _extract_item_text() when text is empty - see that function's own Notes) are combined into one input, on the assumption that consecutive messages arriving before a turn starts represent one continued thought.
             - The combined turn itself is delegated to utils_calls/call_dispatch_handler.py::execute_dispatch_call(), passed this worker's own self.dispatch_queue - see its own docstring for what runs the pipeline and publishes the outcome. Kept out of this class deliberately - a SessionWorker's own job is thread/inbox/lifecycle management, not the Call pipeline's run-and-publish mechanics.
             - self.session_dir is also passed through, purely so a Call/provider that wants continuity across turns (Claude's cwd-keyed session resume, today - see claude_interface.py) has a stable, per-generation directory to anchor it to. This SessionWorker never reads/writes anything in it itself.
         """

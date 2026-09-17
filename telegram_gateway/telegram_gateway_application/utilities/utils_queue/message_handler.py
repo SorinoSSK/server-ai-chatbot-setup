@@ -12,8 +12,11 @@
 #   - text messages may carry inline keyboard buttons - see utils_telegram/utilities/button_prompt_handler.py.
 #   - text messages have their own Markdown-ish formatting converted to Telegram-safe HTML before sending - see
 #     utils_telegram/utilities/markdown_converter.py and _handle_text()'s own docstring.
+#   - A no-buttons text reply exceeding TELEGRAM_MESSAGE_MAX_LENGTH is split into multiple messages, converted
+#     independently per chunk, rather than sent as one oversized request - see _split_for_telegram().
 #   - poll messages start their answer-collection timer on send - see utils_telegram/utilities/poll_response_handler.py.
 #   - A send rejected by Telegram (or by local validation) is reported as a Tier 1 delivery_failed event, per task_id - see error_handling.py.
+#   - A completed marker's mapping teardown is deferred for as long as a Tier 1 delivery retry is still outstanding for that task_id, so the corrective reply isn't left with nowhere to land - see _handle_completed().
 #
 # Notes       :
 #   - Owns its own JSON parsing so a malformed payload is logged and dropped rather than requeued forever.
@@ -30,7 +33,8 @@ from ...config import settings
 from ..utils_redis.database import (
     get_task_mapping,
     delete_task_mapping,
-    create_poll_mapping
+    create_poll_mapping,
+    pop_pending_retry
 )
 from ..utils_telegram.gateway_outbound import (
     send_message,
@@ -324,6 +328,94 @@ def _build_button_rows(chat_id: int, task_id: str, rows: list[list[dict]]) -> li
 
     return built_rows
 
+def _split_oversized_line(line: str) -> list[str]:
+    """
+    Recursively bisects a single raw line whose own converted form exceeds TELEGRAM_MESSAGE_MAX_LENGTH.
+
+    Args:
+        line (str):
+            A single raw (pre-conversion) line, with no internal newline, whose own to_telegram_html()
+            output alone is longer than settings.TELEGRAM_MESSAGE_MAX_LENGTH.
+
+    Returns:
+        list[str]:
+            One or more already-converted chunks, each within the length limit, in original order.
+
+    Notes:
+        - Bisects the *raw* line's text, then converts each half independently via to_telegram_html() -
+          see _split_for_telegram()'s own Notes for why converting independently, rather than slicing
+          already-converted HTML, is what keeps every resulting chunk's HTML well-formed regardless of
+          where the cut lands.
+        - Recurses only on whichever half(s) still don't fit after converting - a single bisection is
+          expected to be sufficient for realistic prose; deeper recursion only fires for a pathological
+          single "word"/token far longer than the limit.
+    """
+    converted = to_telegram_html(line)
+    if len(converted) <= settings.TELEGRAM_MESSAGE_MAX_LENGTH:
+        return [converted]
+    elif len(line) <= 1:
+        # Base case - cannot bisect a single character further. Telegram itself is the final backstop
+        # here (a single character alone exceeding the limit is not a realistic scenario in practice).
+        return [converted]
+    else:
+        midpoint = len(line) // 2
+        return _split_oversized_line(line[:midpoint]) + _split_oversized_line(line[midpoint:])
+
+def _split_for_telegram(message: str) -> list[str]:
+    """
+    Splits and converts message into one or more Telegram-safe HTML chunks, each within TELEGRAM_MESSAGE_MAX_LENGTH.
+
+    Args:
+        message (str):
+            A reply's raw, pre-conversion text - see to_telegram_html().
+
+    Returns:
+        list[str]:
+            One or more already-converted (to_telegram_html()) chunks, each guaranteed to fit within
+            settings.TELEGRAM_MESSAGE_MAX_LENGTH. A single-element list for the common case where the
+            whole message already fits.
+
+    Notes:
+        - Splits the *raw* message before conversion, then converts each resulting chunk independently -
+          not the other way around. Converting first and then slicing the final HTML risks cutting a
+          <b>/<i>/<code> tag pair in half; splitting the raw text first means any Markdown delimiter
+          separated by a cut simply fails to find its matching partner within its own chunk's conversion
+          and degrades to a literal character (see markdown_converter.py's own "degrades gracefully"
+          guarantee) - never an unbalanced HTML tag reaching Telegram.
+        - Lines are the packing unit for the general case, filled as full as possible before starting a
+          new chunk - never split mid-line unless a single line's own converted form still exceeds the
+          limit on its own (see _split_oversized_line()).
+        - Fenced code blocks are unaffected by this same-chunk-independence property - a bisected block
+          leaves at most one piece with a matched ``` pair (renders as a proper code block); the other
+          piece's dangling marker simply fails to match and falls through to plain escaped text instead -
+          still safe either way, never a broken <pre>/<code> tag.
+    """
+    whole = to_telegram_html(message)
+    if len(whole) <= settings.TELEGRAM_MESSAGE_MAX_LENGTH:
+        return [whole]
+    else:
+        chunks: list[str] = []
+        current_lines: list[str] = []
+
+        def _flush() -> None:
+            if current_lines:
+                chunks.append(to_telegram_html("\n".join(current_lines)))
+                current_lines.clear()
+
+        for line in message.split("\n"):
+            candidate = "\n".join(current_lines + [line])
+            if len(to_telegram_html(candidate)) <= settings.TELEGRAM_MESSAGE_MAX_LENGTH:
+                current_lines.append(line)
+            else:
+                _flush()
+                if len(to_telegram_html(line)) <= settings.TELEGRAM_MESSAGE_MAX_LENGTH:
+                    current_lines.append(line)
+                else:
+                    chunks.extend(_split_oversized_line(line))
+
+        _flush()
+        return chunks
+
 def _handle_text(task_id: str, chat_id: int, message: str, buttons: list[list[dict]] | None = None) -> None:
     """
     Handle a text response payload - sends message to the user as-is, optionally with inline keyboard buttons.
@@ -342,25 +434,31 @@ def _handle_text(task_id: str, chat_id: int, message: str, buttons: list[list[di
         None
 
     Notes:
-        - Falls back to a plain send_message() if buttons is missing/empty, or if every button fails to register.
-        - A rejected send (Telegram, or local validation - see send_message_with_buttons()) is reported as a Tier 1 delivery_failed event - see error_handling.py.
-          A connection failure or unauthorized token (Tier 2) is already recorded internally - nothing further to do here.
-        - message is run through to_telegram_html() first (see utils_telegram/utilities/markdown_converter.py),
-          converting the agent's own Markdown-ish formatting into Telegram-safe HTML, then sent with
-          parse_mode=_TEXT_PARSE_MODE ("HTML"). Deterministic by construction - see that module's own Notes -
-          so a malformed/unmatched formatting character can no longer cause Telegram to reject the whole send.
+        - Falls back to a plain send_message() path if buttons is missing/empty, or if every button fails to register.
+        - Buttoned path: message is run through to_telegram_html() once as a whole (see utils_telegram/utilities/markdown_converter.py)
+          and sent via send_message_with_buttons(), which fails closed (no send, no split) if the converted text exceeds
+          TELEGRAM_MESSAGE_MAX_LENGTH - the buttons must stay attached to one message, so overflow is not split into a follow-up here.
+        - Plain (no-buttons) path: message is split into one or more Telegram-safe chunks via _split_for_telegram() -
+          a single chunk for the common case where it already fits, or more if not. Chunks are sent in order; the first
+          rejected chunk reports a Tier 1 delivery_failed event and stops sending any remaining chunks.
+        - Either path: a rejected send (Telegram, or local validation) is reported as a Tier 1 delivery_failed event -
+          see error_handling.py. A connection failure or unauthorized token (Tier 2) is already recorded internally by
+          send_message()/send_message_with_buttons() - nothing further to do here.
         - Only message's own text is converted - a button's own "text" label is sent as-is, unconverted; inline
           keyboard button labels are plain Telegram UI text with no formatting support in the first place.
     """
-    html_message = to_telegram_html(message)
     rows = _build_button_rows(chat_id, task_id, buttons) if buttons else []
     if rows:
+        html_message = to_telegram_html(message)
         result = send_message_with_buttons(chat_id, html_message, rows, parse_mode=_TEXT_PARSE_MODE)
+        if isinstance(result, dict):
+            push_tier1_delivery_failed(task_id, "text", result.get("status_code"), result.get("reason"))
     else:
-        result = send_message(chat_id, html_message, parse_mode=_TEXT_PARSE_MODE)
-
-    if isinstance(result, dict):
-        push_tier1_delivery_failed(task_id, "text", result.get("status_code"), result.get("reason"))
+        for chunk in _split_for_telegram(message):
+            result = send_message(chat_id, chunk, parse_mode=_TEXT_PARSE_MODE)
+            if isinstance(result, dict):
+                push_tier1_delivery_failed(task_id, "text", result.get("status_code"), result.get("reason"))
+                break
 
 def _format_duration(seconds: int) -> str | None:
     """
@@ -391,7 +489,7 @@ def _format_duration(seconds: int) -> str | None:
 
 def _handle_completed(task_id: str, chat_id: int) -> None:
     """
-    Handle a completed marker payload - deletes the task's Redis mapping.
+    Handle a completed marker payload - deletes the task's Redis mapping, unless a Tier 1 delivery retry is still outstanding for it.
 
     Args:
         task_id (str)
@@ -403,11 +501,16 @@ def _handle_completed(task_id: str, chat_id: int) -> None:
         None
 
     Notes:
-        - Also gives a deferred session_reset for chat_id a chance to resolve now that this task_id no longer counts as open - see utils_session/session_reset_handler.py::resolve_pending_reset_if_ready().
+        - If a Tier 1 delivery_failed retry is outstanding for task_id (see error_handling.py::push_tier1_delivery_failed()), its mapping is deliberately kept alive here instead of being deleted - the corrective reply bot_sanctuary is expected to publish for this same task_id still needs it. That retry's own eventual completed marker will find no pending_retry left (already consumed here) and delete the mapping for real.
+        - Deliberately not mirrored in _handle_error() - an error marker means bot_sanctuary hit a blocking failure of its own, with no corrective retry ever coming for that task_id, unlike a Tier 1 delivery_failed, which specifically exists to request one.
+        - Also gives a deferred session_reset for chat_id a chance to resolve now that this task_id no longer counts as open - see utils_session/session_reset_handler.py::resolve_pending_reset_if_ready(). Skipped when a retry is outstanding, since the task isn't actually closed yet.
     """
-    deleted = delete_task_mapping(task_id, chat_id)
-    logger.info(f"Task task_id={task_id} completed. Is mapping deleted successfully: {deleted}.")
-    resolve_pending_reset_if_ready(chat_id)
+    if pop_pending_retry(task_id):
+        logger.info(f"Task task_id={task_id} completed, but a Tier 1 delivery retry is outstanding for it - keeping its mapping alive rather than deleting.")
+    else:
+        deleted = delete_task_mapping(task_id, chat_id)
+        logger.info(f"Task task_id={task_id} completed. Is mapping deleted successfully: {deleted}.")
+        resolve_pending_reset_if_ready(chat_id)
 
 def _handle_session_reset(task_id: str | None) -> None:
     """

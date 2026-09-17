@@ -7,6 +7,7 @@
 # Features    :
 #   - Tier 1 - push_tier1_delivery_failed(): a specific send was rejected by Telegram, or failed local validation before ever reaching Telegram.
 #     Reported per task_id, since the backend/orchestrator can react by retrying that same task differently (e.g. a different content type, a shorter message).
+#     Also marks that task_id as having a retry outstanding (set_pending_retry()), so its corrective reply isn't left with nowhere to land - see utils_queue/message_handler.py::_handle_completed().
 #   - Tier 2 - record_send_success()/record_send_failure(): Telegram is unreachable altogether, or the bot token itself is invalid/revoked (401/404) - not tied to any one task, since no per-task retry/tool-swap fixes either.
 #     Tracks a rolling consecutive-failure count and fires a gateway_alert once per incident, re-arming only once a send succeeds again.
 #     That re-arming send also pushes a gateway_recover event - but only if it's actually closing out a prior alert, not on every ordinary success - see record_send_success().
@@ -26,7 +27,7 @@ import logging
 import threading
 
 from ...config import settings
-from ..utils_redis.database import generate_session, get_tier2_alert_armed, set_tier2_alert_armed
+from ..utils_redis.database import generate_session, get_tier2_alert_armed, set_tier2_alert_armed, set_pending_retry
 
 # =============================================================================
 # G L O B A L   V A R I A B L E
@@ -86,6 +87,7 @@ def push_tier1_delivery_failed(task_id: str, attempted_type: str, status_code: i
     Notes:
         - Used only when a specific request was rejected (by Telegram, or by local validation) - never for connection-level failures, which carry no "wrong tool" signal and are reported via record_send_failure() instead.
         - session_id is resolved via generate_session() and is mandatory on every outbound payload - see utils_redis/database.py.
+        - Once actually pushed, also marks task_id as having a retry outstanding (set_pending_retry()) - see utils_queue/message_handler.py::_handle_completed(), which checks this before tearing down the task's mapping, so the corrective reply bot_sanctuary is expected to publish for this same task_id still has somewhere to land. Not set at all if the push itself fails - no retry is realistically coming for an event that never reached bot_sanctuary.
     """
     from .queue import queue_push_task
 
@@ -108,6 +110,7 @@ def push_tier1_delivery_failed(task_id: str, attempted_type: str, status_code: i
             logger.error(f"Failed to push Tier 1 delivery_failed event for task_id={task_id} to RabbitMQ. Event dropped.")
             return False
         else:
+            set_pending_retry(task_id)
             logger.info(f"Pushed Tier 1 delivery_failed event for task_id={task_id} (attempted_type={attempted_type}, status_code={status_code}).")
             return True
 

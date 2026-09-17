@@ -117,8 +117,8 @@ class Settings:
         #   - DEBOUNCING (POLL_DEBOUNCE_INITIAL_SECONDS, shortened to POLL_DEBOUNCE_SUBSEQUENT_SECONDS on every further answer): once answered, compiles and pushes the latest answer once things go quiet - capped overall by POLL_GLOBAL_CAP_SECONDS from poll creation, regardless of how many times debouncing resets.
         DEFAULT_TELEGRAM_POLL_ANONYMOUS                         = False
         DEFAULT_POLL_TIMEOUT_SECONDS                            = 300  # 5 min hard cap while awaiting a first answer
-        DEFAULT_POLL_DEBOUNCE_INITIAL_SECONDS                   = 30  # 30 sec debounce after the first answer
-        DEFAULT_POLL_DEBOUNCE_SUBSEQUENT_SECONDS                = 60   # 1 min debounce after every answer thereafter
+        DEFAULT_POLL_DEBOUNCE_INITIAL_SECONDS                   = 10   # 10 sec debounce after the first answer
+        DEFAULT_POLL_DEBOUNCE_SUBSEQUENT_SECONDS                = 10   # 10 sec debounce after every answer thereafter
         DEFAULT_POLL_GLOBAL_CAP_SECONDS                         = 480  # 8 min hard ceiling from poll creation (Telegram's own open_period/close_date maxes at 600s)
         DEFAULT_POLL_MAPPING_TTL_SECONDS                        = 600  # Redis-side backstop, slightly beyond the hard cap
         self.TELEGRAM_POLL_ANONYMOUS                            = get_env_bool("TELEGRAM_POLL_ANONYMOUS", DEFAULT_TELEGRAM_POLL_ANONYMOUS)

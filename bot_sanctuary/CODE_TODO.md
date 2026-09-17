@@ -630,7 +630,7 @@ A second, compounding gap was found while investigating, not yet fixed until thi
 
 ## NEW — Token-usage cost review: unbounded session growth, uncapped `WebSearch` tool-call chaining, and turn-multiplying self-correction/retry loops
 
-Status: **Scoped (2026-09-16) - not yet implemented.** Raised directly by the user ("bot is using too much token, approximately 13% usage from 6:59am to 9:30am") after testing the live bot; traced against `bot_sanctuary.log`/`telegram_gateway.log` for that exact window (both read in full, cross-referenced by `task_id`/timestamp). Builds directly on the "FIX — `query_via_service()`'s timeout path..." entry immediately above - **same log window, same abandoned 12-`WebSearch` shoe-question turn.** That entry fixed the stuck-lock-on-timeout symptom only; its own Decisions explicitly left the *trigger* (a persona chaining an unbounded number of tool calls in one turn) out of scope ("agent-behaviour, not something this fix changes"). The three cost drivers below are scoped here instead, as a direct follow-up.
+Status: **On observation (2026-09-16) - one driver's worst-case trigger fixed as a byproduct of other work; the other two drivers remain fully unaddressed by deliberate decision.** Raised directly by the user ("bot is using too much token, approximately 13% usage from 6:59am to 9:30am") after testing the live bot; traced against `bot_sanctuary.log`/`telegram_gateway.log` for that exact window (both read in full, cross-referenced by `task_id`/timestamp). Builds directly on the "FIX — `query_via_service()`'s timeout path..." entry immediately above - **same log window, same abandoned 12-`WebSearch` shoe-question turn.** That entry fixed the stuck-lock-on-timeout symptom only; its own Decisions explicitly left the *trigger* (a persona chaining an unbounded number of tool calls in one turn) out of scope ("agent-behaviour, not something this fix changes"). The three cost drivers below were scoped here instead, as a direct follow-up - see "Re-review (2026-09-16, later same day)" below for what actually happened to each.
 
 ### Context
 
@@ -648,31 +648,47 @@ None of this is "expected" cost for the ~8 user messages logged from one chat to
 2. **`SESSION_RESET_TIME` is unconfigured today, and even once set it only bounds growth to "at most one day," not "this exchange's own footprint."** `SESSION_RESET_TIME` (already-built, already-supported - see the entry above this file's §3 "New: crash-recovery tracking" area) fires at most once every 24h at a fixed wall-clock time; it does nothing to stop a session's cached history from growing all day between resets during genuinely active use, which is exactly what happened today. **Scoped fix:** set `SESSION_RESET_TIME` operationally (a `config.ini` value, no code change) as an immediate, low-risk first step. **Separately flagged as an open question, not yet decided:** whether a shorter, *idle-based* reset (clear a session after N minutes of no new message, distinct from the existing fixed-daily-time mechanism) is worth designing - today's own log shows multiple 40+ minute idle gaps within the same still-open session (07:14→08:56, 08:57→09:17), each of which re-reads the full history-to-date on the very next message regardless of how long the gap was.
 3. **A single user message can silently cost 2-3 full Claude turns.** Two independent, already-by-design multipliers observed today, neither free to run: **(a)** `chat.json`'s enforced JSON-only reply contract, an accepted, already-documented trade-off (the alternative - trusting free-form model output to always parse cleanly - was already rejected when that contract was written) - **not being reopened here**; **(b)** `telegram_gateway`'s Tier 1 `delivery_failed` retry (see its own `CODE_TODO.md`'s new `BUG` entry, "a Tier 1 `delivery_failed` retry can never resolve once the task's `completed` marker has already run") - **this side's own follow-up**, once that entry's preferred direction (b1, a fresh `task_id` for the corrective retry) is confirmed jointly, is to make sure whichever mechanism `session_worker.py`/`call_dispatch_handler.py` uses to answer a `delivery_failed` event mints/obtains that fresh `task_id` rather than assuming the original one is still usable - exact implementation deferred until that cross-service decision is made.
 
+### Re-review (2026-09-16, later same day) - what actually happened to each driver
+
+**Driver 1 (uncapped `WebSearch` chaining) - explicitly declined, not implemented.** A `max_turns` cap was discussed directly with the user and rejected: bounding tool-call count risks producing an incomplete/lower-quality answer for a legitimately multi-step research question, and if a capped call still hits `AGENT_QUERY_TIMEOUT_SECONDS` regardless, the abandon-and-retry pattern already seen today (12 searches wasted, then largely re-run) would simply repeat - capping call count does nothing to prevent that specific failure mode and was judged not worth its own quality trade-off. **Not tracked as a pending item** - would need a materially different proposal (e.g. salvaging partial research on timeout, rather than capping count) to be worth reopening.
+
+**Driver 2 (`SESSION_RESET_TIME` unconfigured) - still not applied. Remains the single most direct, lowest-effort lever for this issue.** Confirmed still unset. A further idle-based alternative (reset/compact after N minutes of inactivity, rather than once daily at a fixed time) was explored in depth: the Claude Agent SDK's own automatic context compaction exists conceptually, but the pinned Python package (`claude-agent-sdk==0.2.152`) has a **documented upstream gap** - `ClaudeAgentOptions` is missing the `compaction_control` parameter the SDK's own docs describe (open GitHub issue against this exact package), so `bot_sanctuary` cannot request compaction on its own schedule today. A custom idle-triggered "summarise, then reseed a fresh session" mechanism was discussed as an alternative but would be genuine new infrastructure (idle tracking + a summarisation call + a way to seed a new session with prior context) - not designed or committed. **User's own framing, judged reasonable:** the day's actual cost was dominated by a handful of unusually expensive turns, not chronic ambient cost - flipping the already-built `SESSION_RESET_TIME` on its own may already capture most of the realistic benefit for the effort involved, versus building idle-detection infrastructure for a narrower additional gain.
+
+**Driver 3(b) (`delivery_failed`/`completed` race) - resolved, but via a different, simpler mechanism than either candidate shape originally drafted here.** `telegram_gateway` ended up keeping the *same* `task_id` alive (a `pending_retry` Redis marker deferring its mapping's deletion) rather than minting a fresh one - see `telegram_gateway/CODE_TODO.md`'s own entry for the full mechanism and why the originally-planned (b1) (a fresh `task_id`, minted by `bot_sanctuary`) turned out to be architecturally impossible (`bot_sanctuary` never mints `task_id`s). **No `bot_sanctuary`-side change was needed for the mapping-retention half at all** - only this file's separate `_process_batch()` entry (delivery_failed content) was actually required on this side.
+
+**Directly relevant new finding, worth recording against this entry specifically:** re-examining the exact 09:17 "AI slowdown" incident (`task_id=9478f79c...`) that originally motivated driver 3 found it cost **3 full Claude calls (~107,800 cache_read + ~12,600 cache_creation + ~4,200 output tokens combined) and delivered zero replies to the user** - confirmed via `telegram_gateway.log`'s own `"No task mapping found... Message dropped."` lines for both of that exchange's reply attempts. `telegram_gateway`'s fix (a) (splitting an overlong plain-text reply instead of letting Telegram reject it with 400) would have prevented this exact chain's `delivery_failed` from ever being triggered in the first place - not just made its eventual retry deliverable. **This is the basis for this entry's "On observation" status**, not "Resolved": the user's own expectation (this specific quantified worst-case pattern should stop recurring, reducing total usage) is well-evidenced, but no before/after measurement of actual day-to-day usage has been taken yet - and drivers 1/2 above remain fully unaddressed and could still dominate future usage regardless of this one pattern being closed.
+
 ### Open Questions
 
-1. Exact `max_turns` value for driver 1's fix - not yet decided.
-2. Whether an idle-based session reset (distinct from `SESSION_RESET_TIME`'s fixed daily time) should be designed at all, given this is a single-user/family-chat deployment where multi-hour idle gaps between messages are the normal case, not an edge case.
-3. The cross-service mechanism for driver 3(b) - depends entirely on `telegram_gateway/CODE_TODO.md`'s own entry landing a decided direction first.
+1. ~~Exact `max_turns` value for driver 1's fix.~~ **Moot - driver 1's fix was declined outright, not merely deferred pending a value.**
+2. Whether an idle-based session reset/compaction (distinct from `SESSION_RESET_TIME`'s fixed daily time) is worth designing as genuine new infrastructure, given the SDK-level `compaction_control` gap above rules out the low-effort native path. Still open, no decision made.
+3. ~~The cross-service mechanism for driver 3(b).~~ **Resolved - see "Re-review" above.**
+4. **New:** whether/when to actually flip `SESSION_RESET_TIME` on - still awaiting an operational decision, zero code blocking it.
+5. **New:** whether to measure actual token usage after this session's fixes are deployed, to confirm or refute the "on observation" expectation above - not yet planned as a concrete step.
 
 ### Follow-up Work
 
-- Implement a `max_turns` cap on both `ClaudeAgentOptions` call sites (driver 1).
-- Set `SESSION_RESET_TIME` operationally; separately scope an idle-based reset if judged worthwhile (driver 2).
-- Once `telegram_gateway`'s `delivery_failed`/`task_id` decision lands, implement this side's half of it (driver 3(b)).
+- Decide and apply a `SESSION_RESET_TIME` value (driver 2) - the one remaining zero-code lever still on the table.
+- Observe actual usage after deployment to confirm/refute whether closing driver 3(b)'s pattern meaningfully reduced overall cost, before considering this entry fully resolved.
+- Driver 1 has no planned follow-up unless a materially different proposal (not a bare `max_turns` cap) is raised.
 
 ### Where
 
-- `bot_sanctuary_application/utilities/utils_agents/interfaces/claude_interface.py::_run_query()` (`ClaudeAgentOptions` construction).
-- `bot_sanctuary_application/utilities/utils_agents/services/claude_session_service.py` (equivalent `ClaudeAgentOptions` construction).
-- Root `config.ini`/`config_sample.ini`: `SESSION_RESET_TIME` (operational, no code change for the immediate first step).
-- `bot_sanctuary_application/libraries/claude/chat.json` (referenced only, not modified - see driver 3(a)).
-- Cross-reference: `telegram_gateway/CODE_TODO.md`'s new `BUG` entry, "a Tier 1 `delivery_failed` retry can never resolve once the task's `completed` marker has already run" (driver 3(b)).
+- `bot_sanctuary_application/utilities/utils_agents/interfaces/claude_interface.py::_run_query()` (`ClaudeAgentOptions` construction - driver 1, declined).
+- `bot_sanctuary_application/utilities/utils_agents/services/claude_session_service.py` (equivalent construction - driver 1, declined).
+- Root `config.ini`/`config_sample.ini`: `SESSION_RESET_TIME` (driver 2 - still not applied).
+- `bot_sanctuary_application/libraries/claude/chat.json` (referenced only, not modified - driver 3(a)).
+- Cross-reference: `telegram_gateway/CODE_TODO.md`'s `delivery_failed` entry (resolved, same day - driver 3(b)) and this file's own `_process_batch()` entry (resolved, same day - supplies the retry's actual content).
 
 ---
 
 ## BUG — `SessionWorker._process_batch()` only ever reads a task payload's `text` field; `poll_answer`/`button_press`/media fields are silently inert
 
-Status: **Scoped (2026-09-16) - not yet implemented.** Found while elaborating the fix for `telegram_gateway/CODE_TODO.md`'s "a validated button press produces no response when its `purpose` isn't `draft_continue`" entry - tracing that fix's button-press payload through to its actual consumer on this side surfaced a broader, pre-existing gap that entry's own fix cannot work around.
+Status: **Resolved (2026-09-16), broad scope, plus a third signal type folded in.** Found while elaborating the fix for `telegram_gateway/CODE_TODO.md`'s "a validated button press produces no response when its `purpose` isn't `draft_continue`" entry - tracing that fix's button-press payload through to its actual consumer on this side surfaced a broader, pre-existing gap that entry's own fix cannot work around. Implemented the same day, broad (per Open Question 1 below), and later extended a second time to also cover `delivery_failed` once that payload's own content gap was found while implementing `telegram_gateway`'s matching entry.
+
+### Correction to this entry's own original Context (2026-09-16, same day)
+
+The original Context section below claimed poll answers had "apparently never had a working consumer" on this side. **That claim was wrong** - challenged directly by the user ("how is poll_answer responding? I recall testing it successfully"), then re-investigated across every poll test in every log that day rather than just the first (failing) one the original claim was based on. Three genuinely successful `poll_answer` round-trips were found the same morning; the one failing test's actual cause was an unrelated app restart landing between it and the successful ones. The underlying `_process_batch()` gap below was still real and still worth fixing - `poll_answer` not being read here was a genuine, separate risk even though it hadn't actually caused a failure yet on the day this was raised - but the "never had a working consumer" framing itself is retracted, not merely superseded.
 
 ### Context
 
@@ -696,17 +712,25 @@ The agent Call pipeline (§5) was built and wired for a "minimal Chat-only case"
 
 ### Open Questions
 
-1. Narrow (`button_press` only) vs. broad (`button_press` + `poll_answer` together) scope for this fix - see Decisions above.
-2. Exact prompt-text wording for a folded-in `poll_answer`/`button_press` signal.
-3. Whether media fields (`image_url`/`video_url`/`file_url`) being equally unread is worth its own tracked entry now, or left for whenever multimodal input is actually prioritised - not decided here, flagged only.
+1. ~~Narrow vs. broad scope.~~ **Resolved - broad.** `button_press`, `poll_answer`, and (added in a second pass, see below) `delivery_failed` are all handled by one function.
+2. ~~Exact prompt-text wording.~~ **Resolved - see Implementation Notes.**
+3. Whether media fields (`image_url`/`video_url`/`file_url`) being equally unread is worth its own tracked entry now, or left for whenever multimodal input is actually prioritised - still open, not decided, unaffected by this entry's resolution.
+
+### Implementation Notes (2026-09-16)
+
+New `_extract_item_text(item)` (`session_worker.py`), called per batch item in place of the old bare `item.get("text") or ""`:
+
+- `text` if non-empty, checked first.
+- Else `button_press` present → `"[The user pressed a button - purpose: {purpose!r}, payload: {payload}.]"` - carries the button's own `payload` dict directly (the persona defined it when it built the button), unlike `poll_answer` below.
+- Else `poll_answer` present → `"[The user answered the poll by selecting option index/indices: {indices}.]"` - Telegram's own selected option *indices*, not their text; `telegram_gateway` has no lookup back to the original poll's question/options, so this relies on the persona's own conversation history (the poll it sent, moments earlier) to make sense of which index means what.
+- **Else, added in a second pass while implementing `telegram_gateway`'s `delivery_failed` entry: `item.get("type") == "delivery_failed"` present** → `"[Your previous {attempted_type!r} reply failed to send - status_code={status_code}, reason: {reason}. Please try again, correcting the issue if possible.]"`. **Found to be a genuine, separate gap, not just a mechanical extension:** without this, a `delivery_failed`-only batch produced `combined_text = ""` - Claude would receive an empty prompt for its corrective-retry turn, with no idea what failed or why a retry was even happening. `telegram_gateway`'s own fix (keeping the `task_id`'s mapping alive for the retry) would have had nothing meaningful to actually retry without this half also landing.
+- `poll_timed_out` (a distinct payload, no `text`/`button_press`/`poll_answer`/`delivery_failed` field at all) still resolves to `""` - not handled by this function, explicitly out of scope, unchanged by either pass.
 
 ### Follow-up Work
 
-- Implement whichever scope (narrow/broad) is decided, in `_process_batch()`.
-- Coordinate directly with `telegram_gateway/CODE_TODO.md`'s button-press entry - that fix is incomplete without this one, regardless of which scope is chosen here.
-- Once implemented, retest both the `select_shoe` button flow and a plain poll end-to-end, since both are affected by the same gap.
+- None outstanding for `button_press`/`poll_answer`/`delivery_failed`. Media fields (`image_url`/`video_url`/`file_url`) remain a separate, explicitly out-of-scope, not-yet-tracked item (Open Question 3).
 
 ### Where
 
-- `bot_sanctuary_application/utilities/utils_session/session_worker.py::_process_batch()`.
-- Cross-reference: `telegram_gateway/CODE_TODO.md`'s "a validated button press produces no response when its `purpose` isn't `draft_continue`" entry (the change that surfaced this gap; that entry's own fix depends on this one).
+- `bot_sanctuary_application/utilities/utils_session/session_worker.py::_extract_item_text()`, `_process_batch()`.
+- Cross-reference: `telegram_gateway/CODE_TODO.md`'s button-press entry (resolved, same day) and its `delivery_failed` entry (resolved, same day - the `delivery_failed` branch above is this entry's counterpart to that fix).
