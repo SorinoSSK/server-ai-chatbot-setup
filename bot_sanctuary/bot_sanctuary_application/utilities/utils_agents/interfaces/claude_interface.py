@@ -5,47 +5,18 @@
 # Created On  : 2026-09-10
 #
 # Features    :
-#   - query_via_oauth() - sends a prompt to Claude, authenticated via a Claude Code OAuth token. Routed through claude_session_service.py's persistent per-generation platform whenever a session_dir is given; falls back to this module's own one-shot _run_query() otherwise.
-#   - query_via_api()   - sends a prompt to Claude, authenticated via an Anthropic API key. Always one-shot (_run_query()) - claude_session_service.py has no API-key equivalent.
-#   - initialise_claude()/terminate_claude() - starts/stops claude_session_service.py's persistent Claude session platform, called from agent_interface.py's own initialise_llm_services()/terminate_llm_services().
-#   - terminate_session(session_dir) - tears down every live, in-memory Claude client anchored anywhere under session_dir, called from agent_interface.py's own terminate_session().
+#   - query_via_oauth() - sends a prompt to Claude via an OAuth token, routing through the persistent session platform whenever a session_dir is given.
+#   - query_via_api() - sends a prompt to Claude via an Anthropic API key, always one-shot.
+#   - initialise_claude()/terminate_claude() - starts/stops claude_session_service.py's persistent Claude session platform.
+#   - terminate_session(session_dir) - tears down every live, in-memory Claude client anchored anywhere under session_dir.
 #
 # Notes       :
-#   - query_via_api() always uses this module's own one-shot claude_agent_sdk.query() call
-#     (_run_query()) - query_via_oauth() uses it only when called with no session_dir (e.g. the startup
-#     credential smoke test); otherwise it delegates to claude_session_service.py::query_via_service() instead.
-#     See query_via_oauth()'s own Notes for the behavioural differences this split creates (persona handling,
-#     the service's own startup dependency).
-#   - persona is parsed for an optional YAML frontmatter block (tools/model) plus a system prompt body, wired into ClaudeAgentOptions.
-#   - session_dir, if given, anchors Claude's own session continuity: this module remembers the SDK's own
-#     session_id in a small marker file inside session_dir (_read_resume_id()/_write_resume_id()) and passes it
-#     back as ClaudeAgentOptions' resume= on the next call - continue_conversation=True was tried first and
-#     confirmed, empirically, not to reliably resume a session across separate query() calls (matches known
-#     upstream reports - see github.com/anthropics/claude-agent-sdk-python issues #10/#555/#848). See
-#     _run_query()'s own Notes for detail.
+#   - Claude's credential is resolved once at startup by initialise_claude(), not per call.
+#   - query_via_oauth()/query_via_api() take no token argument, unlike every other provider's own equivalent.
+#   - persona is parsed for an optional YAML frontmatter block (tools/model) plus a system prompt body.
+#   - Session continuity uses an explicit resume=<session_id> marker file, since continue_conversation was found empirically unreliable across separate calls.
 #   - See agent_interface.py for the provider-agnostic dispatch that selects this module.
-#   - initialise_claude()/terminate_claude() read settings.LLM_CLAUDE_ACCESS_TYPE/settings.LLM_CLAUDE_TOKEN
-#     directly rather than taking either as a parameter, per explicit instruction - it is this module, not
-#     agent_interface.py, that decides how Claude is configured. This is why this module imports settings
-#     directly - query_via_oauth()/query_via_api() no longer need any credential argument at all (see below),
-#     so settings is read only by these two functions.
-#   - Credential bridging (CLAUDE_CODE_OAUTH_TOKEN/ANTHROPIC_API_KEY) now happens exactly once, inside
-#     initialise_claude(), at startup - per explicit instruction ("run once on startup... and never be called
-#     again"). query_via_oauth()/query_via_api() no longer bridge their own credential into os.environ on every
-#     call - see their own Notes for the accepted consequence this creates (a call-time dependency on
-#     initialise_claude() having already run).
-#   - query_via_oauth()/query_via_api() no longer take a token parameter at all, per explicit instruction
-#     ("clean up unused token parameter") - since neither function's own body ever read it once the bridging
-#     above moved out to initialise_claude(), it was dead, not merely unused-for-parity. This makes this
-#     module's own two functions the one deviation from the otherwise-uniform four-provider
-#     query_via_oauth(prompt, token, persona, session_dir)/query_via_api(...) signature every other
-#     <provider>_interface.py still uses - agent_interface.py::query_llm() calls this module specifically
-#     without a token argument as a result. See that module's own Notes for how it accommodates this.
-#   - ToolUseBlock/ToolResultBlock content is now logged (name/input, and tool_use_id/is_error/content
-#     respectively) wherever an AssistantMessage's blocks are inspected - added specifically to get direct,
-#     per-turn evidence of whether a tool (e.g. WebSearch) was actually invoked and what it returned, rather
-#     than relying on the model's own self-report of what it does/doesn't have access to. Diagnostic only -
-#     neither block type is fed into the returned reply string, which stays text-only.
+#   - See README.md for the full credential-resolution and session-continuity design rationale.
 #
 # =============================================================================
 # I M P O R T   H E A D E R
@@ -123,17 +94,14 @@ def _read_resume_id(session_dir: Path | None) -> str | None:
 
     Args:
         session_dir (Path | None):
-            The working-directory anchor to check - typically a SessionWorker's own session_dir. None if this
-            call has no session_dir at all (e.g. the startup credential smoke test).
+            The working-directory anchor to check. None if this call has no session_dir at all.
 
     Returns:
         str | None:
-            The remembered session_id, or None if session_dir is None, no marker file exists yet (this
-            generation's very first call), or the file is empty.
+            The remembered session_id, or None if unavailable.
 
     Notes:
-        - Never raises - a missing/unreadable marker file is treated the same as "nothing to resume from" (this
-          generation's first call), not an error.
+        - Never raises - a missing/unreadable marker file is treated as nothing to resume from.
     """
     if session_dir is None:
         return None
@@ -149,25 +117,21 @@ def _read_resume_id(session_dir: Path | None) -> str | None:
 
 def _write_resume_id(session_dir: Path | None, session_id: str | None) -> None:
     """
-    Remembers session_id as session_dir's own latest Claude session, for a future call in this generation to
-    resume from.
+    Remembers session_id as session_dir's own latest Claude session, for a future call to resume from.
 
     Args:
         session_dir (Path | None):
-            The working-directory anchor to write into. A no-op if None (nothing to anchor the marker to).
+            The working-directory anchor to write into. A no-op if None.
 
         session_id (str | None):
-            The session_id captured from this call's own ResultMessage. A no-op if None/empty - leaves whatever
-            was previously remembered untouched, rather than overwriting it with nothing.
+            The session_id captured from this call's own ResultMessage. A no-op if None/empty.
 
     Returns:
         None
 
     Notes:
-        - Only ever called after a confirmed-successful call (see _run_query()) - a failed call leaves the
-          previously-remembered session_id in place, so the next call still has something valid to resume from.
-        - Best-effort - a write failure is logged but non-fatal, matching this codebase's own on-disk cleanup
-          convention (e.g. utils_session/session_worker.py::clear_session_directory()).
+        - Only called after a confirmed-successful call, so a failed call leaves the prior session_id in place.
+        - Best-effort - a write failure is logged but non-fatal.
     """
     if session_dir is None or not session_id:
         return
@@ -179,7 +143,9 @@ def _write_resume_id(session_dir: Path | None, session_id: str | None) -> None:
 
 def _find_transcript(session_id: str) -> Path | None:
     """
-    Searches ~/.claude/projects/ for session_id's own transcript file - diagnostic only, decides nothing.
+    Searches ~/.claude/projects/ for session_id's own transcript file.
+
+    Diagnostic only - used to confirm whether a resumed session_id genuinely exists on disk.
 
     Args:
         session_id (str):
@@ -187,16 +153,10 @@ def _find_transcript(session_id: str) -> Path | None:
 
     Returns:
         Path | None:
-            The matching <session_id>.jsonl file, if found anywhere under ~/.claude/projects/; otherwise None.
+            The matching <session_id>.jsonl file, if found; otherwise None.
 
     Notes:
-        - Added purely to get direct evidence on a resume=<session_id> failure ("No conversation found") -
-          whether the transcript genuinely isn't on disk yet (a timing race), or is present somewhere Claude
-          itself isn't finding it (a session_dir/lookup mismatch) - rather than guessing from third-party bug
-          reports.
-        - A plain recursive filename search, not dependent on Claude's own undocumented project-directory
-          encoding scheme - only the leaf filename (<session_id>.jsonl) is assumed stable.
-        - Never raises - a missing/inaccessible ~/.claude/projects/ is treated the same as "not found".
+        - Never raises - a missing/inaccessible directory is treated the same as "not found".
     """
     projects_root = Path("~/.claude/projects").expanduser()
     if not projects_root.is_dir():
@@ -220,8 +180,7 @@ async def _run_query(prompt: str, persona: str | None = None, session_dir: Path 
             Optional persona/system prompt for this call, parsed via _parse_persona().
 
         session_dir (Path | None):
-            Optional working-directory anchor for this call, typically a SessionWorker's own session_dir. When
-            given, also drives Claude's own session continuity - see Notes below.
+            Optional working-directory anchor for this call. When given, also drives Claude's own session continuity via a resume marker file.
 
     Returns:
         str | None:
@@ -229,27 +188,8 @@ async def _run_query(prompt: str, persona: str | None = None, session_dir: Path 
 
     Notes:
         - Credential resolution is env-var driven - callers set the relevant env var before calling this.
-        - Session continuity is resume-based, not continue_conversation-based. continue_conversation=True was
-          tried first (on the assumption that a stable session_dir alone would let the SDK find and resume its
-          most recent session there) and confirmed, empirically, not to work - diagnostic logging showed a
-          brand-new session_id and num_turns=1 on every single call despite an identical session_dir across all
-          of them, matching known upstream reports (github.com/anthropics/claude-agent-sdk-python issues
-          #10/#555/#848). The documented, working mechanism instead is: capture session_id from a call's own
-          ResultMessage, then pass it back explicitly as resume= on the next call - which is what this function
-          now does via _read_resume_id()/_write_resume_id(), using a small marker file colocated with
-          session_dir.
-        - Only ever reads/writes that marker file when session_dir is given - a call with no session_dir (e.g.
-          the startup credential smoke test) behaves exactly as before, no resume attempted, no marker file
-          involved.
-        - Each SessionWorker generation gets its own never-before-used session_dir (see session_worker.py's own
-          Notes on why), so this marker file is likewise generation-scoped - a session_cleared/global reset
-          wipes it along with the rest of that generation's directory (see clear_session_directory()), and the
-          next generation starts with no marker file, correctly starting Claude fresh rather than resuming a
-          conversation that was supposed to be cleared.
-        - ToolUseBlock/ToolResultBlock are logged too, not just collected/discarded like every other
-          non-TextBlock content - same diagnostic addition as claude_session_service.py::_run_turn(), for
-          parity between this one-shot path and that persistent one. Purely diagnostic - neither is fed into
-          the returned reply string, which remains text-only, unchanged.
+        - Session continuity is resume-based: this call's session_id is captured and reused on the next call for the same session_dir.
+        - ToolUseBlock/ToolResultBlock content is logged for diagnostic purposes only.
     """
     resume_id = _read_resume_id(session_dir)
     if session_dir is not None:
@@ -312,51 +252,16 @@ async def query_via_oauth(prompt: str, persona: str | None = None, session_dir: 
             Optional persona/system prompt for this call.
 
         session_dir (Path | None):
-            Optional working-directory anchor for this call - see _run_query()'s own Notes for what it does.
-            Also decides which of the two underlying paths this call actually takes - see Notes below.
+            Optional working-directory anchor for this call - also decides which of the two underlying paths this call takes.
 
     Returns:
         str | None:
             The assistant's text reply, or None on failure.
 
     Notes:
-        - Takes no token argument - unlike codex_interface.py/deepseek_interface.py/qwen_interface.py's own
-          query_via_oauth(), which still bridge their own credential per call. Claude's credential is resolved
-          exactly once, at startup, inside initialise_claude() - CLAUDE_CODE_OAUTH_TOKEN is already set (or not)
-          in os.environ by the time this function ever runs, and this function has no per-call use for it
-          anyway (see the next Note). A direct consequence: this function depends on initialise_claude() having
-          already run and having actually selected OAuth - calling it beforehand, or with Claude configured for
-          a different access type, sends an unauthenticated request rather than one authenticated per call.
-          agent_interface.py::query_llm() calls this function's own signature specifically (no token argument),
-          not the uniform four-provider call it uses for codex/deepseek/qwen - see its own Notes.
-        - Routes through claude_session_service.py's persistent per-generation platform (query_via_service())
-          whenever session_dir is given, rather than this module's own one-shot _run_query() - a genuinely
-          continued conversation on one long-lived ClaudeSDKClient per session_dir, reused turn to turn, rather
-          than a fresh connection and a resume=<session_id> marker file on every call. Falls back to
-          _run_query() only when session_dir is None (today, only agent_interface.py's own startup credential
-          smoke test calls this with no session_dir at all).
-        - persona is silently unused on the query_via_service() path - that platform loads its own
-          persona/tools/model itself, from libraries/claude/chat.json via its own _parse_agent(), never from
-          whatever this function was called with. This is a real behavioural divergence from the _run_query()
-          fallback path (which does honour persona, parsed via _parse_persona() from libraries/claude/chat.md) -
-          flagged explicitly rather than silently absorbed: a caller passing a persona now only sees it take
-          effect when session_dir is None.
-        - claude_session_service.py's own persona file is hardcoded to the Chat Call specifically
-          (_LLM_TYPE="claude", filename "chat.json") - not a problem in practice today since Chat is the only
-          Call actually reachable (see call_dispatch_handler.py's own Phase 3/4 history in CODE_TODO.md), but a
-          real, pre-existing constraint this routing now makes load-bearing rather than latent, should
-          Architect/Coder/Review/Documentation ever also resolve to llm_type="claude"+access_type="OAUTH" with
-          a session_dir of their own.
-        - query_via_service() is itself a blocking, synchronous call (it blocks its own calling thread for a
-          reply, up to settings.AGENT_QUERY_TIMEOUT_SECONDS) - called directly here, not awaited, since it is
-          not itself a coroutine. Consistent with this codebase's existing blocking-call convention elsewhere
-          (this function's own caller already runs one turn at a time on one SessionWorker's dedicated thread -
-          see session_worker.py), not a new concurrency risk introduced by this change.
-        - Requires claude_session_service.py's own background thread/loop to already be running
-          (start_claude_session_service(), called from initialise_claude() when OAuth is selected) - if that
-          service was never started (e.g. initialise_llm_services() not yet wired into initialise.py - see
-          CODE_TODO.md), every call on this path returns None immediately (logged as an error by
-          query_via_service() itself) rather than silently falling back to _run_query().
+        - Takes no token argument - Claude's credential is resolved once at startup by initialise_claude().
+        - Routes through claude_session_service.py's persistent platform whenever session_dir is given, falling back to this module's own one-shot _run_query() otherwise.
+        - persona is ignored on the persistent-platform path, which loads its own persona from its own library file - see README.md.
     """
     if session_dir is not None:
         return query_via_service(session_dir, prompt)
@@ -382,23 +287,15 @@ async def query_via_api(prompt: str, persona: str | None = None, session_dir: Pa
             The assistant's text reply, or None on failure.
 
     Notes:
-        - Takes no token argument - unlike codex_interface.py/deepseek_interface.py/qwen_interface.py's own
-          query_via_api(), which still bridge their own credential per call. Claude's credential is resolved
-          exactly once, at startup, inside initialise_claude() - ANTHROPIC_API_KEY is already set (or not) in
-          os.environ by the time this function ever runs. A direct consequence: this function depends on
-          initialise_claude() having already run and having actually selected API - calling it beforehand, or
-          with Claude configured for a different access type, sends an unauthenticated request rather than one
-          authenticated per call. agent_interface.py::query_llm() calls this function's own signature
-          specifically (no token argument), not the uniform four-provider call it uses for codex/deepseek/qwen
-          - see its own Notes.
+        - Takes no token argument - Claude's credential is resolved once at startup by initialise_claude().
     """
     return await _run_query(prompt, persona, session_dir)
 
 def initialise_claude() -> None:
     """
-    Resolves Claude's configured access type exactly once, at startup, bridges its credential into whichever
-    environment variable claude_agent_sdk actually reads, and starts claude_session_service.py's persistent
-    Claude session platform if - and only if - that resolved access type is OAuth.
+    Resolves Claude's configured access type once at startup and bridges its credential accordingly.
+
+    Starts claude_session_service.py's persistent Claude session platform if the resolved access type is OAuth.
 
     Args:
         None
@@ -407,31 +304,8 @@ def initialise_claude() -> None:
         None
 
     Notes:
-        - Reads settings.LLM_CLAUDE_ACCESS_TYPE/settings.LLM_CLAUDE_TOKEN directly rather than taking either as
-          a parameter, per explicit instruction - this module is the one that decides how Claude is configured,
-          rather than a caller (agent_interface.py) resolving that decision and handing this function the
-          result. See this module's own header Notes for why this deliberately departs from
-          query_via_oauth()/query_via_api()'s explicit-argument convention.
-        - Runs once, at startup, per explicit instruction ("begin the implementation to run once on startup") -
-          this is now the *only* place either CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY is ever set for
-          Claude; query_via_oauth()/query_via_api() no longer bridge anything themselves (see their own Notes).
-          A direct, accepted consequence: both of those now depend on this function having already run with
-          the same access type still in effect - not yet addressed here, since wiring this into initialise.py's
-          own startup ordering (ahead of test_llm_tokens()'s smoke test, specifically) is deferred until
-          initialise_llm_services() itself is actually wired in.
-        - Logs the resolved access type either way, per explicit instruction ("log selection choice") - an
-          operator can tell from the logs alone which of the three outcomes below this startup run resolved
-          to, rather than only seeing evidence of the two "something happened" branches.
-        - Three outcomes, one branch each:
-            - LLM_CLAUDE_ACCESS_TYPE == "OAUTH" and LLM_CLAUDE_TOKEN configured - bridges
-              CLAUDE_CODE_OAUTH_TOKEN, then starts claude_session_service.py's persistent platform (unchanged
-              from the existing OAuth-only gate on that platform).
-            - LLM_CLAUDE_ACCESS_TYPE == "API" and LLM_CLAUDE_TOKEN configured - bridges ANTHROPIC_API_KEY only;
-              there is no persistent platform for this access type, so this bridge exists purely for
-              query_via_api()'s own one-shot claude_agent_sdk.query() calls.
-            - Anything else (access type unset/unrecognised, or its own token missing) - per explicit
-              instruction ("if none, assume unknown decision, log it and do nothing") - logged as an
-              unresolved/unknown configuration decision; no environment mutation, no service start.
+        - Reads settings.LLM_CLAUDE_ACCESS_TYPE/settings.LLM_CLAUDE_TOKEN directly, per this module's own convention.
+        - Logs the resolved access type, or an unrecognised/unconfigured decision, either way.
     """
     access_type = settings.LLM_CLAUDE_ACCESS_TYPE.strip().upper()
 
@@ -460,40 +334,24 @@ def terminate_claude() -> None:
         None
 
     Notes:
-        - Safe to call unconditionally, even if initialise_claude() never started the service (Claude
-          configured for API access instead of OAuth, or not configured at all) -
-          stop_claude_session_service() is already its own no-op in that case.
-        - Called from agent_interface.py::terminate_llm_services() - not intended to be called directly by
-          any other caller, though nothing in this function's own signature prevents it.
+        - Safe to call unconditionally, even if the service was never started.
     """
     stop_claude_session_service()
 
 def terminate_session(session_dir: Path) -> None:
     """
-    Tears down every live, in-memory Claude client anchored anywhere under session_dir - thin delegate onto
-    claude_session_service.py::destroy_sessions_under().
+    Tears down every live, in-memory Claude client anchored anywhere under session_dir.
 
     Args:
         session_dir (Path):
-            The Call/LLM-scoped leaf directory (e.g. .../chat/claude), or a session root covering several such
-            leaves (e.g. .../<session_id>, once more than one Call/LLM combination has been used for the same
-            session), whose live client(s) should be destroyed.
+            The Call/LLM-scoped leaf directory, or a session root covering several such leaves, whose live client(s) should be destroyed.
 
     Returns:
         None
 
     Notes:
-        - Called from agent_interface.py::terminate_session() - the provider-agnostic hook
-          utils_session/session_worker.py::clear_session_directory() calls whenever a session's on-disk
-          directory is cleared (the startup sweep, a per-chat session_cleared confirmation, or a global session
-          reset), so this service's own in-memory memory of every conversation under session_dir is destroyed
-          at the same moment as the on-disk state, rather than left to leak until process exit.
-        - Root-scoped, not a single exact-key match - destroy_sessions_under() matches every registry entry
-          equal to or nested under session_dir, since one session_id's root can now own more than one live
-          client at once (one per Call/LLM combination actually used).
-        - A no-op (logged at debug, inside destroy_sessions_under() itself) if the service isn't running at
-          all, or if nothing under session_dir has a live client - safe to call unconditionally, same
-          convention as terminate_claude() above.
+        - Root-scoped - matches every registry entry equal to or nested under session_dir.
+        - A no-op if the service isn't running, or nothing under session_dir has a live client.
     """
     destroy_sessions_under(session_dir)
 

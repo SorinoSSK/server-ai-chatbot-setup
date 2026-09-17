@@ -8,10 +8,9 @@
 #   - Sends text, typing action, polls (and closes them), and photo/video/document/album to a Telegram chat.
 #
 # Notes       :
-#   - send_message/send_poll/stop_poll/send_document/send_photo/send_video/send_media_group all retry up to TELEGRAM_SEND_MAX_ATTEMPTS times (TELEGRAM_SEND_RETRY_DELAY apart) on connection failures/timeouts only; other failures are not retried.
-#   - On a rejected (non-retried) request, send_message/send_poll/send_photo/send_video/send_document/send_media_group return a {"error": True, "status_code", "reason"} dict instead of False/None (except a 401/404, which is Tier 2 - see below) - callers use this to report a Tier 1 delivery_failed event (see utils_queue/error_handling.py) so the backend can retry the same task differently.
-#     stop_poll/send_typing_action don't - see their own docstrings.
-#   - A connection-exhausted failure, or a 401/404 (see _config_failure_reason()), is reported to utils_queue/error_handling.py as a Tier 2 signal (record_send_failure()) regardless of which function it came from - a successful send re-arms it (record_send_success(response.status_code)), which itself may push a gateway_recover event - see error_handling.py.
+#   - Every send function retries up to TELEGRAM_SEND_MAX_ATTEMPTS times (TELEGRAM_SEND_RETRY_DELAY apart) on connection failures/timeouts only; other failures are not retried.
+#   - On a rejected (non-retried) request, most functions return a {"error": True, "status_code", "reason"} dict instead of False/None, so callers can report a Tier 1 delivery_failed event - see utils_queue/error_handling.py. stop_poll()/send_typing_action() don't - see their own docstrings.
+#   - A connection-exhausted failure, or a 401/404, is reported to error_handling.py as a Tier 2 signal regardless of which function it came from - a successful send re-arms it, which may itself push a gateway_recover event.
 #
 # =============================================================================
 # I M P O R T   H E A D E R

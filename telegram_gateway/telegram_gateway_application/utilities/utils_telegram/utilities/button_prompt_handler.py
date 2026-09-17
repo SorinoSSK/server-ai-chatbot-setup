@@ -67,10 +67,7 @@ def register_bot_button(text: str, purpose: str, chat_id: int, task_id: str | No
             Chat the button is sent to - a press is only valid from the same chat.
 
         task_id (str | None, optional):
-            The task_id the buttoned message was published against - read back from
-            validate_bot_callback() so a press can be routed back onto that same task_id, mirroring
-            poll_response_handler.py::_push_poll_answer()'s existing task_id-reuse pattern for polls.
-            None for a purpose that is never routed back to a task at all. Defaults to None.
+            The task_id the buttoned message was published against - read back from validate_bot_callback() so a press can be routed back onto that same task_id. None for a purpose that is never routed back to a task at all. Defaults to None.
 
         payload (dict | None, optional):
             Caller-defined context retrieved alongside the press.

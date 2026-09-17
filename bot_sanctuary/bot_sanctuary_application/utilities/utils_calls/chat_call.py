@@ -9,16 +9,10 @@
 #
 # Notes       :
 #   - Conversation/routing only - has no filesystem or code tool access, unlike Architect/Coder/Review/Documentation.
-#   - Which reply tool to use (text/poll/image/...), or whether to hand off via target_call, is decided entirely
-#     by the LLM itself - agent_tools.build_tool_prompt() appends the available formats to prompt. This file
-#     never parses/inspects/validates/retries the LLM's raw reply itself - utils_calls/call_dispatch_handler.py's
-#     own message_dissect() owns all of that now (including correcting an invalid reply via a retry, queued
-#     back to this same Call) - same shape every other <name>_call.py already uses.
-#   - Persona content is loaded per provider from libraries/<llm_type>/chat.md - for Claude specifically, this
-#     is only actually used on agent_interface.py's one-shot fallback path (session_dir is None); every real
-#     turn (session_dir given) routes through claude_session_service.py's persistent platform instead, which
-#     loads its own persona from libraries/claude/chat.json, ignoring whatever this function passes as persona
-#     entirely. See claude_interface.py::query_via_oauth()'s own Notes for the full detail.
+#   - Which reply tool to use, or whether to hand off via target_call, is decided entirely by the LLM itself.
+#   - This file never parses/validates/retries the LLM's raw reply - call_dispatch_handler.py owns all of that.
+#   - Persona content is loaded per provider from libraries/<llm_type>/chat.md.
+#   - See README.md for how this interacts with Claude's own persistent-platform persona.
 #
 # =============================================================================
 # I M P O R T   H E A D E R
@@ -49,32 +43,17 @@ async def handle(prompt: str, session_dir: Path) -> str | None:
             The prompt/context for this turn.
 
         session_dir (Path):
-            This session's own on-disk root directory (SessionWorker.session_dir, i.e. SESSION_DIR/<session_id>)
-            - not yet a leaf anchor itself. This function derives its own Call/LLM-scoped leaf directory
-            (session_dir/CALL_NAME/<llm_type>) before passing it on to query_llm() - see Notes below for why.
+            This session's own on-disk root directory - this function derives its own Call/LLM-scoped leaf directory before passing it on to query_llm().
 
     Returns:
         str | None:
-            The LLM's raw reply, unparsed - expected to be one of agent_tools.py's TOOLS formats, or a
-            {"target_call": ..., "message": ...} call pass (see agent_tools.build_tool_prompt()), interpreted
-            entirely by utils_calls/call_dispatch_handler.py::message_dissect(), not by this function.
+            The LLM's raw reply, unparsed, interpreted by call_dispatch_handler.py::message_dissect().
             None if LLM_CHAT_TYPE is unset or the underlying call failed.
 
     Notes:
-        - The LLM decides the tool (or handoff), not this function - agent_tools.build_tool_prompt() appends
-          the available tools/formats to prompt. Whatever the LLM sends back is returned as-is, unexamined.
-        - Persona content is loaded fresh on every call, so an LLM_CHAT_TYPE change takes effect immediately.
-        - Leaf directory is session_dir/CALL_NAME/<llm_type> (e.g. .../chat/claude), created here
-          (mkdir(parents=True, exist_ok=True)) rather than by SessionWorker itself - the session root alone is
-          no longer a valid anchor once more than one Call and/or more than one LLM provider can be reused for
-          the same session_id (e.g. Architect and Coder both resolving to Claude would otherwise collide on one
-          shared cwd/persistent-client key - see claude_session_service.py). Every <call>_call.py that ever
-          consumes session_dir is expected to derive its own leaf the same way, keyed by its own CALL_NAME and
-          resolved llm_type - this is the one Call actually doing so today (see CODE_TODO.md).
-        - The derived leaf is forwarded regardless of which provider LLM_CHAT_TYPE names - only
-          claude_interface.py currently does anything with it (routes to claude_session_service.py's
-          persistent, per-leaf ClaudeSDKClient platform for OAuth access, or its own resume=<session_id>
-          marker-file mechanism for API access). codex/deepseek/qwen accept and ignore it today.
+        - The LLM decides the tool (or handoff), not this function.
+        - Persona content is loaded fresh on every call, so a configuration change takes effect immediately.
+        - See README.md for how the derived leaf directory anchors provider-side session continuity.
     """
     if not settings.LLM_CHAT_TYPE:
         logger.warning(f"{CALL_NAME} Call has no LLM_CHAT_TYPE configured - skipping.")

@@ -146,9 +146,7 @@ def _stop_draft_loop(chat_id: int) -> None:
         None
 
     Notes:
-        - The control dict's own action/event fields are mutated under _lock too, not just
-          _active_drafts membership - keeps this in sync with continue_draft_timer()/
-          _consume_continue(), which mutate the same shared fields from other threads.
+        - Mutates the control dict's own action/event fields under _lock too, not just _active_drafts membership - see module Notes.
     """
     with _lock:
         control = _active_drafts.pop(chat_id, None)
@@ -161,9 +159,7 @@ def _stop_draft_loop(chat_id: int) -> None:
 
 def continue_draft_timer(chat_id: int) -> bool:
     """
-    Signals an active draft's loop that a continue press was received, in response to a button
-    press - this is what allows the draft to reach its next scheduled cycle instead of closing at
-    the end of the one currently in progress.
+    Signals an active draft's loop that a continue press was received, allowing it to reach its next scheduled cycle instead of closing at the end of the one currently in progress.
 
     Args:
         chat_id (int)
@@ -173,12 +169,8 @@ def continue_draft_timer(chat_id: int) -> bool:
             True if a draft timer was active for chat_id and was signalled; otherwise False.
 
     Notes:
-        - Does not shorten the cycle currently in progress (see _draft_loop()) - its own remaining
-          wait still plays out in full; this only decides whether the loop is allowed to advance
-          once that wait ends, rather than closing the draft.
-        - The control dict's own action/event fields are mutated under _lock too, not just
-          _active_drafts membership - keeps this in sync with _stop_draft_loop()/
-          _consume_continue(), which mutate the same shared fields from other threads.
+        - Does not shorten the cycle currently in progress (see _draft_loop()) - its own remaining wait still plays out in full.
+        - Mutates the control dict's own action/event fields under _lock too, not just _active_drafts membership - see module Notes.
     """
     with _lock:
         control = _active_drafts.get(chat_id)
@@ -231,8 +223,7 @@ def _consume_continue(control: dict, is_final_cycle: bool) -> bool:
             True if a valid "continue" signal was consumed (event cleared, action reset); otherwise False, leaving control untouched.
 
     Notes:
-        - Mutates control's action/event fields under _lock, same as _stop_draft_loop()/
-          continue_draft_timer() (see module Notes above).
+        - Mutates control's action/event fields under _lock, same as _stop_draft_loop()/continue_draft_timer() - see module Notes.
     """
     with _lock:
         if control["action"] == "continue" and not is_final_cycle:

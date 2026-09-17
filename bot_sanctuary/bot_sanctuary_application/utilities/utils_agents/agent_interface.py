@@ -12,22 +12,12 @@
 #   - terminate_session(session_dir) - provider-agnostic teardown of a live, in-memory LLM session anchored to a specific session_dir, for whichever providers have such a concept (today, only Claude, via claude_interface.py's own terminate_session()).
 #
 # Notes       :
-#   - More than one provider can be configured and used at once - callers pass llm_type explicitly rather than reading a single global setting.
+#   - More than one provider can be configured and used at once - callers pass llm_type explicitly.
 #   - Add a matching <provider>_interface.py and a branch in _resolve_provider() to support a further provider.
 #   - persona is passed through to the resolved provider's own native mechanism, never concatenated into prompt.
-#   - query_llm() special-cases llm_type == "claude" to omit the token argument (claude_interface.py's own
-#     query_via_oauth()/query_via_api() no longer take one - see that module's own header Notes) - codex/
-#     deepseek/qwen are still called with the original, uniform four-argument signature. This is the one
-#     provider-specific branch in this otherwise provider-agnostic dispatch, added deliberately per explicit
-#     instruction to remove that now-dead parameter from claude_interface.py itself.
-#   - initialise_llm_services()/terminate_llm_services() are deliberately not Claude-specific, even though
-#     Claude is the only provider with an always-on platform (claude_session_service.py) to start/stop today -
-#     each simply delegates to whichever provider module(s) expose their own initialise_<provider>()/
-#     terminate_<provider>() pair (today, only claude_interface.py does), rather than deciding any
-#     provider-specific precondition/credential-bridging logic itself. A future provider's own equivalent
-#     would add its own such pair to its own <provider>_interface.py and a further call here, rather than this
-#     module growing new provider-specific branches of its own. Distinct from query_llm()'s own one-shot
-#     <provider>_interface.py path, which needs no start/stop step at all for any provider.
+#   - Claude is called with no token argument, since its credential is resolved once at startup rather than per call - see claude_interface.py.
+#   - initialise_llm_services()/terminate_llm_services() are provider-agnostic - each delegates to whichever provider module exposes its own initialise_<provider>()/terminate_<provider>() pair.
+#   - See README.md for the full provider dispatch and credential-handling design rationale.
 #
 # =============================================================================
 # I M P O R T   H E A D E R
@@ -113,22 +103,14 @@ async def query_llm(llm_type: str, prompt: str, persona: str | None = None, sess
             Optional persona/agent-context content for this call, typically the result of a prior load_persona() call.
 
         session_dir (Path | None):
-            Optional working-directory anchor for this call, typically a SessionWorker's own session_dir. Passed
-            through uniformly to every provider's query_via_oauth()/query_via_api(), same as persona - today only
-            claude_interface.py actually uses it (session_dir + claude_session_service.py's own persistent
-            platform, for Claude's own session_dir-keyed continuity); codex/deepseek/qwen accept and ignore it.
+            Optional working-directory anchor for this call. Only claude_interface.py currently does anything with it; codex/deepseek/qwen accept and ignore it.
 
     Returns:
         str | None:
             The assistant's text reply, or None if llm_type/its access type is invalid, or the call failed.
 
     Notes:
-        - claude_interface.py's own query_via_oauth()/query_via_api() take no token argument, unlike the other
-          three providers - Claude's credential is resolved once at startup (claude_interface.py's own
-          initialise_claude()), not per call, so there is nothing left for a per-call token to do (see that
-          module's own header Notes). This function special-cases llm_type == "claude" below rather than
-          calling all four providers with an identical signature, which is the one deliberate exception to
-          this module's otherwise-uniform four-provider dispatch.
+        - Claude is called with no token argument, since its credential is resolved once at startup rather than per call - see claude_interface.py.
     """
     resolved = _resolve_provider(llm_type)
     if resolved is None:
@@ -198,21 +180,9 @@ def initialise_llm_services() -> None:
         None
 
     Notes:
-        - Provider-agnostic entry point, per explicit instruction ("whatever agent_interface hold should be
-          for all LLM") - this function itself decides nothing provider-specific; it only delegates to
-          whichever provider module(s) expose their own initialise_<provider>() to call. A future provider's
-          own always-on platform would add its own initialise_<provider>() to its own <provider>_interface.py
-          and a further call here, rather than this module growing new provider-specific logic of its own.
-        - Claude: delegates to claude_interface.initialise_claude(), which decides for itself whether Claude's
-          own claude_session_service.py platform should actually start (gated on OAuth access - see that
-          function's own docstring for the precondition/credential-bridging detail, both of which live in
-          claude_interface.py, not here).
-        - Codex/DeepSeek/Qwen have no equivalent always-on platform/initialise_<provider>() today - nothing
-          further runs for them yet.
-        - Safe to call unconditionally at startup regardless of LLM_CHAT_TYPE/LLM_ARCHITECT_TYPE/etc. - a
-          provider mix that never actually names "claude" simply leaves Claude's own service
-          started-but-unused (an idle background thread with an empty client registry), not a resource leak
-          worth guarding against specially.
+        - Provider-agnostic - delegates to whichever provider module exposes its own initialise_<provider>().
+        - Today, only Claude has an always-on service (claude_session_service.py), gated on OAuth access.
+        - Safe to call unconditionally at startup, regardless of which providers are actually configured.
     """
     claude_interface.initialise_claude()
 
@@ -227,46 +197,25 @@ def terminate_llm_services() -> None:
         None
 
     Notes:
-        - Provider-agnostic entry point, same rationale as initialise_llm_services() above - delegates to
-          whichever provider module(s) expose their own terminate_<provider>(), rather than deciding anything
-          provider-specific itself.
-        - Claude: delegates to claude_interface.terminate_claude(). Safe to call unconditionally, even if
-          initialise_llm_services() never actually started Claude's own service (configured for API access
-          instead of OAuth, or not configured at all) - terminate_claude() is already its own no-op in that
-          case.
-        - Codex/DeepSeek/Qwen have no equivalent always-on platform/terminate_<provider>() today - nothing
-          further runs for them yet.
+        - Provider-agnostic - delegates to whichever provider module exposes its own terminate_<provider>().
+        - Safe to call unconditionally, even if no provider's service was ever started.
     """
     claude_interface.terminate_claude()
 
 def terminate_session(session_dir: Path) -> None:
     """
-    Terminates any live, in-memory LLM session anchored to session_dir, for whichever provider(s) actually have
-    such a concept.
+    Terminates any live, in-memory LLM session anchored to session_dir, for providers that have one.
 
     Args:
         session_dir (Path):
-            The Call/LLM-scoped leaf directory (or a session root covering several such leaves) whose live
-            session(s), if any, should be torn down - typically utils_session/session_worker.py's own
-            session_dir, passed here from clear_session_directory() at the same moment its on-disk state is
-            removed.
+            The Call/LLM-scoped leaf directory, or a session root covering several such leaves, whose live session(s), if any, should be torn down.
 
     Returns:
         None
 
     Notes:
-        - Provider-agnostic entry point, same rationale as initialise_llm_services()/terminate_llm_services()
-          above - delegates to whichever provider module(s) expose their own terminate_session(), rather than
-          deciding anything provider-specific itself. A future provider's own persistent-session concept would
-          add its own terminate_session() to its own <provider>_interface.py and a further call here, rather
-          than this module growing new provider-specific logic of its own.
-        - Claude: delegates to claude_interface.terminate_session(session_dir), which tears down every live
-          claude_session_service.py client anchored anywhere under session_dir (see that module's own
-          destroy_sessions_under()) - safe to call unconditionally even if session_dir never had a live Claude
-          session at all, or if Claude's own always-on platform was never started (API access, or Claude not
-          configured) - both degrade to a harmless no-op internally.
-        - Codex/DeepSeek/Qwen have no equivalent persistent-session concept today - nothing further runs for
-          them yet.
+        - Provider-agnostic - delegates to whichever provider module exposes its own terminate_session().
+        - Today, only Claude has a persistent-session concept to terminate.
     """
     claude_interface.terminate_session(session_dir)
 

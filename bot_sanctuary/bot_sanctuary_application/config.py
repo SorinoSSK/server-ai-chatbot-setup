@@ -28,26 +28,20 @@ class AgentPersona:
     """
     One agent's fully-parsed configuration, loaded from its own libraries/<llm_type>/<call_name>.json file.
 
-    Kept here, not inside any single provider's own interface/service file, since this same shape is meant to
-    be valid and reusable across every LLM provider (Claude, Codex, DeepSeek, Qwen) - not a Claude-specific
-    return type. Equality is field-by-field (the default dataclass behaviour), which is what lets a caller
-    detect "has this Call's agent definition changed since I last built something from it" with a plain !=.
+    Shared across every LLM provider rather than defined per-provider, so a caller can detect a changed agent definition with a plain equality check.
 
     Attributes:
         body (str):
-            The fully-resolved system prompt text - any {{BOT_NAME}} placeholder already substituted for
-            settings.TELEGRAM_BOT_NAME, ready to hand to whichever provider's own "system prompt" mechanism.
+            The fully-resolved system prompt text, ready to hand to a provider's own "system prompt" mechanism.
 
         tools (list[str] | None):
-            The agent definition's own declared tool list, if it declared one. None if absent/empty.
+            The agent definition's own declared tool list, if any.
 
         model (str | None):
-            The agent definition's own declared model name, if it declared one. None if absent.
+            The agent definition's own declared model name, if any.
 
         persona (dict):
-            The raw, unprocessed parsed JSON object the other three fields were derived from - kept so a field
-            not yet formalised above (e.g. "name"/"description"), or a future provider-specific need, doesn't
-            require changing this shared class again.
+            The raw parsed JSON object the other fields were derived from.
     """
     body: str
     tools: "list[str] | None"

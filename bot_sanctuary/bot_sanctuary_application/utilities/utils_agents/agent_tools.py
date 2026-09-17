@@ -10,14 +10,10 @@
 #   - execute_completed() - publishes the "completed" close-out directly - bot_sanctuary's own decision, never the agent's.
 #
 # Notes       :
-#   - A message is exactly telegram_gateway's own per-type payload shape, minus task_id/session_id (added here) -
-#     see telegram_gateway/README.md's "Response Queue Message Payloads" section for the authoritative format.
-#   - session_reset/bot_started excluded on purpose - those are orchestrator-only actions (a whitelisted admin
-#     command or this application's own schedule - see utils_session/session_worker.py), never agent-decided.
-#   - "completed" is deliberately not in TOOLS - an agent's own reply must never end a task with silence; only
-#     bot_sanctuary itself (call_dispatch_handler.py::execute_dispatch_call()'s own close-out step, via
-#     execute_completed() below) may decide a task is finished with no further reply. The agent remains free to
-#     choose any other tool, including "error" - only "completed" is reserved.
+#   - A message is exactly telegram_gateway's own per-type payload shape, minus task_id/session_id (added here).
+#   - session_reset/bot_started are excluded on purpose - those are orchestrator-only actions, never agent-decided.
+#   - "completed" is deliberately not in TOOLS - only bot_sanctuary's own dispatch logic may close a task with no further reply.
+#   - See README.md and telegram_gateway/README.md for the authoritative payload formats.
 #
 # =============================================================================
 # I M P O R T   H E A D E R
@@ -137,9 +133,7 @@ def execute_tool(publisher: "RabbitMQPublisher", task_id: str, session_id: str, 
 
     Returns:
         str | None:
-            None if published successfully.
-            Otherwise, a corrective message naming the expected format - meant to be handed back to the agent
-            that produced message, so it can retry with a corrected one.
+            None if published successfully; otherwise a corrective message naming the expected format, meant to be handed back to the agent so it can retry with a corrected one.
     """
     error = validate_message(message)
     if error is not None:
@@ -156,9 +150,9 @@ def execute_tool(publisher: "RabbitMQPublisher", task_id: str, session_id: str, 
 
 def execute_completed(publisher: "RabbitMQPublisher", task_id: str, session_id: str) -> str | None:
     """
-    Publishes a "completed" close-out for task_id directly - bypasses TOOLS/validate_message() entirely, since
-    "completed" is deliberately not a choice available to an agent (see TOOLS above) - only bot_sanctuary's own
-    dispatch logic (call_dispatch_handler.py::execute_dispatch_call()) decides a task ends with no further reply.
+    Publishes a "completed" close-out for task_id directly.
+
+    Bypasses TOOLS/validate_message() entirely, since "completed" is deliberately not a choice available to an agent - only bot_sanctuary's own dispatch logic may decide a task ends with no further reply.
 
     Args:
         publisher (RabbitMQPublisher):
@@ -170,9 +164,7 @@ def execute_completed(publisher: "RabbitMQPublisher", task_id: str, session_id: 
 
     Returns:
         str | None:
-            None if published successfully.
-            Otherwise, an error string describing the publish failure (never a corrective message meant for an
-            agent, unlike execute_tool()'s own return - there is no agent reply to correct here).
+            None if published successfully; otherwise an error string describing the publish failure.
     """
     payload = {"task_id": task_id, "session_id": session_id, "type": "completed"}
     if publisher.publish(payload):

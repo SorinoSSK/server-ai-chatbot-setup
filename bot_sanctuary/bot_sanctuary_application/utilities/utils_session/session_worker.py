@@ -8,25 +8,15 @@
 #   - SessionWorker - one long-lived worker per session_id, coalescing queued messages into combined turns.
 #   - Session registry management, including per-session on-disk directory lifecycle.
 #   - Startup crash-recovery sweep requesting a session reset for sessions left dangling by a prior run.
-#   - Admin-triggered and optional scheduled global session resets, decided by whether a reset sweep is already in progress.
-#   - Graceful per-session and application-wide shutdown that drains and finishes outstanding work before exiting.
-#   - Hands each coalesced batch's combined turn off to utils_calls/call_dispatch_handler.py::execute_dispatch_call(),
-#     on this worker's own thread/publisher - the Call pipeline's own run-and-publish mechanics live there, not here.
+#   - Admin-triggered and optional scheduled global session resets.
+#   - Graceful per-session and application-wide shutdown that drains outstanding work before exiting.
+#   - Hands each coalesced batch off to utils_calls/call_dispatch_handler.py for the actual Call pipeline run.
 #
 # Notes       :
 #   - stop() abandons whatever remains queued; shutdown()/retire() both drain it fully before exiting.
-#   - Each SessionWorker's session_dir is a stable root (SESSION_DIR/<session_id>), not a randomly-named
-#     per-generation directory - a session's own directory tree is only ever removed by clear_session_directory(),
-#     called on the startup sweep (clear_all_session_directories()) and on an actual session reset (retire()'s own
-#     exit path, or directly when no worker is active) - never merely because a new SessionWorker was constructed.
-#     See CODE_TODO.md's "per-session on-disk directory" entry for the full history of this decision.
-#   - retire()'s own exit-path cleanup (clear_session_directory()) is shared by two distinct callers: a global
-#     session reset sweep (session_clear_request/SESSION_RESET_TIME), and a per-chat session_cleared confirmation
-#     (utils_queue/message_handler.py::_handle_session_cleared()) - both need the same guarantee (drain whatever's
-#     already in flight, only clean up once that's genuinely finished), so both reuse this one exit path rather
-#     than each inventing their own.
-#   - A global session reset may only ever be triggered by a whitelisted admin command or this application's own optional daily schedule - telegram_gateway has no authority to trigger one itself.
-#   - The Call pipeline handed off to is deliberately minimal (Chat only, no handoff) - see CODE_TODO.md §5 Phase 3/4.
+#   - A session's on-disk directory is only ever removed via clear_session_directory(), never on worker creation.
+#   - A global session reset may only be triggered by a whitelisted admin command or the optional daily schedule.
+#   - The Call pipeline handed off to is Chat-only for now, with no handoff between Calls - see CODE_TODO.md.
 #   - See README.md for the full coalescing, crash-recovery, and session reset design.
 #
 # =============================================================================
@@ -90,28 +80,18 @@ def get_or_create_session_worker(session_id: str) -> "SessionWorker":
 
 def clear_session_directory(session_id: str) -> None:
     """
-    Removes session_id's entire on-disk session directory (every Call/LLM leaf beneath it), and terminates any
-    live LLM session(s) anchored to it, if either exists.
+    Removes session_id's entire on-disk session directory, and terminates any live LLM session anchored to it.
 
     Args:
         session_id (str):
-            Session identifier whose on-disk directory (settings.SESSION_DIR/<session_id>) should be removed.
+            Session identifier whose on-disk directory should be removed.
 
     Returns:
         None
 
     Notes:
-        - terminate_session() runs first, deliberately - it tears down a live, in-memory LLM connection (today,
-          only Claude's persistent per-generation client - see claude_session_service.py) still anchored to
-          session_root or one of its <call_type>/<llm_type> leaves, so nothing is left holding a reference to a
-          cwd that's about to be deleted out from under it. Best-effort itself, same convention as the rmtree
-          below - a provider-side failure is logged internally by terminate_session()'s own call chain, not
-          raised here.
-        - Best-effort - a failure to remove the directory itself is logged but non-fatal.
-        - The only two callers of this function are clear_all_session_directories() (the startup sweep) and
-          whichever path decided this session_id's turn(s) have already finished - never while a turn could
-          still be in flight. See this module's own header Notes and utils_queue/message_handler.py's
-          _handle_session_cleared() for how that guarantee is maintained.
+        - Best-effort - a failure to remove the directory is logged but non-fatal.
+        - Only called once a session's turn(s) are confirmed finished, never while one could still be in flight.
     """
     session_root = settings.SESSION_DIR / session_id
     terminate_session(session_root)
@@ -127,8 +107,9 @@ def clear_session_directory(session_id: str) -> None:
 
 def clear_all_session_directories() -> None:
     """
-    Removes every on-disk session directory under SESSION_DIR, unconditionally - the startup sweep that
-    guarantees a session is reset on every bot_sanctuary startup, not only on an explicit session reset.
+    Removes every on-disk session directory under SESSION_DIR, unconditionally.
+
+    Guarantees every session is reset on every bot_sanctuary startup, not only on an explicit session reset.
 
     Args:
         None
@@ -137,17 +118,8 @@ def clear_all_session_directories() -> None:
         None
 
     Notes:
-        - Intended to run once, as the very first step of initialise_application() - before RabbitMQ connects,
-          before the message consumer starts, and before any SessionWorker can possibly exist. Every directory
-          found at that point is therefore guaranteed to be left over from a prior process lifetime - nothing in
-          this process could be using any of them yet, so this is safe regardless of whether a prior turn
-          finished cleanly or not (see this module's own header Notes).
-        - Delegates per-session_id removal to the existing clear_session_directory() - same best-effort
-          behaviour, same terminate_session() + rmtree pairing, just swept across every session_id found rather
-          than one at a time.
-        - A no-op (logged) if SESSION_DIR doesn't exist yet - main.py already creates it before
-          initialise_application() ever runs, but this guards against being called in a context where that
-          ordering doesn't hold.
+        - Intended to run once, as the very first step of initialise_application(), before any worker exists.
+        - A no-op (logged) if SESSION_DIR doesn't exist yet.
     """
     if not settings.SESSION_DIR.is_dir():
         logger.info("SESSION_DIR does not exist yet - nothing to clear at startup.")
@@ -223,21 +195,19 @@ def resync_orphaned_sessions() -> None:
 
 def session_clear_response(task_id: str) -> None:
     """
-    Responds to an accepted session_clear_request by immediately publishing the corresponding session_reset back to telegram_gateway.
+    Responds to an accepted session_clear_request by publishing the corresponding session_reset.
 
-    Published before any session is actually cleared, so telegram_gateway's own reset-application timing is never forced to wait on this application finishing its own clearing sweep.
+    Published before any session is actually cleared, so telegram_gateway need not wait for the clearing sweep to finish.
 
     Args:
         task_id (str):
-            The task_id the session_clear_request arrived on, already validated non-empty by the caller. Echoed back on session_reset so telegram_gateway can close it out.
+            The task_id the session_clear_request arrived on.
 
     Returns:
         None
 
     Notes:
-        - Called only from the accept path of handle_session_clear_request().
         - A failed publish is not retried or backstopped - see README.md's Limitations.
-        - Uses its own disposable RabbitMQPublisher, not the long-lived one a SessionWorker owns for its own turn traffic.
     """
     from ..utils_queue.queue import RabbitMQPublisher
 
@@ -265,8 +235,6 @@ def _reject_session_clear_request(task_id: str) -> None:
 
     Notes:
         - Sent as an error, not a silent completion, so the requesting admin sees why nothing happened.
-        - A failed publish is not retried or backstopped - see README.md's Limitations.
-        - Uses its own disposable RabbitMQPublisher, same pattern as session_clear_response().
     """
     from ..utils_queue.queue import RabbitMQPublisher
 
@@ -544,32 +512,12 @@ def _extract_item_text(item: dict) -> str:
 
     Returns:
         str:
-            item["text"] if non-empty; otherwise a description built from item["button_press"] if
-            present; otherwise a description built from item["poll_answer"] if present; otherwise a
-            description built from item["type"] == "delivery_failed" if that's what item is; otherwise "".
+            item["text"] if non-empty, otherwise a description built from a button_press, poll_answer, or delivery_failed field; otherwise an empty string.
 
     Notes:
-        - button_press/poll_answer are telegram_gateway's own gateway_inbound.py::_push_button_press()/
-          poll_response_handler.py::_push_poll_answer() payloads - each always accompanied by text=""
-          on that same payload (see their own Notes), so checking text first and falling back to
-          whichever of the two is present is safe and requires no ordering assumption between them -
-          a single payload never carries both at once.
-        - button_press carries {"purpose", "payload"} exactly as the persona itself defined when it
-          built the button (chat.json's button spec) - unlike poll_answer below, this can directly
-          embed identifying content (e.g. {"shoe_name": "Cloud 5"}) rather than relying on the
-          persona's own conversation history to make sense of a bare index.
-        - poll_answer carries Telegram's own selected option *indices* (option_ids), not the option's
-          own text - telegram_gateway has no lookup back to the original poll's question/options at
-          this point, so this can only describe the answer by index. Relies on the persona's own
-          conversation history (the poll it just sent, moments earlier in the same session) to make
-          sense of which index means what.
-        - delivery_failed carries {"attempted_type", "status_code", "reason"} - telegram_gateway's own
-          Tier 1 report of a rejected send (see error_handling.py::push_tier1_delivery_failed()). Also
-          keeps that same task_id's mapping alive on telegram_gateway's side specifically so this
-          description's resulting retry has somewhere to land - see message_handler.py::_handle_completed().
-        - poll_timed_out (a distinct payload - {"task_id", "type": "poll_timed_out"}, no "text"/
-          "button_press"/"poll_answer"/"delivery_failed" at all) still resolves to "" here - not handled
-          by this function, out of scope of this change.
+        - button_press/poll_answer payloads always carry an empty text, so checking text first is safe.
+        - poll_answer describes the answer by option index, relying on conversation history for meaning.
+        - delivery_failed describes a previously rejected send, so the reply can retry it.
     """
     text = item.get("text") or ""
     if text:
@@ -725,15 +673,9 @@ class SessionWorker:
 
     def retire(self) -> None:
         """
-        Signals this worker to finish processing whatever is currently queued - including a batch already in
-        progress - then permanently retire: removing itself from the session registry and clearing its on-disk
-        session directory (and terminating any live LLM session anchored to it - see clear_session_directory()).
+        Signals this worker to finish whatever is currently queued, then permanently retire.
 
-        A third terminal path alongside stop()/shutdown(). Has two distinct callers today, both of which need the
-        same guarantee (nothing torn down while a turn could still be in flight - see this module's own header
-        Notes): the per-session exit action a global session_clear_request/SESSION_RESET_TIME sweep signals every
-        session with, and the exit action utils_queue/message_handler.py::_handle_session_cleared() signals a
-        single session with once telegram_gateway confirms that specific session_id has already been reset.
+        Removes itself from the session registry, clears its on-disk session directory, and terminates any live LLM session anchored to it once finished.
 
         Args:
             None
@@ -742,26 +684,16 @@ class SessionWorker:
             None
 
         Notes:
-            - Same draining behaviour as shutdown() - finishes whatever is already queued (including anything
-              already in progress) rather than abandoning it. Differs only in its exit action: shutdown() simply
-              stops, retire() also removes this session from the registry and clears its on-disk directory.
-            - Does not publish anything itself - for a global sweep, session_reset already happened once, at
-              accept-time, for the whole sweep this retirement is part of; for a per-chat session_cleared
-              confirmation, telegram_gateway has already applied that reset on its own side by the time this is
-              ever signalled, so there is nothing further to publish either way.
-            - Does not block - the caller is not expected to join this worker's thread; a retiring session simply
-              removes itself from the registry once it finishes.
-            - Reports its own retirement once finished (_report_retirement()) - a no-op (logged at debug) unless
-              this retirement is actually part of a currently in-progress global sweep, which is what allows a
-              future global session reset to be accepted again once every currently-pending session in that
-              sweep has done the same. A session_cleared-triggered retirement is never part of any sweep, so this
-              is always a harmless no-op on that path.
+            - A third terminal path alongside stop()/shutdown() - drains fully, including work already in progress.
+            - Does not publish anything itself - session_reset is published once for the whole sweep it is part of.
+            - Reports its own retirement once finished, which is what allows a global sweep to complete.
+            - See README.md for the full session reset design.
         """
         self._clear_event.set()
 
     def _run(self) -> None:
         """
-        Main loop - waits for a queued item, drains and coalesces whatever else is ready, processes the batch, and repeats until stopped.
+        Main loop - waits for a queued item, coalesces whatever else is ready, processes the batch, and repeats.
 
         Args:
             None
@@ -771,8 +703,8 @@ class SessionWorker:
 
         Notes:
             - stop() takes effect immediately, abandoning whatever remains queued.
-            - shutdown()/retire() only take effect once the inbox is genuinely empty, so a backlog queued as either begins is still fully processed.
-            - retire()'s own exit action (registry removal + on-disk directory cleanup) runs here, once the loop actually exits - regardless of whether it exited by draining fully or by stop() abandoning what was left, since by that point retirement was already requested either way.
+            - shutdown()/retire() only take effect once the inbox is genuinely empty.
+            - retire()'s own exit action runs here, once the loop actually exits.
         """
         while not self._stop_event.is_set():
             try:
@@ -814,10 +746,9 @@ class SessionWorker:
             None
 
         Notes:
-            - Every task_id in the batch except the last is closed out immediately, so it does not stay open on telegram_gateway's side for the turn's whole duration.
-            - The batch's text fields (falling back to a button_press/poll_answer/delivery_failed description via _extract_item_text() when text is empty - see that function's own Notes) are combined into one input, on the assumption that consecutive messages arriving before a turn starts represent one continued thought.
-            - The combined turn itself is delegated to utils_calls/call_dispatch_handler.py::execute_dispatch_call(), passed this worker's own self.dispatch_queue - see its own docstring for what runs the pipeline and publishes the outcome. Kept out of this class deliberately - a SessionWorker's own job is thread/inbox/lifecycle management, not the Call pipeline's run-and-publish mechanics.
-            - self.session_dir is also passed through, purely so a Call/provider that wants continuity across turns (Claude's cwd-keyed session resume, today - see claude_interface.py) has a stable, per-generation directory to anchor it to. This SessionWorker never reads/writes anything in it itself.
+            - Every task_id in the batch except the last is closed out immediately.
+            - The batch's text fields are combined into one input, as one continued thought.
+            - The combined turn is delegated to call_dispatch_handler.execute_dispatch_call() for the actual run.
         """
         task_ids = [item.get("task_id") for item in batch if item.get("task_id")]
         if not task_ids:

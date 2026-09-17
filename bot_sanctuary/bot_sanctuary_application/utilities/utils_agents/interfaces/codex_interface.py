@@ -94,9 +94,7 @@ async def query_via_oauth(prompt: str, token: str, persona: str | None = None, c
             Optional persona/system prompt for this call.
 
         cwd (Path | None):
-            Unused - accepted only for a uniform signature across every provider's query_via_oauth()/
-            query_via_api() (see agent_interface.py::query_llm()). Codex has no session-continuity mechanism
-            wired yet - see claude_interface.py for the one provider that currently does something with this.
+            Unused - accepted only for a uniform signature across every provider. Codex has no session-continuity mechanism wired yet.
 
     Returns:
         str | None:
@@ -123,9 +121,7 @@ async def query_via_api(prompt: str, token: str, persona: str | None = None, cwd
             Optional persona/system prompt for this call.
 
         cwd (Path | None):
-            Unused - accepted only for a uniform signature across every provider's query_via_oauth()/
-            query_via_api() (see agent_interface.py::query_llm()). Codex has no session-continuity mechanism
-            wired yet - see claude_interface.py for the one provider that currently does something with this.
+            Unused - accepted only for a uniform signature across every provider. Codex has no session-continuity mechanism wired yet.
 
     Returns:
         str | None:

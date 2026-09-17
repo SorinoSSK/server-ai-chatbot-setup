@@ -411,21 +411,14 @@ def _push_button_press(chat_id: int, purpose: str, payload: dict, task_id: str |
             The button's caller-defined payload, carried through unchanged.
 
         task_id (str | None):
-            The task_id the buttoned message was published against - None if the button was registered
-            with no task_id at all (not expected for a bot_sanctuary-issued button - see
-            register_bot_button()'s own Notes; only "draft_continue" registers with task_id=None, and
-            that purpose never reaches this function, see _handle_update()).
+            The task_id the buttoned message was published against - not expected to be None for a bot_sanctuary-issued button in practice, since only "draft_continue" registers with task_id=None, and that purpose never reaches this function - see _handle_update().
 
     Returns:
         None
 
     Notes:
-        - Mirrors utils_telegram/utilities/poll_response_handler.py::_push_poll_answer()'s existing
-          task_id-reuse pattern for polls - never mints a new task_id, since bot_sanctuary already has
-          this one open (see its own call_dispatch_handler.py: a text reply carrying buttons is left
-          open exactly like a poll, awaiting this eventual response).
-        - session_id is resolved via generate_session() and is mandatory on every outbound payload -
-          see utils_redis/database.py.
+        - Mirrors poll_response_handler.py::_push_poll_answer()'s task_id-reuse pattern for polls - never mints a new task_id, since bot_sanctuary already has this one open.
+        - session_id is resolved via generate_session() and is mandatory on every outbound payload.
     """
     if not task_id:
         logger.error(f"Validated callback_query from chat_id={chat_id} for purpose={purpose!r} carries no task_id - button_press dropped.")

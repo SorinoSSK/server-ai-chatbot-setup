@@ -127,8 +127,9 @@ def _handle_gateway_recover(data: dict) -> None:
 
 def _handle_session_cleared(data: dict) -> None:
     """
-    Handles a session_cleared acknowledgement, signalling any worker owning the named session to finish its
-    in-flight work and retire, or clearing its on-disk session directory directly if no worker is active.
+    Handles a session_cleared acknowledgement from telegram_gateway.
+
+    Signals any worker owning the named session to finish its in-flight work and retire, or clears its on-disk directory directly if no worker is active.
 
     Args:
         data (dict):
@@ -138,15 +139,8 @@ def _handle_session_cleared(data: dict) -> None:
         None
 
     Notes:
-        - No active worker for the named session is a normal, expected case - the on-disk directory (and any
-          live LLM session anchored to it) is still cleared directly in that case, since nothing could possibly
-          be in flight for a session with no active worker.
-        - When a worker *is* active, retire() is used rather than stop() + an immediate clear - stop() only
-          prevents a further batch from starting, it does not pause a batch already in progress on the worker's
-          own thread, so clearing immediately from this (the consumer) thread could race a still-in-flight turn.
-          retire() already guarantees whatever's in flight finishes - including publishing its reply - before its
-          own exit path clears the directory (see utils_session/session_worker.py's own header Notes and
-          retire()'s own docstring for the full reasoning).
+        - No active worker is a normal, expected case - the on-disk directory is still cleared directly.
+        - retire() is used instead of an immediate clear, so an in-flight turn is never interrupted.
     """
     session_id = data.get("session_id")
     if not session_id:
@@ -173,7 +167,7 @@ def _handle_session_clear_request(data: dict) -> None:
 
     Notes:
         - A missing/empty task_id is a malformed message and is logged and dropped rather than passed on.
-        - The accept/reject decision, the session_reset publish, and the per-session retire signalling all live in utils_session/session_worker.py::handle_session_clear_request() - this function is only the inbound validation/routing step.
+        - The accept/reject decision itself is delegated to utils_session/session_worker.py::handle_session_clear_request().
     """
     task_id = data.get("task_id")
     if not task_id:

@@ -5,25 +5,19 @@
 # Created On  : 2026-09-06
 #
 # Features    :
-#   - Unconditional startup sweep clearing every leftover on-disk session directory (and any live LLM session
-#     anchored to one), ahead of everything else - see utils_session/session_worker.py::clear_all_session_directories().
-#   - Starts/stops every LLM provider's own always-on service (today, only Claude's claude_session_service.py), ahead of the LLM credential smoke test.
+#   - Startup sweep clearing every leftover on-disk session directory, ahead of everything else.
+#   - Starts/stops every LLM provider's own always-on service, ahead of the LLM credential smoke test.
 #   - One-off LLM credential smoke test performed during startup.
 #   - RabbitMQ consume connection and background consumer lifecycle management.
 #   - Unconditional bot_started broadcast on every startup, ahead of crash recovery.
 #   - Crash-recovery sweep for sessions left dangling by a prior run.
-#   - Starts the optional daily timed global session reset (SESSION_RESET_TIME), if configured.
+#   - Starts the optional daily timed global session reset, if configured.
 #   - Graceful shutdown of active session workers ahead of connection teardown, then the LLM services above.
 #
 # Notes       :
 #   - Intended to be invoked once during application startup and once during shutdown.
-#   - initialise_llm_services() runs before test_llm_tokens(), deliberately - Claude's own credential is now
-#     resolved once at startup (claude_interface.py::initialise_claude()), not per call, so the smoke test
-#     would otherwise fail authentication for Claude on its very first run. See utils_agents/agent_interface.py
-#     and utils_agents/interfaces/claude_interface.py for the full detail this ordering depends on.
-#   - terminate_llm_services() runs after shutdown_all_session_workers(), deliberately - a session worker
-#     finishing its last queued turn may still be mid-call against Claude's persistent session platform
-#     (claude_session_service.py); stopping that platform first would risk disconnecting a client still in use.
+#   - LLM services are started before the credential smoke test, since a provider's credential may need resolving first.
+#   - LLM services are stopped after every session worker has finished, since a worker's last turn may still be mid-call against one.
 #   - See README.md for the full startup/shutdown sequence and design rationale.
 #
 # =============================================================================
@@ -69,8 +63,7 @@ def _push_bot_started() -> None:
 
     Notes:
         - Fired once RabbitMQ connectivity is already confirmed, ahead of the crash-recovery sweep.
-        - Best-effort and non-fatal - a failed publish is logged and startup proceeds regardless; telegram_gateway's own ceiling sweep is the fallback for a lost event.
-        - Uses its own disposable RabbitMQPublisher, not a long-lived, thread-confined instance.
+        - Best-effort and non-fatal - a failed publish is logged and startup proceeds regardless.
     """
     publisher = RabbitMQPublisher()
     try:
@@ -94,13 +87,6 @@ def initialise_application() -> None:
         None
 
     Notes:
-        - clear_all_session_directories() runs first, ahead of everything else - a pure local filesystem
-          sweep with no dependency on RabbitMQ/Redis/LLM services being up yet, and safe to run unconditionally
-          since no SessionWorker can possibly exist this early (see its own docstring). This is what guarantees
-          every session is reset on every bot_sanctuary startup, not only on an explicit session reset.
-        - initialise_llm_services() runs next, ahead of test_llm_tokens() - see this module's own header
-          Notes for why that specific ordering matters (Claude's own credential is resolved once here, not
-          per call, so the smoke test depends on this having already run).
         - See README.md for the full startup sequence and its design rationale.
     """
     clear_all_session_directories()
@@ -129,9 +115,6 @@ def terminate_application() -> None:
         None
 
     Notes:
-        - terminate_llm_services() runs after shutdown_all_session_workers(), not before - see this module's
-          own header Notes for why that specific ordering matters (a worker finishing its last turn may still
-          be mid-call against Claude's own persistent session platform).
         - See README.md for the full shutdown sequence and its design rationale.
     """
     stop_session_reset_schedule()

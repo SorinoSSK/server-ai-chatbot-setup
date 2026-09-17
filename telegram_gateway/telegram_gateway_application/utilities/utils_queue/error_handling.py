@@ -5,20 +5,13 @@
 # Created On  : 2026-09-02
 #
 # Features    :
-#   - Tier 1 - push_tier1_delivery_failed(): a specific send was rejected by Telegram, or failed local validation before ever reaching Telegram.
-#     Reported per task_id, since the backend/orchestrator can react by retrying that same task differently (e.g. a different content type, a shorter message).
-#     Also marks that task_id as having a retry outstanding (set_pending_retry()), so its corrective reply isn't left with nowhere to land - see utils_queue/message_handler.py::_handle_completed().
-#   - Tier 2 - record_send_success()/record_send_failure(): Telegram is unreachable altogether, or the bot token itself is invalid/revoked (401/404) - not tied to any one task, since no per-task retry/tool-swap fixes either.
-#     Tracks a rolling consecutive-failure count and fires a gateway_alert once per incident, re-arming only once a send succeeds again.
-#     That re-arming send also pushes a gateway_recover event - but only if it's actually closing out a prior alert, not on every ordinary success - see record_send_success().
+#   - Tier 1 - push_tier1_delivery_failed(): reports a single rejected/invalid send, per task_id, so the backend can retry that same task differently.
+#   - Tier 2 - record_send_success()/record_send_failure(): tracks systemic Telegram reachability, firing a gateway_alert/gateway_recover once per incident rather than per send.
 #
 # Notes       :
-#   - Deferred import of queue_push_task to avoid a circular import (queue.py -> message_handler.py -> ... -> queue.py), same pattern as utils_telegram/utilities/poll_response_handler.py::_push_poll_answer().
-#   - Tier 2's consecutive-failure counter resets on restart - deliberately, since a restart is itself a fresh start at reassessing whether Telegram is reachable.
-#     The armed/disarmed flag (whether an incident is currently outstanding) is persisted separately - see load_tier2_alert_state() - so a gateway_alert resolved via restart (e.g. a 401/404 fixed by updating TELEGRAM_BOT_TOKEN) still receives its paired gateway_recover. Closes CCR-019 (CODE_NON_COMPLIANCE.md).
-#   - _lock's scope covers the persist-and-publish step (set_tier2_alert_armed() + _push_tier2_gateway_alert()/_push_tier2_gateway_recover()) on top of the state mutation itself, for the armed<->disarmed transition branches only - not just the read/write of _alert_armed/_consecutive_failures.
-#     A dedicated second lock scoped only to the publish step was tried first and rejected: it prevented two publishes overlapping, but did not guarantee publish order matched transition order - after releasing _lock, which thread reaches a second lock first is scheduler-dependent, not tied to which thread mutated state first. Guaranteeing order requires the decision and the publish to be one uninterrupted critical section under the same lock, which is what this does.
-#     Accepted cost, explicit user decision: a transitioning call now holds _lock for the full publish duration (up to Q_PUSH_MAX_ATTEMPTS x Q_PUSH_RETRY_DELAY, ~30s, if RabbitMQ is also unreachable) - during that window every other thread's record_send_success()/record_send_failure() call (i.e. every send_*() in gateway_outbound.py, across every concurrent thread) blocks too, not just the two threads actually racing. Judged acceptable because this worst case only arises when RabbitMQ is unreachable at the same time Telegram delivery is failing/recovering - the system is already broadly degraded in that scenario, so the added internal lock contention is not the dominant concern. Closes CCR-020 (CODE_NON_COMPLIANCE.md).
+#   - Deferred import of queue_push_task to avoid a circular import, same pattern as poll_response_handler.py::_push_poll_answer().
+#   - Tier 2's consecutive-failure counter resets on restart, but its armed/disarmed flag is persisted separately, so an incident left outstanding by a prior run still receives its paired gateway_recover - see load_tier2_alert_state().
+#   - _lock's scope covers the full persist-and-publish step, not just the state mutation, so a transition's publish can never be reordered relative to the other transition's own publish - see README.md's Design Decisions for the trade-off this accepts.
 #
 # =============================================================================
 # I M P O R T   H E A D E R
@@ -127,10 +120,7 @@ def record_send_success(status_code: int | None = None) -> None:
 
     Notes:
         - Intended to be called after any successful send - clears the slate so a past incident doesn't suppress the next genuine one.
-        - _push_tier2_gateway_recover() fires exactly once per incident - only when this success follows an armed-off state (i.e. record_send_failure() had already fired a gateway_alert) - not on every ordinary success. Mirrors record_send_failure()'s own "once per incident" behaviour.
-        - The armed flag is persisted to Redis (set_tier2_alert_armed()) only on this transition, not on every ordinary success - see load_tier2_alert_state(). Closes CCR-019 (CODE_NON_COMPLIANCE.md).
-        - Logged here (rather than inside _push_tier2_gateway_recover()) so the recovery transition itself is always visible in the logs regardless of whether the queue push succeeds - this behaviour hasn't been through testing yet, so the extra visibility is deliberate while that's confirmed.
-        - The persist-and-publish step below runs inside the same _lock as the state mutation above, not after releasing it - guarantees this transition's publish can't be reordered relative to record_send_failure()'s own transition. See _lock's module-level Notes. Closes CCR-020 (CODE_NON_COMPLIANCE.md).
+        - The gateway_recover push and the armed flag's persistence both only happen when this success is actually closing out a prior alert, not on every ordinary success.
     """
     global _consecutive_failures, _alert_armed
 
@@ -159,11 +149,9 @@ def record_send_failure(reason: str, status_code: int | None = None) -> None:
         None
 
     Notes:
-        - reason="unauthorized"/"not_found" both fire immediately, bypassing the threshold - every endpoint the gateway hits is a fixed, hardcoded path, so either one is a permanent config issue (bad/revoked token), not a blip - no number of retries fixes it.
-        - reason="unreachable" (connection/timeout exhaustion) only fires once GATEWAY_ALERT_FAILURE_THRESHOLD consecutive failures have accumulated across all sends - a single blip is expected noise, not a systemic signal.
-        - Fires once per incident: re-armed only by record_send_success(), not by further failures, so an ongoing outage doesn't spam one alert per message.
-        - The disarmed flag is persisted to Redis (set_tier2_alert_armed()) only on the transition that actually fires - see load_tier2_alert_state(). Closes CCR-019 (CODE_NON_COMPLIANCE.md).
-        - The persist-and-publish step below runs inside the same _lock as the state mutation above, not after releasing it - guarantees this transition's publish can't be reordered relative to record_send_success()'s own transition. See _lock's module-level Notes. Closes CCR-020 (CODE_NON_COMPLIANCE.md).
+        - reason="unauthorized"/"not_found" fire immediately, bypassing the threshold, since either is a permanent config issue, not a blip.
+        - reason="unreachable" only fires once GATEWAY_ALERT_FAILURE_THRESHOLD consecutive failures have accumulated across all sends.
+        - Fires once per incident: re-armed only by record_send_success(), not by further failures.
     """
     global _consecutive_failures, _alert_armed
 

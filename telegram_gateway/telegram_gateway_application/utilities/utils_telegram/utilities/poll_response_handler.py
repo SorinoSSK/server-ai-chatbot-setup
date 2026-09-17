@@ -5,12 +5,9 @@
 # Created On  : 2026-09-02
 #
 # Features    :
-#   - Runs a per-poll_id background loop through two phases:
-#       - AWAITING FIRST ANSWER (POLL_TIMEOUT_SECONDS): closes with a chat message if nobody answers in time,
-#         and pushes a poll_timed_out event (see _push_poll_timed_out()) so the backend isn't left with no signal at all.
-#       - DEBOUNCING (POLL_DEBOUNCE_INITIAL_SECONDS, shortened to POLL_DEBOUNCE_SUBSEQUENT_SECONDS on every further answer): once answered, waits for things to go quiet before compiling and pushing the latest answer - capped overall by POLL_GLOBAL_CAP_SECONDS from poll creation, regardless of how many times debouncing resets.
+#   - Runs a per-poll_id background loop through two phases - AWAITING FIRST ANSWER (POLL_TIMEOUT_SECONDS), which pushes a poll_timed_out event if nobody answers in time, then DEBOUNCING, which waits for things to go quiet before pushing the latest answer, capped by POLL_GLOBAL_CAP_SECONDS.
 #   - Unrelated chat messages do not interact with an open poll at all - the bot is expected to answer them independently while the poll keeps running.
-#   - close_orphaned_polls() sweeps Redis on startup for polls left behind by a timer that did not survive the previous run (e.g. an app restart), closing each one out immediately - pushing whatever answer (or poll_timed_out) it already has, same as any other closure path.
+#   - close_orphaned_polls() sweeps Redis on startup for polls left behind by a timer that did not survive the previous run, closing each one out immediately.
 #
 # Notes       :
 #   - In-memory only - not persisted.

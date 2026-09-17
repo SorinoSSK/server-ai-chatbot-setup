@@ -1,105 +1,22 @@
 # =============================================================================
 # File        : claude_session_service.py
-# Description : Always-on platform maintaining one persistent Claude Agent SDK connection (ClaudeSDKClient) per
-#               generation directory, so a conversation can genuinely continue turn-to-turn - and become
-#               eligible for Claude's own prompt-cache pricing - without any per-session thread ever holding
-#               persistent async state itself.
+# Description : Always-on platform maintaining one persistent Claude Agent SDK connection per generation directory, so a conversation can genuinely continue turn-to-turn.
 # Author      : SorinoSSK
 # Created On  : 2026-09-13
 #
 # Features    :
-#   - start_claude_session_service()/stop_claude_session_service() - lifecycle for this platform's own
-#     dedicated thread and persistent event loop.
-#   - query_via_service() - the platform's public entry point. Synchronous from any caller's own thread - hands
-#     a turn off to this service's persistent loop and blocks for the reply, the same shape as any other
-#     blocking provider call (a subprocess run, an HTTP request) elsewhere in utils_agents/.
-#   - destroy_session() - disconnects and discards one exact generation's client, by its exact registry key.
-#   - destroy_sessions_under() - disconnects and discards every client whose key falls under a given root path -
-#     the one actually wired to a caller today (claude_interface.py::terminate_session(), called from
-#     utils_session/session_worker.py::clear_session_directory() on the startup sweep, a per-chat session_cleared
-#     confirmation, and a global session reset), so this platform's own in-memory memory of a cleared
-#     conversation is destroyed alongside the on-disk state, not left to leak until process exit.
+#   - start_claude_session_service()/stop_claude_session_service() - lifecycle for this platform's own thread and event loop.
+#   - query_via_service() - runs one turn against a session_dir's persistent client, synchronously from any caller's own thread.
+#   - destroy_session()/destroy_sessions_under() - disconnects and discards one or more clients by registry key.
 #
 # Notes       :
-#   - Built and hardened in isolation initially, per explicit instruction - see the module's own Created On
-#     date. Since wired in for real: claude_interface.py::query_via_oauth() routes here whenever session_dir
-#     is given, initialise_claude()/terminate_claude() call start_claude_session_service()/
-#     stop_claude_session_service() (gated on OAuth), and those two are in turn wired into
-#     utilities/initialise.py's own initialise_application()/terminate_application(). destroy_sessions_under()
-#     is wired too, via claude_interface.py::terminate_session() (see Features above) - destroy_session() is
-#     the one function in this module still uncalled from anywhere, remaining a valid lower-level primitive
-#     with no caller of its own - see its own docstring.
-#   - ToolUseBlock/ToolResultBlock content is now logged (name/input, and tool_use_id/is_error/content
-#     respectively) inside _run_turn() - added specifically to get direct, per-turn evidence of whether a tool
-#     (e.g. WebSearch) was actually invoked and what it returned, rather than relying on the model's own
-#     self-report of what it does/doesn't have access to. Diagnostic only - neither block type is fed into the
-#     returned reply string, which stays text-only.
-#   - One ClaudeSDKClient per generation directory (keyed by str(session_dir)), never pooled or shared across
-#     two different session_dir keys - see _get_or_create_entry()'s own Notes. This is what actually guarantees
-#     cache isolation between different sessions/users: Claude's own prompt cache is an exact-content-prefix match,
-#     and since every generation's client sends only that one conversation's own accumulating turns, there is
-#     no code path where one session's private content could ever be served back against another session's
-#     request. This is a structural guarantee (one client object, one generation, never crossed), not a
-#     runtime check layered on top of a shared connection.
-#   - The static persona/system-prompt block is identical across every session using the same Call, and may
-#     legitimately be cached and reused across different sessions by Claude's own automatic caching - that's
-#     safe (no private content) and is Claude's own behaviour, not anything built here. Flagged as an assumption
-#     consistent with Claude Code's documented caching behaviour, not independently verified by this module.
-#   - Continuity comes from holding one connection open across turns - unlike the one-shot query() function's
-#     continue_conversation/resume options (both empirically proven not to work for this application - see
-#     claude_interface.py's own history), a ClaudeSDKClient's persistent connection continues its own session
-#     automatically on every further .query() call, with no resume flag needed at all.
-#   - Deliberately-considered limitations, each addressed or explicitly accepted below rather than overlooked:
-#       - Two concurrent turns for the same session_dir (shouldn't happen given SessionWorker's own
-#         one-batch-at-a-time guarantee, but this platform doesn't assume a caller's internal discipline) -
-#         serialised per-client via _ClientEntry.lock, held for a whole query()/receive_response() cycle.
-#       - Two concurrent first-use requests for the same session_dir racing to create a client - serialised via
-#         the registry's own asyncio.Lock, held only for the short create-or-fetch step, never across a query.
-#       - A persona change mid-generation (e.g. an admin edits a library file while a session is still active) -
-#         detected by comparing the AgentPersona an existing client was built with against a fresh one parsed
-#         straight off disk on every turn (_parse_agent() takes no input and always re-reads the file); a
-#         mismatch reconnects with a fresh client rather than silently continuing on stale configuration.
-#       - A broken/crashed client (subprocess died, pipe closed) - dropped from the registry on its next failed
-#         use rather than retried in place; the following call creates a fresh connection instead of wedging
-#         permanently. That session loses Claude-side continuity for one turn but recovers.
-#       - A caller that times out waiting for a reply - query_via_service() cancels its own future, but this is
-#         best-effort only: cancelling a Future returned by run_coroutine_threadsafe() does not guarantee the
-#         in-flight coroutine on the service's own loop actually stops - it may keep running to completion in
-#         the background, updating/holding its client's state, with nothing left to receive the eventual result.
-#         Fixed 2026-09-16, not left accepted-as-is: query_via_service()'s own timeout branch now also evicts
-#         session_dir's entry from the registry (fire-and-forget _drop_entry(), same as the broken-client bullet
-#         above) - the abandoned coroutine may still run to completion holding the old entry's own lock, but the
-#         *next* call for this session_dir is no longer at risk of queuing behind it, since it builds a brand
-#         new entry (and lock) instead. Diagnosed directly from a real occurrence - see CODE_TODO.md.
-#       - Unbounded growth of the registry between resets - bounded now, not accepted-and-ignored: every entry
-#         under a session's root is destroyed via destroy_sessions_under() whenever that session's on-disk
-#         directory is cleared (startup sweep, session_cleared, or a global reset - see
-#         utils_session/session_worker.py::clear_session_directory()). A session that is simply never reset at
-#         all still grows this registry by one entry per distinct Call/LLM combination actually used for it,
-#         which remains accepted - there is no per-turn/idle-timeout eviction, only reset-triggered eviction.
-#       - Credential setup (CLAUDE_CODE_OAUTH_TOKEN/ANTHROPIC_API_KEY) still mutates process-wide os.environ,
-#         same constraint already documented against claude_interface.py/agent_interface.py - inherited, not
-#         newly introduced here, and unchanged by this module's own single-Claude-credential-configured-at-once
-#         reality today.
-#   - Expected library file format - libraries/claude/chat.json, read directly by _parse_agent() (which takes no
-#     input at all - it owns its own file path via the module-level _LIBRARIES_ROOT/_LLM_TYPE constants):
-#       {
-#           "tools": ["WebSearch"],
-#           "model": "sonnet",
-#           "persona": ["You are {{BOT_NAME}}, ...", "..."]
-#       }
-#     "persona" may be an array of lines (joined with "\n") or a bare string - either is accepted. "name"/
-#     "description" keys, if present, are still not read into body/tools/model at all - a persona's identity
-#     comes from {{BOT_NAME}} in the body, substituted for settings.TELEGRAM_BOT_NAME at load time, never a fixed
-#     name written into the file itself.
-#   - _parse_agent() returns an AgentPersona (body/tools/model/persona) rather than a bare tuple. AgentPersona
-#     itself is defined in config.py, not here, since the same shape is meant to be valid and reusable across
-#     every LLM provider's own eventual equivalent of this function - not something specific to Claude.
-#   - _DEFAULT_QUERY_TIMEOUT_SECONDS/_DEFAULT_SHUTDOWN_TIMEOUT_SECONDS, previously local module constants, are
-#     now settings.AGENT_QUERY_TIMEOUT_SECONDS/settings.AGENT_SHUTDOWN_TIMEOUT_SECONDS in config.py - global,
-#     provider-agnostic defaults for any always-on, persistent-connection agent session platform, not specific
-#     to Claude even though it's the only provider with one implemented today.
+#   - One ClaudeSDKClient per generation directory, never pooled or shared across two different session_dir keys.
+#   - A changed library file mid-generation triggers a reconnect with the new agent definition.
+#   - A broken/crashed client is dropped from the registry and rebuilt fresh on its next use.
+#   - A caller timeout evicts the corresponding registry entry, so the next call always builds a fresh client.
+#   - Registry entries are bounded by session reset, not by an idle timeout.
 #   - See agent_interface.py for the provider-agnostic dispatch that would eventually route into this module.
+#   - See README.md for the full concurrency, caching, and failure-handling design rationale.
 #
 # =============================================================================
 # I M P O R T   H E A D E R
@@ -148,11 +65,6 @@ _registry_lock: "asyncio.Lock | None" = None
 class _ClientEntry:
     """
     One generation's own persistent Claude connection, plus what's needed to serialise and validate reuse of it.
-
-    Notes:
-        - Stores the AgentPersona the client was actually built with (not a raw string) so a later call can
-          detect a changed library file with a plain dataclass equality check (entry.agent != freshly-parsed
-          agent) - see _get_or_create_entry()'s own Notes.
     """
 
     def __init__(self, client: ClaudeSDKClient, agent: AgentPersona):
@@ -166,36 +78,19 @@ _clients: dict[str, _ClientEntry] = {}
 
 def _parse_agent() -> AgentPersona:
     """
-    Loads and parses this service's own Claude library file (libraries/claude/chat.json) into an AgentPersona,
-    defensively - a missing, unreadable, or malformed file falls back to an empty-but-valid AgentPersona rather
-    than raising, so a broken library file degrades a session's persona rather than blocking it outright.
+    Loads and parses this service's own Claude library file into an AgentPersona.
+
+    Falls back to an empty-but-valid AgentPersona if the file is missing, unreadable, or malformed.
 
     Args:
         None
 
     Returns:
         AgentPersona:
-            The parsed agent definition, with _BOT_NAME_PLACEHOLDER in its body already substituted for
-            settings.TELEGRAM_BOT_NAME. Falls back to AgentPersona(body="", tools=None, model=None, persona={})
-            if the file is missing, unreadable, or not valid JSON.
+            The parsed agent definition, with the bot name placeholder already substituted.
 
     Notes:
-        - Takes no arguments and owns its own file path entirely - _LIBRARIES_ROOT / _LLM_TYPE / "chat.json" -
-          rather than being handed pre-loaded content by a caller, per explicit instruction. A side effect of
-          this is that it re-reads the file fresh on every call, which is exactly what lets
-          _get_or_create_entry() detect a library file changing mid-generation by comparing two AgentPersona
-          values for equality, rather than needing a separate file-watching mechanism.
-        - Every failure mode is caught and logged rather than raised, and all three fall back to the same empty
-          AgentPersona rather than three different error shapes a caller would need to handle separately:
-          a missing file (FileNotFoundError), a file that exists but can't be read (OSError), and a file that
-          exists but isn't valid JSON (json.JSONDecodeError).
-        - AgentPersona itself lives in config.py, not here - it's meant to be one shared, provider-agnostic
-          return shape reusable by a future Codex/Qwen/DeepSeek equivalent of this function, not something
-          specific to Claude.
-        - "name"/"description" keys, if present in the JSON, are not read into body/tools/model at all - a
-          persona's identity comes from _BOT_NAME_PLACEHOLDER in its body, substituted for
-          settings.TELEGRAM_BOT_NAME, never from a name written into the file itself. Both are still available
-          on the returned value's own .persona field, for any future need.
+        - Re-reads the file fresh on every call, which is what allows a library file change to be detected.
     """
     path = _LIBRARIES_ROOT / _LLM_TYPE / "chat.json"
     try:
@@ -228,11 +123,6 @@ def _get_registry_lock() -> asyncio.Lock:
     Returns:
         asyncio.Lock:
             The lock guarding _clients dict mutation.
-
-    Notes:
-        - Only ever called from within a coroutine already running on _loop, so the check-then-create below has
-          no await between the check and the assignment - safe under asyncio's own cooperative scheduling with
-          no separate guard needed for the lock's own creation.
     """
     global _registry_lock
     if _registry_lock is None:
@@ -251,8 +141,7 @@ async def _disconnect_entry(entry: _ClientEntry) -> None:
         None
 
     Notes:
-        - Never raises - a failed disconnect is logged but does not block whatever cleanup/replacement is
-          happening around it, since the entry is being discarded either way.
+        - Never raises - a failed disconnect is logged but does not block whatever cleanup is happening around it.
     """
     try:
         await entry.client.disconnect()
@@ -284,21 +173,10 @@ async def _drop_entries_under(root: Path) -> None:
 
     Args:
         root (Path):
-            The path every matching entry's own key must equal or fall under - typically a session's on-disk
-            root (SESSION_DIR/<session_id>) or one specific Call/LLM leaf beneath it.
+            The path every matching entry's own key must equal or fall under.
 
     Returns:
         None
-
-    Notes:
-        - A plain string-prefix match on str(root) + "/" (plus an exact match on str(root) itself), not a
-          Path-object comparison - registry keys are already normalised str(session_dir) values (see
-          _get_or_create_entry()), so this is a cheap, sufficient boundary check without constructing a Path
-          per key. The trailing "/" is what prevents a false-positive match against an unrelated sibling
-          directory that merely shares root's own name as a prefix (e.g. root=".../chat" must not match
-          ".../chat_extra").
-        - Mirrors _disconnect_all()'s own shape (collect matching entries under the lock, clear them from the
-          registry, then disconnect each outside the lock) - just filtered to a subset rather than every entry.
     """
     root_str = str(root)
     prefix = root_str + "/"
@@ -312,32 +190,19 @@ async def _drop_entries_under(root: Path) -> None:
 
 async def _get_or_create_entry(session_dir: Path) -> _ClientEntry:
     """
-    Returns session_dir's own persistent Claude client entry, creating - or recreating, if the library file has
-    changed since it was created - it first.
+    Returns session_dir's own persistent Claude client entry, creating or recreating it if needed.
 
     Args:
         session_dir (Path):
-            The generation directory this client is anchored to. Doubles as ClaudeAgentOptions' own cwd, and as
-            this registry's own lookup key (str(session_dir)).
+            The generation directory this client is anchored to, and this registry's own lookup key.
 
     Returns:
         _ClientEntry:
-            The (possibly newly-created) entry for session_dir - never shared with any other session_dir.
+            The (possibly newly-created) entry for session_dir.
 
     Notes:
-        - Calls _parse_agent() itself on every invocation, rather than being handed a persona by its own caller -
-          this is what makes the library-file-changed check below possible with a plain equality comparison,
-          since _parse_agent() always reflects the file's current on-disk contents.
-        - An AgentPersona mismatch against an already-connected entry forces a disconnect-and-recreate, rather
-          than silently continuing on the configuration the client was originally built with - a persistent
-          connection would otherwise never notice a library file changing mid-generation, unlike the one-shot
-          query() path (see chat_call.py's own "persona is loaded fresh on every call" behaviour).
-        - Registry lookup/creation is serialised via _get_registry_lock() so two concurrent first-use requests
-          for the same session_dir cannot both create a client - the second waiter finds the first's entry
-          already present once it acquires the lock, rather than racing to create two.
-        - Connection failure (client.connect() raising) is not caught here - it propagates to the caller
-          (_run_turn()), which already has its own single, uniform failure-handling path for this whole
-          operation. Nothing is added to _clients unless connect() actually succeeds.
+        - A library file change since the entry was created triggers a disconnect-and-recreate.
+        - Registry lookup/creation is serialised, so two concurrent first-use requests cannot both create a client.
     """
     key = str(session_dir)
     registry_lock = _get_registry_lock()
@@ -376,20 +241,9 @@ async def _run_turn(session_dir: Path, prompt: str) -> str | None:
             The assistant's concatenated text reply, or None if no text block was returned or the call failed.
 
     Notes:
-        - entry.lock is held for the entire query()/receive_response() cycle, not just around the send - this is
-          what serialises two turns that somehow arrive concurrently for the same session_dir, so client.query()
-          is never called a second time before the first turn has finished draining its own response.
-        - Any failure (client-creation failure, a mid-query exception, a broken connection) drops and discards
-          this session_dir's entry entirely before returning None - the next call starts completely fresh rather
-          than reusing a connection that just proved itself broken.
-        - ResultMessage's own usage (input_tokens/cache_creation_input_tokens/cache_read_input_tokens/
-          output_tokens) is logged on every turn - direct, per-turn evidence of whether cache tokens are
-          actually being used, not assumed from documentation.
-        - ToolUseBlock/ToolResultBlock are logged too, not just collected/discarded like every other
-          non-TextBlock content - added specifically to get direct, per-turn evidence of whether a tool
-          (e.g. WebSearch) was actually invoked and what it returned, rather than relying on the model's own
-          self-report of what it does/doesn't have access to. Purely diagnostic - neither is fed into the
-          returned reply string, which remains text-only, unchanged.
+        - Serialised per-client for the whole query/response cycle, so two turns never overlap on one client.
+        - Any failure drops this session_dir's entry entirely, so the next call starts completely fresh.
+        - Token usage and ToolUseBlock/ToolResultBlock content are logged for diagnostic purposes only.
     """
     try:
         entry = await _get_or_create_entry(session_dir)
@@ -447,29 +301,17 @@ def query_via_service(session_dir: Path, prompt: str, timeout: float = settings.
             The prompt to send.
 
         timeout (float):
-            Maximum seconds to wait for a reply before abandoning this call. Defaults to
-            settings.AGENT_QUERY_TIMEOUT_SECONDS (see config.py - shared across every provider's own eventual
-            session platform, not specific to Claude).
+            Maximum seconds to wait for a reply before abandoning this call.
 
     Returns:
         str | None:
             The assistant's text reply, or None if the service isn't running, the call timed out, or it failed.
 
     Notes:
-        - This is the platform's one public, caller-facing entry point - synchronous from the calling thread's
-          own point of view, identical in shape to any other blocking provider call elsewhere in utils_agents/.
-          All persistent/async state lives inside this service's own loop, never inside the caller's thread.
-        - Takes no persona - the client's own system prompt/tools/model come entirely from _parse_agent()
-          reading the library file directly, on this service's own loop, once per turn (via
-          _get_or_create_entry()). A caller has no way to override it per-call.
-        - A timeout cancels this call's own Future, but that is best-effort only - it stops this function from
-          waiting any further, it does not guarantee the corresponding coroutine running on the service's own
-          loop actually stops. It may continue running to completion in the background, still holding/updating
-          its client's state, with no one left waiting on its result. To stop that abandoned state from
-          affecting the *next* call for this same session_dir, session_dir's own entry is also evicted from the
-          registry below (fire-and-forget, not waited on here) - see the timeout branch's own comment.
-        - Never raises - every failure path (service not started, timeout, unexpected exception) is logged and
-          returns None instead, matching this codebase's existing never-crash-on-a-failed-LLM-call convention.
+        - This platform's one public, caller-facing entry point - synchronous from the calling thread's own point of view.
+        - Takes no persona - the client's own system prompt/tools/model come entirely from the library file.
+        - A timeout evicts session_dir's entry from the registry, so the next call always builds a fresh client.
+        - Never raises - every failure path is logged and returns None instead.
     """
     if _loop is None:
         logger.error("Claude session service has not been started - call start_claude_session_service() first. Returning None rather than raising.")
@@ -509,15 +351,8 @@ def destroy_session(session_dir: Path) -> None:
         None
 
     Notes:
-        - Exact-key match only - matches one specific generation's own registry entry, nothing nested beneath
-          it. destroy_sessions_under() (below) is the root-scoped equivalent actually wired to a caller today
-          (claude_interface.py::terminate_session()); this function remains a valid lower-level primitive
-          (e.g. for a caller that already knows the one exact leaf it wants destroyed) but has no caller of its
-          own yet.
-        - A no-op (logged at debug) if the service isn't running at all, or if session_dir has no client to
-          begin with.
-        - Best-effort, same convention as this codebase's other on-disk/connection cleanup (e.g.
-          utils_session/session_worker.py::clear_session_directory()) - a failure is logged, not raised.
+        - Exact-key match only - destroy_sessions_under() is the root-scoped equivalent used elsewhere.
+        - A no-op if the service isn't running, or session_dir has no client to begin with.
     """
     if _loop is None:
         logger.debug(f"Claude session service is not running - nothing to destroy for session_dir={session_dir}.")
@@ -534,25 +369,14 @@ def destroy_sessions_under(root: Path) -> None:
 
     Args:
         root (Path):
-            The session root (or a specific Call/LLM leaf beneath it) whose live client(s) should be destroyed -
-            see _drop_entries_under()'s own docstring for the exact matching rule.
+            The session root, or a specific Call/LLM leaf beneath it, whose live client(s) should be destroyed.
 
     Returns:
         None
 
     Notes:
-        - Exists for utils_session/session_worker.py::clear_session_directory() to call (via
-          claude_interface.py::terminate_session()/agent_interface.py::terminate_session()) at the same moment
-          a session's on-disk directory is cleared - the startup sweep, a per-chat session_cleared confirmation,
-          or a global session reset - so this service's own in-memory memory of every conversation under root
-          is destroyed alongside the on-disk state, rather than left to leak until process exit.
-        - Root-scoped rather than a single exact-key match, unlike destroy_session() above - one session_id's
-          root can own more than one live client at once (one per Call/LLM combination actually used for that
-          session), all of which need destroying together.
-        - A no-op (logged at debug) if the service isn't running at all, or if nothing under root has a live
-          client.
-        - Best-effort, same convention as this codebase's other on-disk/connection cleanup (e.g.
-          utils_session/session_worker.py::clear_session_directory()) - a failure is logged, not raised.
+        - Root-scoped rather than a single exact-key match, since one session root can own several live clients.
+        - A no-op if the service isn't running, or nothing under root has a live client.
     """
     if _loop is None:
         logger.debug(f"Claude session service is not running - nothing to destroy under root={root}.")
@@ -574,11 +398,8 @@ def start_claude_session_service() -> None:
         None
 
     Notes:
-        - No-op (logged at debug) if already running - mirrors the defensive-guard style already used by this
-          codebase's other start_*() functions (e.g. utils_session/session_worker.py's own
-          start_session_reset_schedule()).
-        - The thread runs _loop.run_forever() and nothing else - all actual work is scheduled onto it via
-          asyncio.run_coroutine_threadsafe() from query_via_service()/destroy_session()/stop_claude_session_service().
+        - No-op if already running.
+        - The thread runs _loop.run_forever() and nothing else - all actual work is scheduled onto it separately.
     """
     global _loop, _thread
     if _thread is not None and _thread.is_alive():
@@ -596,18 +417,13 @@ def stop_claude_session_service(timeout: float = settings.AGENT_SHUTDOWN_TIMEOUT
     Args:
         timeout (float):
             Maximum seconds to wait for every client to disconnect, and for this service's own thread to stop.
-            Defaults to settings.AGENT_SHUTDOWN_TIMEOUT_SECONDS (see config.py - shared across every provider's
-            own eventual session platform, not specific to Claude).
 
     Returns:
         None
 
     Notes:
-        - No-op (logged at debug) if the service was never started/already stopped - harmless to call
-          unconditionally, same convention as utils_session/session_worker.py::stop_session_reset_schedule().
-        - A client that fails to disconnect cleanly within timeout is logged and abandoned - the process is
-          assumed to be exiting regardless, matching shutdown_all_session_workers()'s own bounded-wait-then-
-          abandon precedent.
+        - No-op if the service was never started/already stopped.
+        - A client that fails to disconnect cleanly within timeout is logged and abandoned.
     """
     global _loop, _thread
     if _loop is None or _thread is None or not _thread.is_alive():

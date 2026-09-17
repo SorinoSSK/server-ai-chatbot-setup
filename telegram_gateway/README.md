@@ -1,8 +1,6 @@
 # Telegram Gateway
 
-The Telegram Gateway is the sole interface between the Telegram Bot API and the rest of the AI agent system.
-It translates Telegram messages and inline keyboard button interactions into internal queue messages (and vice versa), so no other container talks to Telegram directly.
-It is also responsible for rendering inline keyboard buttons (Accept / Reject / Request Revision, mode selection) and for triggering the user's global session reset.
+The Telegram Gateway is the sole interface between the Telegram Bot API and the rest of the AI agent system. It translates Telegram messages and inline keyboard button interactions into internal queue messages (and vice versa), so no other container talks to Telegram directly. It is also responsible for rendering inline keyboard buttons (Accept / Reject / Request Revision, mode selection) and for triggering the user's global session reset.
 
 All application code runs inside a Docker container - there is no standalone (non-Docker) execution path.
 
@@ -27,7 +25,7 @@ telegram_gateway/telegram_gateway_application
 - `utilities/utils_queue/` - RabbitMQ connection lifecycle, inbound message dispatch, and delivery-failure reporting.
 - `utilities/utils_redis/` - Redis connection lifecycle and task/draft/poll/pending-reset state storage.
 - `utilities/utils_session/` - graceful `session_reset` handling: per-chat defer-until-idle sweep, crash-recovery resync, a bounded force-apply ceiling, orchestrator ack, the chat-facing reset notice, and `bot_started` reconciliation.
-- `utilities/utils_telegram/` - Telegram Bot API integration: inbound long-polling (`gateway_inbound.py`, which also detects the admin global-reset command and enforces its whitelist) and outbound sends (`gateway_outbound.py`), with supporting behaviours (typing indicator, draft keep-alive, poll debounce, inline keyboard buttons) under `utils_telegram/utilities/`.
+- `utilities/utils_telegram/` - Telegram Bot API integration: inbound long-polling (`gateway_inbound.py`, which also detects the admin global-reset command and enforces its whitelist) and outbound sends (`gateway_outbound.py`), with supporting behaviours (typing indicator, draft keep-alive, poll debounce, inline keyboard buttons, Markdown-to-HTML conversion) under `utils_telegram/utilities/`.
 - `data/logs/` - runtime log output (rotating daily, see Logging below).
 
 ### Application Lifecycle
@@ -50,9 +48,7 @@ telegram_gateway/telegram_gateway_application
 **RabbitMQ consumer loop** (`utils_queue/queue.py::queue_consume_task()`) - one iteration per message:
 - Consumes from `Q_CHANNEL_IN` via `basic_consume`.
 - Decodes the message body and passes it to `process_message()` (`utils_queue/message_handler.py`), which dispatches by `type` (poll/image/video/album/file/text/completed/error/session_reset) to the matching Telegram send call.
-- Acks on success.
-  On failure, nacks with requeue up to `Q_CONSUME_MAX_ATTEMPTS`, then drops.
-  Reconnects automatically on a connection-level failure.
+- Acks on success. On failure, nacks with requeue up to `Q_CONSUME_MAX_ATTEMPTS`, then drops. Reconnects automatically on a connection-level failure.
 
 **Telegram long-polling loop** (`utils_telegram/gateway_inbound.py::poll_updates()`) - one iteration per `getUpdates` call:
 - Calls `getUpdates` with the current `offset` and `TELEGRAM_ALLOWED_UPDATES`, holding the connection open for up to `TELEGRAM_POLL_TIMEOUT` seconds.
@@ -75,8 +71,7 @@ On `SIGINT`/`SIGTERM`, the signal handler sets the shared `ShutdownSignal`, waki
 Dynamically spawned per-task threads are daemon threads and are not explicitly joined - they die with the process rather than being waited on.
 
 ## Getting Started
-The Telegram Gateway container is intended to be managed by the project's root `./setup.sh` script (run from the `server-ai-chatbot-setup` root directory) and is not typically invoked directly.
-You may use the helper script, `setup.sh`, for standalone `telegram_gateway` development.
+The Telegram Gateway container is intended to be managed by the project's root `./setup.sh` script (run from the `server-ai-chatbot-setup` root directory) and is not typically invoked directly. You may use the helper script, `setup.sh`, for standalone `telegram_gateway` development.
 
 ### First-Time Setup
 **Step 1:** Run helper script
@@ -128,6 +123,8 @@ docker restart <docker-container-name>
 - **Two-tier delivery-failure reporting** - a rejected send is reported per-task (Tier 1, actionable by retrying differently) separately from a systemic outage (Tier 2, human intervention), so a consumer of `Q_CHANNEL_OUT` can distinguish "retry this differently" from "something is broken".
 - **In-memory timers with a Redis backstop** - draft/poll keep-alive timers are deliberately in-memory rather than persisted/distributed, with Redis TTLs and startup sweeps (`close_orphaned_drafts()`/`close_orphaned_polls()`) as a safety net against a restart leaving state silently stuck.
 - **One configurable timezone, one shared time source** - log timestamps and every stored/compared timestamp (e.g. a pending reset's `created_at`) are anchored to a single configurable timezone (`TZ`) via a single shared time-retrieval helper, rather than each module reading the container's own local time independently.
+- **Deterministic Markdown-to-HTML conversion, not a Telegram Markdown parse_mode** - bot_sanctuary's persona writes ordinary CommonMark-style Markdown (`**bold**`, `# headers`, `- bullets`), which matches neither of Telegram's own Markdown dialects. `utils_telegram/utilities/markdown_converter.py` converts it deterministically into Telegram's HTML parse_mode instead of depending on the persona reliably hand-writing Telegram-specific syntax turn after turn. Every substitution only ever emits a matched, balanced tag pair, so an unmatched/stray delimiter degrades to a harmless literal character rather than Telegram rejecting the whole send.
+- **Tier 2's persist-and-publish held under one lock** - `error_handling.py`'s armed/disarmed transition and its paired `gateway_alert`/`gateway_recover` publish run inside the same lock as the state mutation itself, guaranteeing the two can never be published out of order. The accepted cost is that every other concurrent send's Tier 2 bookkeeping blocks for that publish's full duration in the worst case, judged acceptable since that scenario only arises when RabbitMQ is unreachable at the same time Telegram delivery itself is failing/recovering.
 
 ### Limitations
 - Only one pending draft is held per `chat_id` at a time - further media is rejected with a reminder rather than queued.
@@ -326,56 +323,43 @@ Every task the gateway pushes to RabbitMQ (`Q_CHANNEL_OUT`) shares one shape, re
 - `task_id`: the primary identifier for this exchange - see "`task_id` vs `session_id`" in Design Decisions above.
 - `session_id`: mandatory on every payload - resolved/lazily created via `generate_session()` (`utils_redis/database.py`) immediately before the message is built, from whichever of `chat_id`/`task_id` is available at the call site. Permanent per chat until an explicit `session_reset` - see "`task_id` vs `session_id`" in Design Decisions above.
 - `text`: always present, `""` if the update carried no text.
-- `image_url` / `video_url` / `file_url`: at most one is ever non-empty - the other two are always `""`.
-  Resolved from Telegram's `getFile` endpoint, so the URL embeds the bot token and is only guaranteed valid by Telegram for at least 1 hour - the backend should download promptly rather than persist the URL.
-- `poll_answer`: `null`/absent on a plain text/media task.
-  Populated only on a poll answer push, with the responder's selected option indices (Telegram's `option_ids`, indices into the original poll's `options`).
-  Carries no `user_id` - a poll only ever has one possible responder (this gateway's 1 user : 1 chat, private-chat-only model, where `chat_id` is itself the user's Telegram `user_id`), so `task_id` already resolves the poll back to its chat unambiguously.
+- `image_url` / `video_url` / `file_url`: at most one is ever non-empty - the other two are always `""`. Resolved from Telegram's `getFile` endpoint, so the URL embeds the bot token and is only guaranteed valid by Telegram for at least 1 hour - the backend should download promptly rather than persist the URL.
+- `poll_answer`: `null`/absent on a plain text/media task. Populated only on a poll answer push, with the responder's selected option indices (Telegram's `option_ids`, indices into the original poll's `options`). Carries no `user_id` - a poll only ever has one possible responder (this gateway's 1 user : 1 chat, private-chat-only model, where `chat_id` is itself the user's Telegram `user_id`), so `task_id` already resolves the poll back to its chat unambiguously.
 - `coding_allowed`: always present on this initial task payload - `true` if `chat_id` is in `SESSION_RESET_ALLOWED_CHAT_IDS`, `false` otherwise (default). Tags whether the requesting chat is permitted to reach beyond `bot_sanctuary`'s Chat-only agent tier - the gateway only stamps this identity tag, it does not itself gate/reject anything based on it (see `CODE_TODO.md`'s "Agent-call access tier" entry). Not currently present on the poll-answer/poll-timed-out pushes below, or on the delivery-failure/gateway-alert events further down, as those call sites don't resolve `chat_id` directly.
 
 #### Pending drafts (media without an instruction yet)
 
 A photo/video/document arriving **without** a caption, or with one but no further text, is not immediately turned into a task - it is staged as a Redis-backed draft (one per `chat_id` at a time) until a text update finalises it:
 
-- Media with a caption: the caption is stored as the draft's initial text.
-  The next text update is appended onto it (`caption + " " + text`) and the task is pushed immediately.
+- Media with a caption: the caption is stored as the draft's initial text. The next text update is appended onto it (`caption + " " + text`) and the task is pushed immediately.
 - Media with no caption: the next text update becomes the task's `text` outright, and the task is pushed immediately.
 - Further media (single item or album) arriving while a draft is already pending is **not** stored - the user is reminded about the existing draft instead.
-- Album items (Telegram sets `media_group_id` on each item, delivered as separate updates) are never staged as a draft - the user is asked to resend them one at a time with individual instructions.
-  The reply is sent once per album, not once per item.
+- Album items (Telegram sets `media_group_id` on each item, delivered as separate updates) are never staged as a draft - the user is asked to resend them one at a time with individual instructions. The reply is sent once per album, not once per item.
 - Whether the finalising text still applies to the pending media (e.g. the user changed their mind) is not decided by the gateway - it always attaches the draft's media to whatever text finalises it; that judgement call is left to the backend.
 
-**Timeout**, per draft, is a repeating keep-alive cycle rather than a single countdown (see `utils_telegram/utilities/image_draft_handler.py`).
-Each cycle is `DRAFT_CYCLE_SECONDS` long (5 min by default) and has exactly one "typing..." window, immediately before the one message a cycle sends:
+**Timeout**, per draft, is a repeating keep-alive cycle rather than a single countdown (see `utils_telegram/utilities/image_draft_handler.py`). Each cycle is `DRAFT_CYCLE_SECONDS` long (5 min by default) and has exactly one "typing..." window, immediately before the one message a cycle sends:
 - `DRAFT_CYCLE_SECONDS - DRAFT_CYCLE_NOTICE_LEAD_SECONDS - DRAFT_TYPING_LEAD_SECONDS` into the cycle (1 min by default): a "typing..." indicator starts.
 - `DRAFT_CYCLE_SECONDS - DRAFT_CYCLE_NOTICE_LEAD_SECONDS` into the cycle (2 min by default): typing stops, a notice is sent asking if the user needs more time, with a "Give me a little while more" button attached.
-- From there until `DRAFT_CYCLE_SECONDS` into the cycle (5 min by default): a further silent wait, with **no** typing indicator, watching for the button to be pressed.
-  A press is acknowledged immediately but does **not** shorten this wait - it plays out in full regardless, same as if the button were never pressed.
+- From there until `DRAFT_CYCLE_SECONDS` into the cycle (5 min by default): a further silent wait, with **no** typing indicator, watching for the button to be pressed. A press is acknowledged immediately but does **not** shorten this wait - it plays out in full regardless, same as if the button were never pressed.
 
 **Whether the button was pressed at any point during that cycle is what decides what happens once the cycle's full 5 minutes has elapsed:**
 - **Pressed at least once** → the draft proceeds to its next scheduled cycle, which repeats the same pattern from its own start (its own 1 min typing, 2 min notice, silent wait to its own close point).
 - **Never pressed** → the draft closes at the end of this cycle, the same way an unanswered final cycle does - it does **not** silently continue to the next scheduled cycle.
 
-The final cycle's notice has no button at all, since there's no further cycle to reach - it always closes at its own end, regardless of response.
-The number of cycles is capped by `DRAFT_CLOSE_SECONDS / DRAFT_CYCLE_SECONDS` (11 cycles at the defaults above, i.e. 55 min total - kept comfortably under Telegram's 1-hour file link guarantee), but that ceiling is only reached if the button is pressed on every single cycle along the way; a draft that's never answered at all closes after just its first cycle (5 min by default).
+The final cycle's notice has no button at all, since there's no further cycle to reach - it always closes at its own end, regardless of response. The number of cycles is capped by `DRAFT_CLOSE_SECONDS / DRAFT_CYCLE_SECONDS` (11 cycles at the defaults above, i.e. 55 min total - kept comfortably under Telegram's 1-hour file link guarantee), but that ceiling is only reached if the button is pressed on every single cycle along the way; a draft that's never answered at all closes after just its first cycle (5 min by default).
 
-The keep-alive cycle above is **in-memory only** - it does not survive an application restart, though the Redis-backed draft record itself does (it has its own TTL, `DRAFT_MAPPING_TTL_SECONDS`, slightly beyond `DRAFT_CLOSE_SECONDS`, as a backstop).
-Since the loop's progress isn't persisted, a restart would otherwise leave a draft silently pending with no further notices and no close message, for up to that TTL.
-To avoid this, `close_orphaned_drafts()` sweeps Redis for any leftover drafts on startup, before polling resumes, and closes each one out immediately (draft deleted, close message sent) rather than attempting to resume it part-way through a cycle.
+The keep-alive cycle above is **in-memory only** - it does not survive an application restart, though the Redis-backed draft record itself does (it has its own TTL, `DRAFT_MAPPING_TTL_SECONDS`, slightly beyond `DRAFT_CLOSE_SECONDS`, as a backstop). Since the loop's progress isn't persisted, a restart would otherwise leave a draft silently pending with no further notices and no close message, for up to that TTL. To avoid this, `close_orphaned_drafts()` sweeps Redis for any leftover drafts on startup, before polling resumes, and closes each one out immediately (draft deleted, close message sent) rather than attempting to resume it part-way through a cycle.
 
 #### Poll answers
 
-A poll (`type: "poll"`, see below) is always sent non-anonymous (`TELEGRAM_POLL_ANONYMOUS`, not caller-configurable) so an answer can be attributed to its responder.
-See `utils_telegram/utilities/poll_response_handler.py`.
+A poll (`type: "poll"`, see below) is always sent non-anonymous (`TELEGRAM_POLL_ANONYMOUS`, not caller-configurable) so an answer can be attributed to its responder. See `utils_telegram/utilities/poll_response_handler.py`.
 
-Unrelated chat messages **do not** interact with an open poll at all - the bot is expected to answer them independently while the poll keeps running in the background.
-There is no "one poll per chat" restriction enforced by the gateway.
+Unrelated chat messages **do not** interact with an open poll at all - the bot is expected to answer them independently while the poll keeps running in the background. There is no "one poll per chat" restriction enforced by the gateway.
 
 Each poll goes through two phases, governed by one timer:
 
 - **Awaiting first answer** (`POLL_TIMEOUT_SECONDS`, 5 min by default): if nobody answers in time, the poll is closed with a chat message and a `poll_timed_out` event (see below) is pushed instead of an answer.
-- **Debouncing**, once answered (`POLL_DEBOUNCE_INITIAL_SECONDS`, 2 min by default, shortened to `POLL_DEBOUNCE_SUBSEQUENT_SECONDS`, 1 min, on every further answer): waits for the responder to stop changing their answer before compiling and pushing the latest one - capped overall by `POLL_GLOBAL_CAP_SECONDS` (8 min by default, comfortably under Telegram's own 10 min native poll auto-close ceiling) from poll creation, regardless of how many times debouncing resets.
-  No chat message is sent on this path - an answer was already collected, so there's nothing to apologise for.
+- **Debouncing**, once answered (`POLL_DEBOUNCE_INITIAL_SECONDS`, 2 min by default, shortened to `POLL_DEBOUNCE_SUBSEQUENT_SECONDS`, 1 min, on every further answer): waits for the responder to stop changing their answer before compiling and pushing the latest one - capped overall by `POLL_GLOBAL_CAP_SECONDS` (8 min by default, comfortably under Telegram's own 10 min native poll auto-close ceiling) from poll creation, regardless of how many times debouncing resets. No chat message is sent on this path - an answer was already collected, so there's nothing to apologise for.
 
 Whether a closure pushes a `poll_answer` or a `poll_timed_out` event depends solely on whether the poll was ever answered, not on why it's closing - a natural debounce expiry, the global cap being reached mid-debounce, and a startup orphan-sweep closure (see below) all resolve identically.
 
@@ -389,18 +373,15 @@ Pushed instead of an answer when a poll's "awaiting first answer" phase elapses 
 - The decision belongs to that agent (re-ask, treat as declined, escalate, or simply send back `completed`/`error`) - not to the orchestrator, and not to this gateway.
 - If nothing ever acts on it (agent bug, crash, dropped message), a `session_reset` deferred behind that `task_id` doesn't wait forever either - see `PENDING_RESET_MAX_WAIT_SECONDS` under `session_reset` below.
 
-The timer above is **in-memory only** - it does not survive an application restart, though the Redis-backed poll record does (its own TTL, `POLL_MAPPING_TTL_SECONDS`, slightly beyond `POLL_GLOBAL_CAP_SECONDS`, refreshed on every answer so it always reflects the latest one).
-To avoid a poll sitting open indefinitely with an uncollected answer, `close_orphaned_polls()` sweeps Redis for any leftover poll on startup, before polling resumes, and closes each one out immediately - pushing whatever answer it already has, same as any other closure path.
+The timer above is **in-memory only** - it does not survive an application restart, though the Redis-backed poll record does (its own TTL, `POLL_MAPPING_TTL_SECONDS`, slightly beyond `POLL_GLOBAL_CAP_SECONDS`, refreshed on every answer so it always reflects the latest one). To avoid a poll sitting open indefinitely with an uncollected answer, `close_orphaned_polls()` sweeps Redis for any leftover poll on startup, before polling resumes, and closes each one out immediately - pushing whatever answer it already has, same as any other closure path.
 
 ### Delivery Failure Events (gateway -> backend)
 
-When a Telegram send fails, the gateway does not simply stay silent about it - it pushes one of two event types onto `Q_CHANNEL_OUT`, depending on whether the failure is specific to one task or systemic (see `utils_queue/error_handling.py`).
-Both share the type discriminator convention of the other gateway -> backend payloads above.
+When a Telegram send fails, the gateway does not simply stay silent about it - it pushes one of two event types onto `Q_CHANNEL_OUT`, depending on whether the failure is specific to one task or systemic (see `utils_queue/error_handling.py`). Both share the type discriminator convention of the other gateway -> backend payloads above.
 
 #### `delivery_failed` (Tier 1 - per-task, actionable)
 
-A specific send was rejected by Telegram (e.g. an invalid `parse_mode`, a malformed poll), or failed local validation before ever reaching Telegram (e.g. an oversized message, an invalid inline keyboard).
-Reported per `task_id`, since the backend/orchestrator can react by retrying that same task differently - a different content type, a shorter message, and so on.
+A specific send was rejected by Telegram (e.g. an invalid `parse_mode`, a malformed poll), or failed local validation before ever reaching Telegram (e.g. an oversized message, an invalid inline keyboard). Reported per `task_id`, since the backend/orchestrator can react by retrying that same task differently - a different content type, a shorter message, and so on.
 
 ```json
 {
@@ -421,8 +402,7 @@ Reported per `task_id`, since the backend/orchestrator can react by retrying tha
 
 #### `gateway_alert` (Tier 2 - systemic, not tied to any task)
 
-Telegram is unreachable altogether (connection/timeout exhausted after `TELEGRAM_SEND_MAX_ATTEMPTS` retries), or the bot token itself is invalid/revoked (`401`/`404`).
-No per-task retry or different tool fixes either - human intervention is the only useful response.
+Telegram is unreachable altogether (connection/timeout exhausted after `TELEGRAM_SEND_MAX_ATTEMPTS` retries), or the bot token itself is invalid/revoked (`401`/`404`). No per-task retry or different tool fixes either - human intervention is the only useful response.
 
 ```json
 {
@@ -437,9 +417,7 @@ No per-task retry or different tool fixes either - human intervention is the onl
 - `task_id` / `session_id`: always `null` - this isn't about any single task or chat.
 - `reason`: `unauthorized` (a 401 was returned), `not_found` (a 404 was returned - see below), or `unreachable` (connection failed/timed out across every retry).
 - `status_code`: Telegram's HTTP status code if one was returned (`401`/`404`); `null` for `unreachable`.
-- `unauthorized`/`not_found` fire immediately, bypassing the threshold below.
-  Every endpoint the gateway calls is a fixed, hardcoded path, so a 404 here can't mean "wrong URL" - like a 401, it means the token doesn't resolve to a real bot (deleted/revoked/malformed).
-  Both are permanent config issues, not blips, so retries won't fix either.
+- `unauthorized`/`not_found` fire immediately, bypassing the threshold below. Every endpoint the gateway calls is a fixed, hardcoded path, so a 404 here can't mean "wrong URL" - like a 401, it means the token doesn't resolve to a real bot (deleted/revoked/malformed). Both are permanent config issues, not blips, so retries won't fix either.
 - `unreachable` only fires once `GATEWAY_ALERT_FAILURE_THRESHOLD` (5 by default) consecutive send failures have accumulated across *all* sends - a single blip is expected noise, not a systemic signal.
 - Either way, fires **once per incident**: a successful send afterwards re-arms it, so an ongoing outage doesn't spam one alert per failed message.
 - Always logged at `CRITICAL` first, regardless of whether the push to `Q_CHANNEL_OUT` itself succeeds - so the alert stays visible via infra/log-based monitoring even if RabbitMQ is part of what's broken.
@@ -501,10 +479,7 @@ Messages consumed by the gateway from the response queue (agent -> gateway) all 
 {"task_id": "...", "session_id": "...", "type": "<type>", ...}
 ```
 
-`task_id` is required on every payload and correlates back to a `chat_id`/`user_id` stored in Redis - responses never carry chat/user identity directly, keeping agents identity-blind.
-`session_id` is likewise mandatory on every payload (see "`task_id` vs `session_id`" in Design Decisions above) - the gateway itself resolves delivery via `task_id`/Redis regardless, so `session_id` here is primarily for the backend/orchestrator's own routing between multiple sessions/bots.
-`type` selects which of the payload shapes below applies.
-Consuming any payload, regardless of `type`, also stops that `task_id`'s outbound "typing..." indicator if one is active (see `utils_telegram/utilities/typing_indicator.py`) - this is not itself a distinct `type`.
+`task_id` is required on every payload and correlates back to a `chat_id`/`user_id` stored in Redis - responses never carry chat/user identity directly, keeping agents identity-blind. `session_id` is likewise mandatory on every payload (see "`task_id` vs `session_id`" in Design Decisions above) - the gateway itself resolves delivery via `task_id`/Redis regardless, so `session_id` here is primarily for the backend/orchestrator's own routing between multiple sessions/bots. `type` selects which of the payload shapes below applies. Consuming any payload, regardless of `type`, also stops that `task_id`'s outbound "typing..." indicator if one is active (see `utils_telegram/utilities/typing_indicator.py`) - this is not itself a distinct `type`.
 
 #### `poll`
 Maps to Telegram's `sendPoll`.
@@ -517,12 +492,9 @@ Maps to Telegram's `sendPoll`.
   "allows_multiple_answers": false
 }
 ```
-- `question`: 1-300 characters.
-  If missing, the whole poll is dropped and logged.
-- `options`: 1-12 items, each 1-100 characters.
-  Null/empty entries are filtered out; the poll is sent with whatever remains.
-- `is_anonymous` is not accepted here - always `TELEGRAM_POLL_ANONYMOUS` (`false` by default), not caller-configurable.
-  See "Poll answers" above for how an answer is collected and pushed back.
+- `question`: 1-300 characters. If missing, the whole poll is dropped and logged.
+- `options`: 1-12 items, each 1-100 characters. Null/empty entries are filtered out; the poll is sent with whatever remains.
+- `is_anonymous` is not accepted here - always `TELEGRAM_POLL_ANONYMOUS` (`false` by default), not caller-configurable. See "Poll answers" above for how an answer is collected and pushed back.
 
 #### `image`
 Maps to Telegram's `sendPhoto`.
@@ -550,8 +522,7 @@ Maps to Telegram's `sendMediaGroup`.
   ]
 }
 ```
-- `items`: any number of entries.
-  Telegram's `sendMediaGroup` only accepts 2-10 per call, so the gateway handles the edge cases automatically:
+- `items`: any number of entries. Telegram's `sendMediaGroup` only accepts 2-10 per call, so the gateway handles the edge cases automatically:
   - 1 item: sent via `sendPhoto`/`sendVideo` instead of a media group.
   - More than 10: split into multiple `sendMediaGroup` calls of up to 10 each - if the final chunk has only 1 item, it falls back the same way.
 - Each item's `type` must be `photo` or `video` - photos and videos can be mixed freely.
@@ -565,12 +536,10 @@ Maps to Telegram's `sendDocument`.
 {"task_id": "...", "type": "file", "url": "...", "caption": "..."}
 ```
 - `caption`: optional, see caption length note below.
-- `url` is fetched by Telegram server-side, same as `image`/`video` - **but Telegram only supports sending a document by URL for `.pdf` and `.zip` files.**
-  Any other file type sent this way is rejected; a direct multipart upload would be required instead, which is not implemented.
+- `url` is fetched by Telegram server-side, same as `image`/`video` - **but Telegram only supports sending a document by URL for `.pdf` and `.zip` files.** Any other file type sent this way is rejected; a direct multipart upload would be required instead, which is not implemented.
 
 ##### Caption length (`image`/`video`/`file`)
-Telegram caps captions at 1024 characters and rejects the entire send if exceeded, rather than truncating it.
-The gateway handles this automatically: the caption is cut to the limit for the media send, and anything beyond that is sent as a separate follow-up `sendMessage` instead of being lost or causing the send to fail.
+Telegram caps captions at 1024 characters and rejects the entire send if exceeded, rather than truncating it. The gateway handles this automatically: the caption is cut to the limit for the media send, and anything beyond that is sent as a separate follow-up `sendMessage` instead of being lost or causing the send to fail.
 
 #### `text`
 Maps to Telegram's `sendMessage`.
@@ -587,8 +556,7 @@ Maps to Telegram's `sendMessage`.
   ]
 }
 ```
-- `buttons`: optional.
-  Rows of inline keyboard buttons, each `{"text": "...", "purpose": "...", "payload": {...}}`.
+- `buttons`: optional. Rows of inline keyboard buttons, each `{"text": "...", "purpose": "...", "payload": {...}}`.
   - `purpose`: caller-defined tag, read back when the press is validated so the gateway knows how to route it.
   - `payload`: optional caller-defined context retrieved alongside the press.
   - Each button is registered with a bot-issued `callback_data` token (see `utils_telegram/utilities/button_prompt_handler.py`) - the agent never supplies `callback_data` directly.

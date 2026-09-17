@@ -142,6 +142,10 @@ Exits `0` on success, `1` on failure - check the container logs either way for d
 - A session's on-disk directory is laid out `SESSION_DIR/<session_id>/<call_type>/<llm_type>` (e.g. `.../chat/claude`) - a stable root per `session_id`, with one leaf subdirectory per Call/LLM-provider combination actually used for it, rather than a single directory per session. This is what lets two different Calls (or the same LLM reused by two different Calls) each keep their own isolated Claude working-directory/session anchor for the same `session_id`, once handoff between Calls is wired (see `CODE_TODO.md`).
 - A global session reset's accept/reject decision is a single in-memory flag - whether an earlier sweep is still draining - not a comparison against the requesting admin or request identity; any request arriving while one is in progress is rejected the same way regardless of who or what triggered it.
 - All wall-clock timing - log timestamps, `SESSION_RESET_TIME` scheduling, throttle timestamps - is anchored to one configurable timezone (`TZ`) via a single shared time-retrieval helper, rather than each module reading the container's own local time independently.
+- Claude's own credential (OAuth token or API key) is bridged into the SDK's expected environment variable exactly once, at startup, rather than resolved on every call.
+- Claude's own session continuity uses an explicit `resume=<session_id>` marker captured from each call's own result, since `continue_conversation=True` was found empirically unreliable across separate SDK calls.
+- `claude_session_service.py` maintains one persistent Claude client per generation directory, never pooled or shared across sessions, which is what guarantees prompt-cache isolation between different sessions.
+- A Claude library file change is detected by re-parsing it fresh on every turn and comparing it against the client's own stored persona, reconnecting only on an actual change.
 
 ### Limitations
 
@@ -152,6 +156,7 @@ Exits `0` on success, `1` on failure - check the container logs either way for d
 - `qwen_interface.py`'s endpoint/model are unconfirmed assumptions, not verified against a real account.
 - A failed `session_reset`/rejection publish during a global session reset has no retry or backstop - the requesting admin's task may be left open on `telegram_gateway`'s side.
 - A session receiving a continuous, gapless stream of messages can delay its own retirement indefinitely during a global session reset, blocking every later reset request until it finishes.
+- A call against Claude's persistent session platform that exceeds `AGENT_QUERY_TIMEOUT_SECONDS` is only best-effort cancelled - the abandoned call may continue running in the background, though the next call for that same session always builds a fresh client rather than queuing behind it.
 
 ### Environment Variables
 
@@ -179,6 +184,14 @@ Exits `0` on success, `1` on failure - check the container logs either way for d
 | LLM_CODEX_ACCESS_TYPE / LLM_CODEX_TOKEN | Codex's access type and credential. |
 | LLM_DEEPSEEK_ACCESS_TYPE / LLM_DEEPSEEK_TOKEN | DeepSeek's access type (`"API"` only) and API key. |
 | LLM_QWEN_ACCESS_TYPE / LLM_QWEN_TOKEN | Qwen's access type (`"API"` only) and API key. |
+
+#### Agent Call Pipeline
+
+| Variable | Purpose |
+|---------|---------|
+| CALL_MAX_HOPS | Maximum handoff/corrective-retry hops a single turn may consume before it is closed with an error. |
+| AGENT_QUERY_TIMEOUT_SECONDS | Maximum seconds to wait for a reply from an always-on, persistent-connection agent session platform (today, only Claude's). |
+| AGENT_SHUTDOWN_TIMEOUT_SECONDS | Maximum seconds to wait for such a platform's clients/thread to stop cleanly during shutdown. |
 
 #### Bot Identity
 
