@@ -13,8 +13,13 @@
 # Notes       :
 #   - Claude's credential is resolved once at startup by initialise_claude(), not per call.
 #   - query_via_oauth()/query_via_api() take no token argument, unlike every other provider's own equivalent.
-#   - persona is parsed for an optional YAML frontmatter block (tools/model) plus a system prompt body.
+#   - persona/tools/model are resolved internally by _run_query() itself, via agent_persona.parse_agent(),
+#     derived from session_dir - not passed in from any caller. See _run_query()'s own Notes.
 #   - Session continuity uses an explicit resume=<session_id> marker file, since continue_conversation was found empirically unreliable across separate calls.
+#   - _run_query() is bounded by settings.AGENT_QUERY_TIMEOUT_SECONDS, deliberately mirroring
+#     claude_session_service.py::query_via_service()'s own timeout handling exactly (same constant, same
+#     discard-on-timeout, same bare None return) - added 2026-09-19, per explicit instruction that the API
+#     path should behave the same as the OAuth path, not differently from it.
 #   - See agent_interface.py for the provider-agnostic dispatch that selects this module.
 #   - See README.md for the full credential-resolution and session-continuity design rationale.
 #
@@ -22,7 +27,7 @@
 # I M P O R T   H E A D E R
 
 import os
-import re
+import asyncio
 import logging
 
 from pathlib import Path
@@ -30,15 +35,13 @@ from pathlib import Path
 from claude_agent_sdk import AssistantMessage, ClaudeAgentOptions, ResultMessage, TextBlock, ToolResultBlock, ToolUseBlock, query as claude_query
 
 from ....config import settings
+from ..agent_persona import call_name_from_session_dir, parse_agent
 from ..services.claude_session_service import destroy_sessions_under, query_via_service, start_claude_session_service, stop_claude_session_service
 
 # =============================================================================
 # G L O B A L   V A R I A B L E
 
 logger = logging.getLogger(__name__)
-
-_FRONTMATTER_DELIMITER = "---"
-_FRONTMATTER_LINE_PATTERN = re.compile(r"^(name|description|tools|model):\s*(.*)$")
 
 # Marker file this module reads/writes inside a given session_dir to remember Claude's own session_id across
 # separate _run_query() calls - see _read_resume_id()/_write_resume_id(). Colocated with session_dir
@@ -48,45 +51,6 @@ _FRONTMATTER_LINE_PATTERN = re.compile(r"^(name|description|tools|model):\s*(.*)
 _SESSION_ID_MARKER_FILENAME = ".claude_session_id"
 
 # =============================================================================
-
-def _parse_persona(persona: str) -> tuple[str, list[str] | None, str | None]:
-    """
-    Splits persona content into its Claude-specific frontmatter (tools/model) and body system prompt.
-
-    Args:
-        persona (str):
-            Raw persona content - an optional leading "---" frontmatter block followed by the system prompt body.
-
-    Returns:
-        tuple[str, list[str] | None, str | None]:
-            (body, tools, model) - frontmatter stripped from body; tools/model are None if absent.
-    """
-    lines = persona.splitlines()
-    tools = None
-    model = None
-    body_lines = lines
-
-    has_frontmatter = bool(lines) and lines[0].strip() == _FRONTMATTER_DELIMITER
-    if has_frontmatter:
-        closing_index = None
-        for index in range(1, len(lines)):
-            if lines[index].strip() == _FRONTMATTER_DELIMITER:
-                closing_index = index
-                break
-
-        if closing_index is not None:
-            for line in lines[1:closing_index]:
-                match = _FRONTMATTER_LINE_PATTERN.match(line.strip())
-                if match is not None:
-                    key, value = match.group(1), match.group(2).strip()
-                    if key == "tools":
-                        tools = [tool.strip() for tool in value.split(",") if tool.strip()]
-                    elif key == "model":
-                        model = value or None
-            body_lines = lines[closing_index + 1:]
-
-    body = "\n".join(body_lines).strip()
-    return body, tools, model
 
 def _read_resume_id(session_dir: Path | None) -> str | None:
     """
@@ -168,6 +132,51 @@ def _find_transcript(session_id: str) -> Path | None:
             logger.exception(f"Failed to search ~/.claude/projects/ for session_id={session_id}'s transcript - diagnostic lookup only, not fatal.")
             return None
 
+async def _collect_claude_response(prompt: str, options: ClaudeAgentOptions | None, session_dir: Path | None) -> tuple[list[str], str | None]:
+    """
+    Consumes claude_query()'s own message stream to completion, collecting it into one final reply.
+
+    Args:
+        prompt (str):
+            The prompt to send.
+
+        options (ClaudeAgentOptions | None):
+            The already-resolved options (persona/tools/model/session continuity) to query with.
+
+        session_dir (Path | None):
+            This call's own working-directory anchor - used only for log-message context here, not logic.
+
+    Returns:
+        tuple[list[str], str | None]:
+            The assistant's own text fragments (one per TextBlock, in arrival order), and the session_id
+            captured from this call's own ResultMessage (None if none arrived).
+
+    Notes:
+        - Module-level, not nested inside _run_query() - factored out solely so its own async for loop can be
+          bounded by asyncio.wait_for() at that call site, which cannot wrap an async for statement directly.
+        - Collects rather than streams: nothing here is yielded progressively to a caller - the full message
+          stream is consumed internally and returned as one aggregate result once exhausted.
+        - ToolUseBlock/ToolResultBlock content is logged for diagnostic purposes only.
+    """
+    parts: list[str] = []
+    session_id: str | None = None
+    async for message in claude_query(prompt=prompt, options=options):
+        if isinstance(message, AssistantMessage):
+            for block in message.content:
+                if isinstance(block, TextBlock):
+                    parts.append(block.text)
+                elif isinstance(block, ToolUseBlock):
+                    logger.info(f"Claude tool_use: name={block.name!r} input={block.input} session_dir={session_dir}")
+                elif isinstance(block, ToolResultBlock):
+                    logger.info(f"Claude tool_result: tool_use_id={block.tool_use_id} is_error={block.is_error} content={block.content} session_dir={session_dir}")
+        elif isinstance(message, ResultMessage):
+            session_id = message.session_id
+            # Diagnostic logging, kept from the continue_conversation investigation - still useful to
+            # directly verify resume= is now actually working (session_id staying stable, num_turns
+            # climbing across successive calls at the same session_dir) rather than trusting it silently.
+            logger.info(f"Claude ResultMessage: session_id={message.session_id} num_turns={message.num_turns} is_error={message.is_error} session_dir={session_dir}")
+    return parts, session_id
+
 async def _run_query(prompt: str, persona: str | None = None, session_dir: Path | None = None) -> str | None:
     """
     Runs a single prompt through the Claude Agent SDK and collects the assistant's text reply.
@@ -177,10 +186,12 @@ async def _run_query(prompt: str, persona: str | None = None, session_dir: Path 
             The prompt to send.
 
         persona (str | None):
-            Optional persona/system prompt for this call, parsed via _parse_persona().
+            Fallback system prompt, used only when session_dir is None (e.g. the startup smoke test) - see
+            this function's own Notes on why it's otherwise ignored.
 
         session_dir (Path | None):
-            Optional working-directory anchor for this call. When given, also drives Claude's own session continuity via a resume marker file.
+            Optional working-directory anchor for this call. When given, also drives Claude's own session
+            continuity via a resume marker file, and this call's own persona/tools/model resolution.
 
     Returns:
         str | None:
@@ -189,7 +200,20 @@ async def _run_query(prompt: str, persona: str | None = None, session_dir: Path 
     Notes:
         - Credential resolution is env-var driven - callers set the relevant env var before calling this.
         - Session continuity is resume-based: this call's session_id is captured and reused on the next call for the same session_dir.
+        - Persona/tools/model are resolved here, locally, right before querying - never passed down from
+          agent_interface.py::query_llm() or any <name>_call.py. call_name_from_session_dir(session_dir) derives
+          which Call this is from session_dir's own <root>/<call_name>/<llm_type> shape, then
+          agent_persona.parse_agent(settings.LLM_TYPE_CLAUDE, call_name) loads that Call's own library file.
+          The persona argument above is only ever consulted when session_dir is None, so a caller with no
+          working-directory anchor (today, only the startup smoke test) still has some way to supply a system
+          prompt directly.
         - ToolUseBlock/ToolResultBlock content is logged for diagnostic purposes only.
+        - Bounded by settings.AGENT_QUERY_TIMEOUT_SECONDS, deliberately mirroring
+          claude_session_service.py::query_via_service()'s own timeout handling exactly - same constant, same
+          discard-everything-on-timeout behaviour, same logger.error() severity/no-stack-trace treatment, same
+          bare None return with no distinguishable error signal. A timeout here is therefore indistinguishable
+          from any other failure to every caller above this function, consistent with the OAuth path's own
+          existing behaviour - not a gap, a deliberate parity choice.
     """
     resume_id = _read_resume_id(session_dir)
     if session_dir is not None:
@@ -202,9 +226,15 @@ async def _run_query(prompt: str, persona: str | None = None, session_dir: Path 
         else:
             logger.info(f"No prior Claude session_id found at session_dir={session_dir} - starting a fresh session.")
 
+    call_name = call_name_from_session_dir(session_dir)
+    if call_name is not None:
+        agent = parse_agent(settings.LLM_TYPE_CLAUDE, call_name)
+        body, tools, model = agent.body, agent.tools, agent.model
+    else:
+        body, tools, model = persona, None, None
+
     options = None
-    if persona or session_dir:
-        body, tools, model = _parse_persona(persona) if persona else (None, None, None)
+    if body or session_dir:
         options = ClaudeAgentOptions(
             system_prompt=body,
             tools=tools,
@@ -214,24 +244,11 @@ async def _run_query(prompt: str, persona: str | None = None, session_dir: Path 
             resume=resume_id,
         )
 
-    reply_parts = []
-    captured_session_id = None
     try:
-        async for message in claude_query(prompt=prompt, options=options):
-            if isinstance(message, AssistantMessage):
-                for block in message.content:
-                    if isinstance(block, TextBlock):
-                        reply_parts.append(block.text)
-                    elif isinstance(block, ToolUseBlock):
-                        logger.info(f"Claude tool_use: name={block.name!r} input={block.input} session_dir={session_dir}")
-                    elif isinstance(block, ToolResultBlock):
-                        logger.info(f"Claude tool_result: tool_use_id={block.tool_use_id} is_error={block.is_error} content={block.content} session_dir={session_dir}")
-            elif isinstance(message, ResultMessage):
-                captured_session_id = message.session_id
-                # Diagnostic logging, kept from the continue_conversation investigation - still useful to
-                # directly verify resume= is now actually working (session_id staying stable, num_turns
-                # climbing across successive calls at the same session_dir) rather than trusting it silently.
-                logger.info(f"Claude ResultMessage: session_id={message.session_id} num_turns={message.num_turns} is_error={message.is_error} session_dir={session_dir}")
+        reply_parts, captured_session_id = await asyncio.wait_for(_collect_claude_response(prompt, options, session_dir), timeout=settings.AGENT_QUERY_TIMEOUT_SECONDS)
+    except asyncio.TimeoutError:
+        logger.error(f"Claude query for session_dir={session_dir} exceeded {settings.AGENT_QUERY_TIMEOUT_SECONDS}s - abandoning it.")
+        return None
     except Exception:
         logger.exception("Claude query failed - credential may be invalid/expired, or the endpoint is unreachable.")
         return None

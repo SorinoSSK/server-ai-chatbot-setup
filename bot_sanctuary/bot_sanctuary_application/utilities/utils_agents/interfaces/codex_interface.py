@@ -11,6 +11,8 @@
 # Notes       :
 #   - No Codex Python SDK exists, so both endpoints shell out to the installed `codex` CLI via `codex exec`.
 #   - persona is delivered via a per-call, throwaway AGENTS.md working directory, removed once the call finishes.
+#   - Persona text is resolved internally by query_via_oauth()/query_via_api(), via agent_persona.parse_agent(),
+#     derived from cwd, whenever cwd is given - not passed in from any caller. See either function's own Notes.
 #   - See agent_interface.py for the provider-agnostic dispatch that selects this module.
 #
 # =============================================================================
@@ -23,6 +25,9 @@ import logging
 import tempfile
 
 from pathlib import Path
+
+from ....config import settings
+from ..agent_persona import call_name_from_session_dir, parse_agent
 
 # =============================================================================
 # G L O B A L   V A R I A B L E
@@ -79,6 +84,32 @@ async def _run_query(prompt: str, env: dict[str, str], persona: str | None = Non
         if call_directory is not None:
             shutil.rmtree(call_directory, ignore_errors=True)
 
+def _resolve_persona(persona: str | None, cwd: Path | None) -> str | None:
+    """
+    Resolves this call's own persona text, locally, right before querying.
+
+    Args:
+        persona (str | None):
+            Fallback persona text, used only when cwd is None.
+
+        cwd (Path | None):
+            Working-directory anchor for this call - see call_name_from_session_dir()'s own Notes for the
+            directory shape this is derived from.
+
+    Returns:
+        str | None:
+            cwd's own resolved persona body if cwd is given and a call_name can be derived from it; otherwise
+            persona, unchanged.
+
+    Notes:
+        - This is the first real use of cwd in this module - previously accepted and ignored (see
+          query_via_oauth()/query_via_api()'s own prior Notes) since Codex had no session-continuity
+          mechanism wired. Harmless today for the same reason: nothing currently calls either function with a
+          real cwd, so this resolves to persona unchanged in practice until that changes.
+    """
+    call_name = call_name_from_session_dir(cwd)
+    return parse_agent(settings.LLM_TYPE_CODEX, call_name).body if call_name is not None else persona
+
 async def query_via_oauth(prompt: str, token: str, persona: str | None = None, cwd: Path | None = None) -> str | None:
     """
     Sends a prompt to Codex, authenticated via the CLI's existing ChatGPT/OAuth login session.
@@ -91,10 +122,11 @@ async def query_via_oauth(prompt: str, token: str, persona: str | None = None, c
             Unused - Codex's OAuth path relies entirely on the CLI's own persisted login session.
 
         persona (str | None):
-            Optional persona/system prompt for this call.
+            Fallback persona/system prompt, used only when cwd is None - see _resolve_persona()'s own Notes.
 
         cwd (Path | None):
-            Unused - accepted only for a uniform signature across every provider. Codex has no session-continuity mechanism wired yet.
+            Working-directory anchor for this call - drives this call's own persona resolution (see
+            _resolve_persona()). Codex has no session-continuity mechanism wired yet beyond that.
 
     Returns:
         str | None:
@@ -104,7 +136,7 @@ async def query_via_oauth(prompt: str, token: str, persona: str | None = None, c
         - Runs with OPENAI_API_KEY absent from the subprocess environment, so codex CLI falls back to its persisted login session.
     """
     env = {key: value for key, value in os.environ.items() if key != "OPENAI_API_KEY"}
-    return await _run_query(prompt, env, persona)
+    return await _run_query(prompt, env, _resolve_persona(persona, cwd))
 
 async def query_via_api(prompt: str, token: str, persona: str | None = None, cwd: Path | None = None) -> str | None:
     """
@@ -118,10 +150,11 @@ async def query_via_api(prompt: str, token: str, persona: str | None = None, cwd
             The OpenAI API key.
 
         persona (str | None):
-            Optional persona/system prompt for this call.
+            Fallback persona/system prompt, used only when cwd is None - see _resolve_persona()'s own Notes.
 
         cwd (Path | None):
-            Unused - accepted only for a uniform signature across every provider. Codex has no session-continuity mechanism wired yet.
+            Working-directory anchor for this call - drives this call's own persona resolution (see
+            _resolve_persona()). Codex has no session-continuity mechanism wired yet beyond that.
 
     Returns:
         str | None:
@@ -131,6 +164,6 @@ async def query_via_api(prompt: str, token: str, persona: str | None = None, cwd
         - Bridges token into OPENAI_API_KEY for this subprocess only.
     """
     env = {**os.environ, "OPENAI_API_KEY": token}
-    return await _run_query(prompt, env, persona)
+    return await _run_query(prompt, env, _resolve_persona(persona, cwd))
 
 # =============================================================================

@@ -30,7 +30,7 @@ from ..utils_agents.agent_interface import load_persona, query_llm
 
 logger = logging.getLogger(__name__)
 
-CALL_NAME = "chat"
+CALL_NAME = settings.CALL_NAME_CHAT
 
 # =============================================================================
 

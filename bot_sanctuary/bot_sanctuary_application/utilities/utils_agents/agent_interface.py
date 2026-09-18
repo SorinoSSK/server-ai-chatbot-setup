@@ -14,6 +14,9 @@
 # Notes       :
 #   - More than one provider can be configured and used at once - callers pass llm_type explicitly.
 #   - Add a matching <provider>_interface.py and a branch in _resolve_provider() to support a further provider.
+#   - Provider identifiers (settings.LLM_TYPE_CLAUDE/CODEX/DEEPSEEK/QWEN, settings.KNOWN_LLM_TYPES) and the
+#     shared libraries/ filesystem root (settings.LIBRARIES_DIR) live in config.py, not as module constants
+#     here - every interface module references the same instances rather than each typing its own copy.
 #   - persona is passed through to the resolved provider's own native mechanism, never concatenated into prompt.
 #   - Claude is called with no token argument, since its credential is resolved once at startup rather than per call - see claude_interface.py.
 #   - initialise_llm_services()/terminate_llm_services() are provider-agnostic - each delegates to whichever provider module exposes its own initialise_<provider>()/terminate_<provider>() pair.
@@ -37,10 +40,6 @@ from .interfaces import qwen_interface
 
 logger = logging.getLogger(__name__)
 
-_KNOWN_LLM_TYPES = ("claude", "codex", "deepseek", "qwen")
-
-_LIBRARIES_ROOT = Path(__file__).resolve().parent.parent.parent / "libraries"
-
 # =============================================================================
 
 def _resolve_provider(llm_type: str) -> tuple[object, str, str] | None:
@@ -49,19 +48,19 @@ def _resolve_provider(llm_type: str) -> tuple[object, str, str] | None:
 
     Args:
         llm_type (str):
-            Which provider to resolve - "claude", "codex", "deepseek", or "qwen".
+            Which provider to resolve - one of settings.KNOWN_LLM_TYPES.
 
     Returns:
         tuple[object, str, str] | None:
             (provider module, access_type, token) for a recognised llm_type; otherwise None.
     """
-    if llm_type == "claude":
+    if llm_type == settings.LLM_TYPE_CLAUDE:
         return claude_interface, settings.LLM_CLAUDE_ACCESS_TYPE, settings.LLM_CLAUDE_TOKEN
-    elif llm_type == "codex":
+    elif llm_type == settings.LLM_TYPE_CODEX:
         return codex_interface, settings.LLM_CODEX_ACCESS_TYPE, settings.LLM_CODEX_TOKEN
-    elif llm_type == "deepseek":
+    elif llm_type == settings.LLM_TYPE_DEEPSEEK:
         return deepseek_interface, settings.LLM_DEEPSEEK_ACCESS_TYPE, settings.LLM_DEEPSEEK_TOKEN
-    elif llm_type == "qwen":
+    elif llm_type == settings.LLM_TYPE_QWEN:
         return qwen_interface, settings.LLM_QWEN_ACCESS_TYPE, settings.LLM_QWEN_TOKEN
     else:
         return None
@@ -72,7 +71,7 @@ def load_persona(llm_type: str, call_name: str) -> str | None:
 
     Args:
         llm_type (str):
-            Which provider's variant to load - "claude", "codex", "deepseek", or "qwen".
+            Which provider's variant to load - one of settings.KNOWN_LLM_TYPES.
 
         call_name (str):
             Which Call's persona to load - matches that Call's own CALL_NAME (e.g. "chat").
@@ -81,7 +80,7 @@ def load_persona(llm_type: str, call_name: str) -> str | None:
         str | None:
             The raw content of libraries/<llm_type>/<call_name>.md, or None if that file doesn't exist or is empty.
     """
-    library_file = _LIBRARIES_ROOT / llm_type / f"{call_name}.md"
+    library_file = settings.LIBRARIES_DIR / llm_type / f"{call_name}.md"
     if not library_file.is_file():
         return None
     else:
@@ -94,7 +93,7 @@ async def query_llm(llm_type: str, prompt: str, persona: str | None = None, sess
 
     Args:
         llm_type (str):
-            Which provider to use - "claude", "codex", "deepseek", or "qwen".
+            Which provider to use - one of settings.KNOWN_LLM_TYPES.
 
         prompt (str):
             The prompt to send.
@@ -120,12 +119,12 @@ async def query_llm(llm_type: str, prompt: str, persona: str | None = None, sess
         provider, access_type, token = resolved
         access_type = access_type.upper()
         if access_type == "OAUTH":
-            if llm_type == "claude":
+            if llm_type == settings.LLM_TYPE_CLAUDE:
                 return await provider.query_via_oauth(prompt, persona, session_dir)
             else:
                 return await provider.query_via_oauth(prompt, token, persona, session_dir)
         elif access_type == "API":
-            if llm_type == "claude":
+            if llm_type == settings.LLM_TYPE_CLAUDE:
                 return await provider.query_via_api(prompt, persona, session_dir)
             else:
                 return await provider.query_via_api(prompt, token, persona, session_dir)
@@ -161,7 +160,7 @@ def test_llm_tokens() -> None:
     Notes:
         - A provider with no credential configured is skipped, not treated as a misconfiguration.
     """
-    for llm_type in _KNOWN_LLM_TYPES:
+    for llm_type in settings.KNOWN_LLM_TYPES:
         _, _, token = _resolve_provider(llm_type)
         if not token:
             logger.info(f"No credential configured for llm_type={llm_type!r} - skipping its startup LLM credential test.")
