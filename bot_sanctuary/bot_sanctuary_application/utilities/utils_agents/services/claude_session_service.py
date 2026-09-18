@@ -15,13 +15,16 @@
 #   - A broken/crashed client is dropped from the registry and rebuilt fresh on its next use.
 #   - A caller timeout evicts the corresponding registry entry, so the next call always builds a fresh client.
 #   - Registry entries are bounded by session reset, not by an idle timeout.
+#   - Library-file loading/parsing (parse_agent()) lives in agent_persona.py, not this module - moved out
+#     2026-09-18 and generalised (llm_type/call_name are now parameters) so every provider's own interface
+#     module can share it. This module still only ever calls it with settings.LLM_TYPE_CLAUDE + "chat" -
+#     not yet generalised to any other Call, same limitation as before the move.
 #   - See agent_interface.py for the provider-agnostic dispatch that would eventually route into this module.
 #   - See README.md for the full concurrency, caching, and failure-handling design rationale.
 #
 # =============================================================================
 # I M P O R T   H E A D E R
 
-import json
 import logging
 import asyncio
 import threading
@@ -32,23 +35,12 @@ from pathlib import Path
 from claude_agent_sdk import AssistantMessage, ClaudeAgentOptions, ClaudeSDKClient, ResultMessage, TextBlock, ToolResultBlock, ToolUseBlock
 
 from ....config import AgentPersona, settings
+from ..agent_persona import parse_agent
 
 # =============================================================================
 # G L O B A L   V A R I A B L E
 
 logger = logging.getLogger(__name__)
-
-# Placeholder a persona body may use to refer to the bot's own configured name - substituted for
-# settings.TELEGRAM_BOT_NAME by _parse_agent(), never hardcoded into a library file itself. See this module's
-# own Notes for the expected chat.json shape this is meant to be authored against.
-_BOT_NAME_PLACEHOLDER = "{{BOT_NAME}}"
-
-# This service's own library file location - libraries/<llm_type>/chat.json, resolved relative to this file's
-# own location so it doesn't depend on the process's current working directory. Fixed to "claude"/"chat.json"
-# since this module is Claude-specific - a future Codex/Qwen/DeepSeek equivalent would define its own constants
-# pointing at its own library file, rather than sharing these.
-_LLM_TYPE = "claude"
-_LIBRARIES_ROOT = Path(__file__).resolve().parent.parent.parent.parent / "libraries"
 
 # This platform's own dedicated thread and event loop - created by start_claude_session_service(), torn down by
 # stop_claude_session_service(). Never shared with, or touched by, any SessionWorker's own thread.
@@ -75,43 +67,6 @@ class _ClientEntry:
 _clients: dict[str, _ClientEntry] = {}
 
 # =============================================================================
-
-def _parse_agent() -> AgentPersona:
-    """
-    Loads and parses this service's own Claude library file into an AgentPersona.
-
-    Falls back to an empty-but-valid AgentPersona if the file is missing, unreadable, or malformed.
-
-    Args:
-        None
-
-    Returns:
-        AgentPersona:
-            The parsed agent definition, with the bot name placeholder already substituted.
-
-    Notes:
-        - Re-reads the file fresh on every call, which is what allows a library file change to be detected.
-    """
-    path = _LIBRARIES_ROOT / _LLM_TYPE / "chat.json"
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        logger.exception(f"Claude library file not found at {path} - using an empty AgentPersona instead.")
-        return AgentPersona(body="", tools=None, model=None, persona={})
-    except OSError:
-        logger.exception(f"Claude library file at {path} could not be read - using an empty AgentPersona instead.")
-        return AgentPersona(body="", tools=None, model=None, persona={})
-    except json.JSONDecodeError:
-        logger.exception(f"Claude library file at {path} is not valid JSON - using an empty AgentPersona instead.")
-        return AgentPersona(body="", tools=None, model=None, persona={})
-    else:
-        raw_body = data.get("persona", "")
-        body = "\n".join(raw_body) if isinstance(raw_body, list) else str(raw_body)
-        body = body.strip().replace(_BOT_NAME_PLACEHOLDER, settings.TELEGRAM_BOT_NAME)
-
-        tools = data.get("tools") or None
-        model = data.get("model") or None
-        return AgentPersona(body=body, tools=tools, model=model, persona=data)
 
 def _get_registry_lock() -> asyncio.Lock:
     """
@@ -207,7 +162,11 @@ async def _get_or_create_entry(session_dir: Path) -> _ClientEntry:
     key = str(session_dir)
     registry_lock = _get_registry_lock()
     async with registry_lock:
-        agent = _parse_agent()
+        # settings.CALL_NAME_CHAT hardcoded here, matching this module's own pre-existing fixed "chat.json"
+        # lookup - not a new limitation introduced by the agent_persona.py move, see this module's own header
+        # Notes. Was a bare "chat" string literal before settings.CALL_NAME_CHAT existed - same fixed value,
+        # now sourced from one shared constant instead of its own separately-typed copy.
+        agent = parse_agent(settings.LLM_TYPE_CLAUDE, settings.CALL_NAME_CHAT)
         entry = _clients.get(key)
         if entry is not None and entry.agent != agent:
             logger.info(f"Claude library file changed for session_dir={session_dir} since its client was created - reconnecting with the new agent definition instead of continuing on stale configuration.")

@@ -1013,3 +1013,60 @@ Two independent, compounding gaps, confirmed against source:
 - `telegram_gateway_application/utilities/utils_queue/error_handling.py::push_tier1_delivery_failed()` (fix b).
 - `telegram_gateway_application/utilities/utils_redis/database.py`: new `set_pending_retry()`/`pop_pending_retry()` (fix b).
 - Cross-reference: `bot_sanctuary/CODE_TODO.md`'s `_process_batch()` entry (resolved, same day - supplies the retry's actual content).
+
+---
+
+## NEW — `billing_exhausted` error type: a dedicated user message, plus a button whose click starts the typing indicator — planned 2026-09-20, not yet implemented
+
+Status: **Planned only, no `telegram_gateway` code changed.** The `bot_sanctuary` half is implemented (see `bot_sanctuary/CODE_TODO.md`, "billing phases 1 and 2 implemented for DeepSeek and Qwen only"). Raised by direct instruction: give the new error type its own message, and add a button plus handling of its click to start typing.
+
+### Goal
+
+When `bot_sanctuary` reports that its LLM provider's balance or quota is exhausted, the user should get a message written for that situation, with a button they can press, and pressing it should start the typing indicator.
+
+### Context
+
+`bot_sanctuary` now publishes `{"type": "error", "error_type": "billing_exhausted", "message": "The chat agent's usage allowance has run out for now. Please try again later."}` for a DeepSeek 402 or a Qwen 429 `insufficient_quota`. `_handle_error()` (`utils_queue/message_handler.py`) special-cases only `error_type == "token_exhausted"`. Every other type, including this one, falls into the generic branch, so today the user sees "Oh nooo, `<bot>` is having difficulty managing a problem. Error: `<the fixed English text above>`" - correct information, but no bespoke wording and no button.
+
+`token_exhausted` was deliberately not reused for this. It is the "taking a nap" message with a countdown, modelled on a known wait of roughly 5 hours (the user's stated reason). A depleted balance has no known end time, so that message would promise a recovery nobody can guarantee. Hence a separate type.
+
+### Decisions
+
+- **The error type is `billing_exhausted`.** Fixed, agreed, and already emitted by `bot_sanctuary`.
+- **A new branch in `_handle_error()`** for it, with its own persona-style wording, alongside the existing `token_exhausted` branch. The `message` field is not shown as-is once this exists, since its text is a stop-gap.
+- **A button on that message, and the click is picked up by the gateway's existing Telegram update polling** (`callback_query` updates already arrive through `gateway_inbound.py::_handle_update()`). The click starts the typing indicator via `typing_indicator.py::start_typing()`. This reads "polling click" as the existing update polling receiving the `callback_query`, not as a Telegram poll (`sendPoll`) - see Open Question 1.
+- **Wording, label and behaviour after the click are not decided** - see below.
+
+### Implementation Notes (planned)
+
+1. `_handle_error()`: a `billing_exhausted` branch sending the new message through `send_message_with_buttons()` (`button_prompt_handler.py`), with one button.
+2. Register the button with `register_bot_button()` under a new purpose (name not decided), the same mechanism the other buttons use. That registration carries `task_id`, `chat_id`, `purpose`, `payload` and a TTL, and `validate_bot_callback()` makes each press single-use.
+3. `_handle_update()`'s callback branch: handle the new purpose locally, the way `draft_continue` is - not through `_push_button_press()`. See the constraint below.
+4. `gateway/README.md` documents the error types (around its `token_exhausted` line) - add `billing_exhausted` there when this lands.
+
+**Constraint found while planning:** `_handle_error()` calls `delete_task_mapping()` right after sending its message. A press routed through `_push_button_press()` would therefore be pushed against a `task_id` whose mapping no longer exists and be dropped ("No task mapping found"), the same failure the earlier button-press entry above fixed for other purposes. So this click cannot use the generic route back to `bot_sanctuary`, unless the button's handler mints a new task, which is Open Question 2.
+
+**Second constraint:** `start_typing()` is keyed by `task_id` and stops on that task's `completed`/`error`, or on its randomised ping cap. Starting it for a task that is already finished has nothing to stop it except the cap.
+
+### Open Questions
+
+1. What "polling click" means. Read here as the existing update polling receiving the button's `callback_query`. If a Telegram poll (`sendPoll`) was meant instead, the mechanism differs.
+2. **What should the click actually do after it starts typing?** Options: (a) only show typing and then nothing, which looks like a hang and achieves nothing; (b) re-submit the user's last message to `bot_sanctuary` as a new task (needs the original text, which the gateway is not known to retain - not verified - plus a fresh `create_task_mapping()`), so typing accompanies a real retry; (c) something else. This is the main unresolved decision.
+3. Whether a second press, or a press while the balance is still empty, should be handled - the retry would just produce another `billing_exhausted`.
+4. The button's label, and the message wording, in the bot's persona.
+5. Whether to call `answerCallbackQuery` for this button. It was declined for every other button as purely cosmetic (see the earlier button-press entry). Here the click has a visible effect, so it may be worth reopening - not decided.
+6. Whether the button's TTL should follow the existing setting or be longer, given billing exhaustion can last hours or days.
+
+### Follow-up Work
+
+- Decide Open Question 2 first - the rest of the design depends on it.
+- Not verified against a live bot: the current generic display of `billing_exhausted`.
+
+### Where
+
+- `telegram_gateway_application/utilities/utils_queue/message_handler.py`: `_handle_error()`.
+- `telegram_gateway_application/utilities/utils_telegram/utilities/button_prompt_handler.py`: `register_bot_button()`, `validate_bot_callback()`, `send_message_with_buttons()`.
+- `telegram_gateway_application/utilities/utils_telegram/gateway_inbound.py`: `_handle_update()`'s callback branch.
+- `telegram_gateway_application/utilities/utils_telegram/utilities/typing_indicator.py`: `start_typing()`.
+- `telegram_gateway/README.md`: error type documentation.
+- Cross-reference: `bot_sanctuary/CODE_TODO.md`'s billing revision, and the earlier button-press entry above for the same-`task_id` routing and the declined `answerCallbackQuery` item.

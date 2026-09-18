@@ -61,9 +61,6 @@ services:
     volumes:
       - "${DEV_PATH}/${CHATBOT_BOT_SANCTUARY_PATH_NAME}/bot_sanctuary_application:/bot_sanctuary/bot_sanctuary_application"
       - "${DEV_PATH}/${CHATBOT_BOT_SANCTUARY_PATH_NAME}/bot_directory/claude:/home/bot_sanctuary_usr/.claude"
-      - "${DEV_PATH}/${CHATBOT_BOT_SANCTUARY_PATH_NAME}/bot_directory/codex:/home/bot_sanctuary_usr/.codex"
-      - "${DEV_PATH}/${CHATBOT_BOT_SANCTUARY_PATH_NAME}/bot_directory/qwen:/home/bot_sanctuary_usr/.qwen"
-      - "${DEV_PATH}/${CHATBOT_BOT_SANCTUARY_PATH_NAME}/bot_directory/deepseek:/home/bot_sanctuary_usr/.deepseek"
     depends_on:
       rabbitmq:
         condition: service_healthy

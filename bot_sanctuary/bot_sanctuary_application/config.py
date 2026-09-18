@@ -76,6 +76,15 @@ class Settings:
         DEFAULT_TZ                                              = "UTC"
         self.TZ                                                 = get_env_timezone("TZ", DEFAULT_TZ)
 
+        # LLM Provider - fixed identifiers, not environment-driven. Named here once so every interface module
+        # (agent_interface.py, each utils_agents/interfaces/<provider>_interface.py, claude_session_service.py)
+        # references the same constant rather than typing its own copy of the same literal string.
+        self.LLM_TYPE_CLAUDE                                    = "claude"
+        self.LLM_TYPE_CODEX                                     = "codex"
+        self.LLM_TYPE_DEEPSEEK                                  = "deepseek"
+        self.LLM_TYPE_QWEN                                      = "qwen"
+        self.KNOWN_LLM_TYPES                                    = (self.LLM_TYPE_CLAUDE, self.LLM_TYPE_CODEX, self.LLM_TYPE_DEEPSEEK, self.LLM_TYPE_QWEN)
+
         # LLM Provider - each named Call resolves its own LLM_<CALL>_TYPE, falling back to LLM_CHAT_TYPE.
         DEFAULT_LLM_CHAT_TYPE                                   = ""
         self.LLM_CHAT_TYPE                                      = os.getenv("LLM_CHAT_TYPE") or DEFAULT_LLM_CHAT_TYPE
@@ -85,6 +94,14 @@ class Settings:
         self.LLM_REVIEW_TYPE                                    = os.getenv("LLM_REVIEW_TYPE") or self.LLM_CHAT_TYPE
         self.LLM_DOCUMENTATION_TYPE                             = os.getenv("LLM_DOCUMENTATION_TYPE") or self.LLM_CHAT_TYPE
 
+        # Call Names - fixed identifiers, not environment-driven. CALL_NAME_CHAT is named here once so every
+        # module needing the Chat Call's own name (chat_call.py, call_dispatch_handler.py,
+        # claude_session_service.py) references the same constant rather than typing its own copy of the same
+        # literal string - same "fixed identifiers" reasoning as LLM_TYPE_CLAUDE/CODEX/DEEPSEEK/QWEN above.
+        # The other four Calls' own names ("architect"/"coder"/"review"/"documentation") remain each Call's
+        # own local CALL_NAME constant for now - not brought in here, out of scope for this pass.
+        self.CALL_NAME_CHAT                                     = "chat"
+
         # Agent Call Pipeline (see utils_calls/call_dispatch_handler.py)
         # Bounds a single turn's dispatch_queue-driven hop count (each handoff and each corrective retry both
         # consume one hop) - so a misbehaving/looping Call chain can never run indefinitely.
@@ -93,7 +110,10 @@ class Settings:
 
         DEFAULT_LLM_CLAUDE_ACCESS_TYPE                          = ""
         DEFAULT_LLM_CLAUDE_TOKEN                                = ""
-        DEFAULT_LLM_CODEX_ACCESS_TYPE                           = ""
+        # Codex is API-key-only - see codex_interface.py's own header Notes on why OAuth was marked not
+        # developed (2026-09-23) rather than finished, mirroring DEFAULT_LLM_DEEPSEEK_ACCESS_TYPE/
+        # DEFAULT_LLM_QWEN_ACCESS_TYPE's own "API" default below instead of Claude's blank one.
+        DEFAULT_LLM_CODEX_ACCESS_TYPE                           = "API"
         DEFAULT_LLM_CODEX_TOKEN                                 = ""
         DEFAULT_LLM_DEEPSEEK_ACCESS_TYPE                        = "API"
         DEFAULT_LLM_DEEPSEEK_TOKEN                              = ""
@@ -108,13 +128,77 @@ class Settings:
         self.LLM_QWEN_ACCESS_TYPE                               = os.getenv("LLM_QWEN_ACCESS_TYPE") or DEFAULT_LLM_QWEN_ACCESS_TYPE
         self.LLM_QWEN_TOKEN                                     = os.getenv("LLM_QWEN_TOKEN") or DEFAULT_LLM_QWEN_TOKEN
 
+        # Qwen Session (see utils_agents/interfaces/qwen_interface.py)
+        # Qwen's own previous_response_id marker is trusted for at most QWEN_SESSION_TTL_DAYS from its own
+        # creation, deliberately shorter than DashScope's own 7-day server-side context TTL - once past this
+        # cutoff it is treated as expired and a fresh conversation is started, without waiting for DashScope
+        # to reject it. The cutoff is a plain day count from the marker's own creation and is not aligned to SESSION_RESET_TIME - the scheduled reset already removes the whole session directory, marker included, so this TTL is only a backstop for when no reset is configured, one is skipped, or its clearing fails. Alignment was removed 2026-09-20.
+        DEFAULT_QWEN_SESSION_TTL_DAYS                           = 2
+        self.QWEN_SESSION_TTL_DAYS                              = get_env_int("QWEN_SESSION_TTL_DAYS", DEFAULT_QWEN_SESSION_TTL_DAYS)
+
+        # Codex Session (see utils_agents/interfaces/codex_interface.py)
+        # Same shape as QWEN_SESSION_TTL_DAYS above - OpenAI's own Responses API previous_response_id is a
+        # server-side conversation handle, not a local transcript, so this is this application's own, stricter
+        # local trust cutoff, not OpenAI's own retention window (which this application does not rely on being
+        # any particular length - unconfirmed, see CODE_TODO.md). A plain day count from the marker's own
+        # creation, not aligned to SESSION_RESET_TIME - same reasoning as QWEN_SESSION_TTL_DAYS/
+        # DEEPSEEK_SESSION_TTL_DAYS above.
+        DEFAULT_CODEX_SESSION_TTL_DAYS                          = 2
+        self.CODEX_SESSION_TTL_DAYS                             = get_env_int("CODEX_SESSION_TTL_DAYS", DEFAULT_CODEX_SESSION_TTL_DAYS)
+
+        # DeepSeek Session (see utils_agents/interfaces/deepseek_interface.py)
+        # DeepSeek's own /chat/completions endpoint is genuinely stateless - unlike Claude/Qwen, there is no
+        # server-side conversation handle at all, so continuity here means this application storing and
+        # replaying the growing conversation itself (a local transcript file), not a small marker/pointer.
+        # DEEPSEEK_TRANSCRIPT_MAX_BYTES is a size safety net on that file - once the persisted transcript's own
+        # serialized size exceeds this many bytes, the oldest complete turns are dropped until back under the
+        # cap, never trimming below the single most-recently-appended turn.
+        # DEEPSEEK_SESSION_TTL_DAYS is the time-based counterpart, mirroring QWEN_SESSION_TTL_DAYS: the transcript
+        # is discarded once it is this many days old, measured from its own original creation (an absolute age,
+        # not reset by activity). It is a plain day count and is not aligned to SESSION_RESET_TIME (see Session Reset below) - that reset already wipes the transcript, so this TTL is only a backstop. Alignment was removed 2026-09-20.
+        DEFAULT_DEEPSEEK_TRANSCRIPT_MAX_BYTES                   = 200000
+        DEFAULT_DEEPSEEK_SESSION_TTL_DAYS                       = 2
+        self.DEEPSEEK_TRANSCRIPT_MAX_BYTES                      = get_env_int("DEEPSEEK_TRANSCRIPT_MAX_BYTES", DEFAULT_DEEPSEEK_TRANSCRIPT_MAX_BYTES)
+        self.DEEPSEEK_SESSION_TTL_DAYS                          = get_env_int("DEEPSEEK_SESSION_TTL_DAYS", DEFAULT_DEEPSEEK_SESSION_TTL_DAYS)
+
         # Agent Session Platform (see utils_agents/services/claude_session_service.py)
         # Global, provider-agnostic timeouts for any always-on, persistent-connection agent session platform -
         # not specific to Claude, even though it's the only provider with one implemented today.
+        # AGENT_QUERY_TIMEOUT_SECONDS is also the one shared per-query timeout for every one-shot provider path:
+        # claude_interface.py's own API path, and qwen_interface.py's/deepseek_interface.py's HTTP calls (each
+        # adds a 10s margin for its own outer bound) - one value across all providers, not one per provider.
         DEFAULT_AGENT_QUERY_TIMEOUT_SECONDS                     = 120
         DEFAULT_AGENT_SHUTDOWN_TIMEOUT_SECONDS                  = 30
         self.AGENT_QUERY_TIMEOUT_SECONDS                        = get_env_int("AGENT_QUERY_TIMEOUT_SECONDS", DEFAULT_AGENT_QUERY_TIMEOUT_SECONDS)
         self.AGENT_SHUTDOWN_TIMEOUT_SECONDS                     = get_env_int("AGENT_SHUTDOWN_TIMEOUT_SECONDS", DEFAULT_AGENT_SHUTDOWN_TIMEOUT_SECONDS)
+
+        # API Retry (see utils_agents/api_retry.py)
+        # One shared value across every one-shot HTTP LLM provider (deepseek_interface.py, qwen_interface.py), same convention as AGENT_QUERY_TIMEOUT_SECONDS above - not one per provider.
+        # API_RETRY_MAX_ATTEMPTS is the total number of attempts including the first, so 3 means one initial try plus up to two retries. 1 disables retrying.
+        # API_RETRY_BASE_DELAY_SECONDS is the first backoff delay in seconds - each further retry doubles it, plus jitter, capped at 30s.
+        # Only transient failures (HTTP 429/500/502/503/504 and connection-level errors) are retried - a timeout or any other 4xx never is.
+        # API_RETRY_TOTAL_BUDGET_SECONDS bounds when a new attempt may start - a retry is skipped once the time already spent plus its backoff would reach it. It never cancels an attempt in flight, so the worst case is this value plus one attempt's own timeout (AGENT_QUERY_TIMEOUT_SECONDS + 10). The default matches AGENT_QUERY_TIMEOUT_SECONDS's own default rather than following it, so raising that timeout does not raise this budget with it.
+        DEFAULT_API_RETRY_MAX_ATTEMPTS                          = 3
+        DEFAULT_API_RETRY_BASE_DELAY_SECONDS                    = 2
+        DEFAULT_API_RETRY_TOTAL_BUDGET_SECONDS                  = 120
+        self.API_RETRY_MAX_ATTEMPTS                             = get_env_int("API_RETRY_MAX_ATTEMPTS", DEFAULT_API_RETRY_MAX_ATTEMPTS)
+        self.API_RETRY_BASE_DELAY_SECONDS                       = get_env_int("API_RETRY_BASE_DELAY_SECONDS", DEFAULT_API_RETRY_BASE_DELAY_SECONDS)
+        self.API_RETRY_TOTAL_BUDGET_SECONDS                     = get_env_int("API_RETRY_TOTAL_BUDGET_SECONDS", DEFAULT_API_RETRY_TOTAL_BUDGET_SECONDS)
+
+        # Agent Library Files - fixed filesystem layout and placeholder tokens, not environment-driven.
+        # LIBRARIES_DIR is computed once here, relative to this file's own location, rather than each of the
+        # several files that need it independently re-deriving the same absolute path via its own .parent
+        # chain (previously done in agent_interface.py and claude_session_service.py, at two different relative
+        # depths, both resolving to this same directory - a duplication risk if either file ever moved).
+        self.LIBRARIES_DIR                                      = Path(__file__).resolve().parent / "libraries"
+        # Shared, provider-agnostic persona/character-text root (libraries/persona/<call_name>.md) - see
+        # utils_agents/agent_persona.py::load_persona_text(). Deliberately not nested under any single
+        # <llm_type>/ folder, since this text is meant to be referenced identically from any provider's own
+        # library file via PERSONA_PLACEHOLDER, not owned by one provider.
+        self.PERSONA_DIR                                        = self.LIBRARIES_DIR / "persona"
+        # Placeholder tokens a library file's own persona/system-prompt text may use, substituted at load time.
+        self.BOT_NAME_PLACEHOLDER                               = "{{BOT_NAME}}"
+        self.PERSONA_PLACEHOLDER                                = "{{PERSONA}}"
 
         # Bot Identity
         DEFAULT_TELEGRAM_BOT_NAME                               = ""
@@ -195,6 +279,7 @@ class Settings:
         # Empty (the default) means no timed reset at all.
         # Accepts either a 24-hour ("13:00") or a 12-hour ("1:00pm") clock value - see get_env_time() for the exact parsing rules.
         # Interpreted as a wall-clock time in settings.TZ (see above), not whatever zone the host/container happens to be running in.
+        # No LLM provider's own session-expiry logic aligns to this any more - qwen_interface.py's and deepseek_interface.py's local TTL cutoffs are plain day counts (alignment removed 2026-09-20), since this reset already clears their marker/transcript along with the whole session directory.
         DEFAULT_SESSION_RESET_TIME                              = ""
         self.SESSION_RESET_TIME                                 = get_env_time("SESSION_RESET_TIME", DEFAULT_SESSION_RESET_TIME)
 

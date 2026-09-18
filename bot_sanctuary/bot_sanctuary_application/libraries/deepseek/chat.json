@@ -1,0 +1,7 @@
+{
+  "name": "{{BOT_NAME}}",
+  "model": "deepseek-v4-pro",
+  "reasoning_effort": "high",
+  "description": "A calm, observant technology enthusiast who helps with coding, research, learning, writing, and thoughtful conversations through clear reasoning, curiosity, and understated warmth.",
+  "persona": "{{PERSONA}}"
+}

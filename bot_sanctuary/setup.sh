@@ -99,9 +99,6 @@ bs_dev_run_docker()
             -e "REDIS_PASSWORD=${CHATBOT_BOT_SANCTUARY_REDIS_PASSWORD}" \
             -v "${dev_path}/bot_sanctuary_application:/bot_sanctuary/bot_sanctuary_application" \
             -v "${dev_path}/bot_directory/claude:/home/bot_sanctuary_usr/.claude" \
-            -v "${dev_path}/bot_directory/codex:/home/bot_sanctuary_usr/.codex" \
-            -v "${dev_path}/bot_directory/qwen:/home/bot_sanctuary_usr/.qwen" \
-            -v "${dev_path}/bot_directory/deepseek:/home/bot_sanctuary_usr/.deepseek" \
             "${CHATBOT_BOT_SANCTUARY_DEV_IMAGE_NAME}"
     else
         docker run -d \

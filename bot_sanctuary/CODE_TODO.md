@@ -734,3 +734,922 @@ New `_extract_item_text(item)` (`session_worker.py`), called per batch item in p
 
 - `bot_sanctuary_application/utilities/utils_session/session_worker.py::_extract_item_text()`, `_process_batch()`.
 - Cross-reference: `telegram_gateway/CODE_TODO.md`'s button-press entry (resolved, same day) and its `delivery_failed` entry (resolved, same day - the `delivery_failed` branch above is this entry's counterpart to that fix).
+
+---
+
+## BUG — `load_persona()` reads a dead `.md` file extension; every provider's API/one-shot persona has been silently empty since the library files migrated to `.json`
+
+Status: **Scoped (2026-09-17), not yet implemented.** Found while verifying `claude_interface.py::query_via_api()`'s own readiness ("claude_interface is now ready for SDK query but it is not ready for API query") - a robustness review of the Claude API-access-mode call path, not a bug report against a specific observed failure.
+
+### Context
+
+Tracing `query_via_api()`'s full call chain (`chat_call.handle()` → `agent_interface.query_llm()` → `claude_interface.query_via_api()` → `_run_query()`) to check its readiness surfaced that `agent_interface.py::load_persona(llm_type, call_name)` reads `libraries/<llm_type>/<call_name>.md` - confirmed against the actual `libraries/` tree that **no `.md` file exists anywhere in it any more**; every library file, for every provider (`claude`/`codex`/`deepseek`/`qwen`) and every Call (`chat`/`architect`/`coder`/`review`/`documentation`), is now `.json` (e.g. `libraries/claude/chat.json`, already documented elsewhere in this file as the format `claude_session_service.py::_parse_agent()` reads). `load_persona()`'s own `if not library_file.is_file(): return None` guard means it has been returning `None` unconditionally, for every provider and every Call, since whichever undocumented migration moved these files from `.md` to `.json` - this file has no prior entry recording that migration at all.
+
+**Consequence, confirmed by trace, not yet observed live:** every `<name>_call.py::handle()` (`chat_call.py`, `architect_call.py`, `coder_call.py`, `review_call.py`, `documentation_call.py`) calls `load_persona(...)` and passes its result straight into `query_llm(..., persona=...)`. For Claude specifically, `persona=None` means `claude_interface.py::_parse_persona()` never runs (guarded by `_parse_persona(persona) if persona else (None, None, None)`), so `query_via_api()`'s `ClaudeAgentOptions` is built with `system_prompt=None, tools=None, model=None` - the entire persona body, the `WebSearch` tool grant, and the `"sonnet"` model override that `chat.json` defines never reach the LLM on this path at all. The three non-Claude providers' own `_run_query()` (`codex`/`deepseek`/`qwen`) accept `persona` as an opaque string written to a per-call `AGENTS.md` - they'd receive `None` too, so this is a shared regression, not Claude-specific, even though this review only traced Claude's own path in depth.
+
+**Separately, even once `load_persona()` finds the right file, `claude_interface.py::_parse_persona()` is the wrong parser for it.** It expects a `---\ntools: ...\nmodel: ...\n---` frontmatter block over a plain-text body - `chat.json`'s actual shape (`{"persona": [...], "tools": [...], "model": "...", ...}`) is structured JSON, already correctly parsed by `claude_session_service.py::_parse_agent()`, a different function entirely. Fixing the file lookup alone would not be sufficient for Claude's `tools`/`model` extraction to start working - it would just start reading raw JSON text as if it were a persona body with no frontmatter, silently dropping `tools`/`model` again in a different way.
+
+### Root Cause
+
+Two independent, previously undocumented gaps compounding: (1) the library-file-format migration from `.md` to `.json` was never reflected in `agent_interface.py::load_persona()`, which was written against the older format and has no entry in this file recording either the migration or the break; (2) `claude_interface.py::_parse_persona()` was written for a frontmatter-over-plain-text shape that predates `chat.json`'s now-established structured-JSON convention, and the two were never reconciled once `claude_session_service.py::_parse_agent()` introduced the JSON convention for the OAuth/persistent path.
+
+### Decisions (scoped, not yet implemented)
+
+- **Not yet decided which of two shapes the fix should take, flagged explicitly rather than picked unilaterally:**
+  1. Make `agent_interface.py::load_persona()` JSON-aware for all four providers uniformly (read `.json`, return the joined `persona` text only) - minimal, fixes the universal regression identically everywhere, but still leaves Claude's `tools`/`model` fields unread on this path, same gap as today.
+  2. Give Claude its own dedicated JSON loader inside `claude_interface.py` (a `call_name`-parameterised sibling of `claude_session_service.py::_parse_agent()`), used by `query_via_api()` in place of `load_persona()`+`_parse_persona()` entirely - fixes `tools`/`model` too, but diverges Claude further from the other three providers' shared `load_persona()` call site, and duplicates `_parse_agent()`'s own JSON-reading logic in a second file rather than sharing it.
+  - Leaning towards (2) for Claude specifically, since `tools`/`model` genuinely need to reach `ClaudeAgentOptions` and `_parse_agent()`'s reading pattern already proves out the right shape for this exact file format - not committed without confirming, since it also touches `chat_call.py`'s existing `load_persona(...)` call site.
+- **This entry deliberately does not extend to fixing `codex_interface.py`/`deepseek_interface.py`/`qwen_interface.py`'s own equally-broken persona loading** - out of scope for this review (Claude-focused), flagged as a shared root cause above so it isn't mistaken for Claude-only, but not scoped further here.
+
+### Open Questions
+
+1. Which of the two fix shapes above to take for Claude - not yet decided.
+2. Whether `agent_interface.py::load_persona()`'s universal `.md`→`.json` fix (needed regardless of which Claude-specific shape is chosen, since `codex`/`deepseek`/`qwen` still depend on it) should be done in the same pass as Claude's fix, or split into its own separately-tracked entry given it affects three other providers this review didn't otherwise touch.
+3. Not yet verified live - this whole entry is a code-trace finding (per this file's own established dry-run-trace precedent, e.g. the `chat_call.py` `cwd` bug entry above), not something observed against a real failed reply yet, since `config.ini` is currently set to `"OAUTH"` for Claude and this bug only bites the `"API"` access type/the other three providers' own paths.
+
+### Follow-up Work
+
+- Decide the fix shape (Open Question 1), implement it, then verify by confirming `ClaudeAgentOptions`'s `system_prompt`/`tools`/`model` are actually populated on a real `query_via_api()` call (e.g. via the existing `ToolUseBlock`/`ToolResultBlock` diagnostic logging already in `_run_query()`).
+- Decide whether to open a separate tracked entry for `codex`/`deepseek`/`qwen`'s own share of the universal `load_persona()` regression (Open Question 2).
+
+### Where
+
+- `bot_sanctuary_application/utilities/utils_agents/agent_interface.py::load_persona()`.
+- `bot_sanctuary_application/utilities/utils_agents/interfaces/claude_interface.py::_parse_persona()`, `_run_query()`.
+- Cross-reference: `bot_sanctuary_application/utilities/utils_agents/services/claude_session_service.py::_parse_agent()` (the correct-format JSON reader this entry proposes reusing the shape of).
+
+---
+
+## NEW — Claude API-access-mode wiring: confirm the fixed persona actually reaches `query_via_api()`'s `ClaudeAgentOptions`
+
+Status: **Scoped (2026-09-17), not yet implemented - blocked on the entry immediately above.**
+
+### Context
+
+Raised initially as its own item ("wire up API query to `query_via_api()`") alongside the persona-loading bug above and the timeout-hardening entry below. Verified by trace: `agent_interface.py::query_llm()`'s dispatch layer already calls `provider.query_via_api(prompt, persona, session_dir)` correctly for `llm_type="claude"` when `access_type="API"` - that wiring is not broken and needs no change. What actually remains is narrower than a separate "wiring" task: once the persona-loading bug above is fixed, the fixed persona/`tools`/`model` need to actually flow into `query_via_api()`'s own `ClaudeAgentOptions(...)` construction inside `_run_query()` - the second half of that same fix, not an independent gap at the dispatch level.
+
+### Decisions
+
+- **Folded into the persona-loading entry's own fix rather than tracked as fully separate work** - kept as its own entry here only so the verification step (confirming the fix actually reaches `ClaudeAgentOptions`, not just that a parser was written) doesn't get silently skipped once the entry above is marked resolved.
+- **No dispatch-level change anticipated** - `query_llm()`/`agent_interface.py` are not expected to need any change; this is scoped entirely to `claude_interface.py`'s own internals.
+
+### Open Questions
+
+- None beyond the parent entry's Open Question 1 (which fix shape) - this entry's own scope is fully determined by that decision.
+
+### Follow-up Work
+
+- Once the persona-loading fix lands, verify via the existing `ToolUseBlock`/tool-use diagnostic logging (already present in `_run_query()`) that a real `query_via_api()` call shows `WebSearch` actually being permitted/attempted, and that the model's replies reflect the persona body - not just that no exception was raised.
+
+### Where
+
+- `bot_sanctuary_application/utilities/utils_agents/interfaces/claude_interface.py::_run_query()` (`ClaudeAgentOptions` construction, API path).
+- Cross-reference: the persona-loading entry immediately above (parent/blocking entry).
+
+---
+
+## NEW — Timeout hardening for `claude_interface.py::_run_query()` (the one-shot API path), with an explicit partial-vs-total-failure trade-off to decide first
+
+Status: **Implemented 2026-09-19.** Scoped 2026-09-17 with three open sub-decisions and an explicit partial-vs-discard trade-off to resolve first (see Decisions below); all resolved the same day as implementation, per explicit instruction to mirror the OAuth path's own existing timeout behaviour exactly rather than design something new for either path.
+
+### Context
+
+`_run_query()` (used by `query_via_api()` always, and by `query_via_oauth()`'s one-shot fallback when `session_dir is None`) has no timeout anywhere in its own call chain - traced through `chat_call.handle()` → `agent_interface.query_llm()` → `claude_interface.query_via_api()` → `_run_query()`'s `async for message in claude_query(...)` loop, and up through `call_dispatch_handler.py::dispatch_call()`'s `await call.handle(...)` and `execute_dispatch_call()`'s `asyncio.run(dispatch_call(...))` - none of these apply a ceiling. A hung or slow-to-return `claude` CLI subprocess (auth retry-looping, network stall) would block that `SessionWorker`'s dedicated thread indefinitely, with no recovery path, unlike the OAuth persistent-platform path's `query_via_service()`, which already wraps its call in `future.result(timeout=settings.AGENT_QUERY_TIMEOUT_SECONDS)` and evicts its client entry on timeout (see the "`query_via_service()`'s timeout path left a session's persistent client entry uncleaned" entry above).
+
+**User-raised caveat, directly informing this entry's own scope rather than a side note:** adding a timeout here risks reproducing the exact abandon-near-complete-work pattern already documented and quantified in this file's own "Token-usage cost review" entry above (the 07:08-07:10 turn, 12 sequential `WebSearch` calls, abandoned at the 120s ceiling with its entire research thrown away) - a timeout firing on a call that was seconds from finishing is not free, and that trade-off was already judged real enough once in this codebase's own history to leave `AGENT_QUERY_TIMEOUT_SECONDS` alone rather than simply raise it (driver 1 of that entry, "explicitly declined, not implemented").
+
+### Decisions (scoped, not yet implemented)
+
+Originally scoped as three open sub-decisions "deliberately not defaulted to mirror `query_via_service()` exactly" - **superseded, same day, per explicit user instruction ("I intend to make API the same as oauth"): mirror it exactly after all**, for both of the two below.
+
+1. ~~Which timeout value - shared constant vs. dedicated.~~ **Decided: reuse `settings.AGENT_QUERY_TIMEOUT_SECONDS`** - the same constant `query_via_service()` already uses, chosen specifically for parity rather than a second tunable to keep in sync with it.
+2. ~~What a timeout should return - partial-salvage vs. discard.~~ **Decided: discard everything**, matching `query_via_service()`'s own discard-on-timeout behaviour exactly - not the partial-reply-salvage option this entry originally floated as "genuinely available here," since the explicit goal is parity with the OAuth path, not a feature it doesn't have.
+3. ~~Whether cancellation actually stops the subprocess - not yet verified.~~ **Resolved via documentation research, 2026-09-19 - not a live test (no execution capability available for one in this pass; see caveat below).** Traced against the SDK's own public changelog/issue tracker (`anthropics/claude-agent-sdk-python`): PR #1082, *"Zombie CLI subprocess prevention - shielded subprocess cleanup from asyncio cancellation so SIGTERM/SIGKILL teardown always runs, preventing orphaned claude child processes when the parent task is cancelled"* - the exact scenario a bare `asyncio.wait_for()` wrapper around `_run_query()`'s loop would trigger - shipped in **v0.2.111 (2026-07-06)**, well before this project's own pinned `claude-agent-sdk==0.2.152`. A second, independent safety net (PR #916 - an `atexit` handler terminating live CLI subprocesses on parent-process exit) covers the case even if in-flight cleanup itself somehow fails. No evidence found of a regression between 0.2.111 and 0.2.152.
+   - **Related, separate finding, not blocking this decision:** the same tracker also shows Issue #378 (`Query.close()` can hang indefinitely on task-group cleanup, up to 100% CPU) - this affects `ClaudeSDKClient.disconnect()` specifically (the OAuth persistent-client teardown path in `claude_session_service.py`), not the one-shot `query()` function `_run_query()` uses. Not a new risk to this codebase either way - `claude_session_service.py`'s own `destroy_session()`/`stop_claude_session_service()` already bound that call via `future.result(timeout=settings.AGENT_SHUTDOWN_TIMEOUT_SECONDS)`, independent of whatever the SDK's own internal cleanup does.
+   - **Caveat, explicitly flagged rather than silently assumed:** this is a documentation-based verification (SDK changelog/GitHub issues), not a live test against this project's own running deployment - no shell/execution access was available in this pass to run a deliberately-slow-prompt test inside the actual container. Recommended before fully relying on this: a quick `pip show claude-agent-sdk` (or equivalent) inside the real container to confirm `0.2.152` is genuinely what's installed there, matching `requirements.txt`.
+
+### Implementation Notes
+
+- **`claude_interface.py` gains `import asyncio`** (new import).
+- **`_run_query()`'s own `async for message in claude_query(...)` loop extracted into a new module-level `async def _collect_claude_response(prompt, options, session_dir) -> tuple[list[str], str | None]`**, placed after `_find_transcript()` and before `_run_query()` - matching this file's own existing convention of module-level private helpers (`_read_resume_id`/`_write_resume_id`/`_find_transcript`), not a nested closure. Takes `prompt`/`options`/`session_dir` as explicit parameters rather than closing over them, so it's independently readable/callable rather than implicitly tied to `_run_query()`'s own local scope. Its message-handling body is otherwise unchanged (`AssistantMessage`/`ToolUseBlock`/`ToolResultBlock`/`ResultMessage` handling copied verbatim), returning `(reply_parts, captured_session_id)`.
+  - **Revised same day, user-requested naming/placement correction:** first implemented as a nested `_collect_reply()` inside `_run_query()` itself - moved out and renamed after the user flagged both the nesting (inconsistent with this file's own convention) and the name (asked for something closer to `_claude_response`, and specifically "streaming, collecting, or waiting?" - resolved as **collecting**: it consumes the SDK's message stream internally and returns one aggregate result, never yielding anything progressively to a caller itself).
+- **`await asyncio.wait_for(_collect_claude_response(prompt, options, session_dir), timeout=settings.AGENT_QUERY_TIMEOUT_SECONDS)`** replaces the bare `async for` - reuses the exact same constant `query_via_service()` already uses (no new setting introduced).
+- **New `except asyncio.TimeoutError:` branch**, ahead of the pre-existing generic `except Exception:` - logs at `logger.error(...)` (matching `query_via_service()`'s own no-stack-trace, expected-condition severity) and returns `None`, with no distinguishable signal from any other failure - deliberate, per the parity decision above, not an oversight.
+- **`_write_resume_id()` only reached on the `else:` branch, unchanged** - a timeout returns before it, so (matching this function's own pre-existing "only write after confirmed success" behaviour) a timed-out call leaves the prior resume marker untouched, same as any other failure already did.
+- **Module header (`Notes`) and `_run_query()`'s own docstring (`Notes`) both updated** to document the new timeout inline, rather than only in this file.
+
+### Open Question raised after implementation, not yet resolved (2026-09-19)
+
+**User-raised concern: the shared `AGENT_QUERY_TIMEOUT_SECONDS` ceiling doesn't represent an equal *effective* budget for both paths.** `claude_query()` (API path) spins up a fresh CLI subprocess on every single call, so that connection overhead sits inside the same 120s window every time. `_run_turn()` (OAuth path) only pays the equivalent `client.connect()` cost when `_get_or_create_entry()` actually has to create/reconnect a client - the first turn of a `session_dir`, or after a failure/eviction/persona-change - every subsequent warm turn has zero connection overhead and gets the full ceiling free for the model's own response time. Net effect: API pays this cost on 100% of calls, OAuth only occasionally - the same nominal ceiling is not the same *effective* thinking-time budget across the two paths, even though the parity decision above was correct for the configured value itself.
+
+Separately checked and ruled out as part of this same concern: whether post-timeout SDK cleanup (subprocess SIGTERM/SIGKILL teardown) needs its own room inside this budget - it doesn't, per the same PR #1082 shielding verified above; that cleanup is shielded from the cancellation our timeout triggers and completes in the background after this function has already returned, non-blocking, identically on both paths.
+
+**Three options presented, not yet decided:**
+1. Accept as-is - simplest, preserves literal parity in the configured value; the asymmetry is inherent to one-shot-vs-persistent architecture regardless of what number is chosen.
+2. Give the API path a small dedicated buffer/separate constant to compensate for its guaranteed per-call spin-up cost, restoring parity in *effective* model-thinking time at the cost of diverging from strict configured-value parity.
+3. Document only, no code change - middle ground, ensures the asymmetry isn't silently forgotten without re-opening the parity decision.
+
+### Follow-up Work (addendum)
+
+- Resolve the open question immediately above once the user decides between the three options.
+
+### Open Questions
+
+None remaining - all four resolved same day (2026-09-19): timeout value and discard-on-timeout decided directly above (mirror `query_via_service()`), subprocess cancellation verified via SDK changelog research above, and a distinguishable `error_type` explicitly rejected as out of scope (see Revision below).
+
+### Follow-up Work
+
+- ~~Resolve Open Question 3 first...~~ **Done** - see the resolved sub-decision 3 above.
+- Spot-check the real deployment's installed `claude-agent-sdk` version against `requirements.txt`'s pinned `0.2.152` (the one caveat left on the cancellation-verification finding above) - not done in this pass, no execution access available.
+- ~~Sequenced after, not before, the persona-loading fix above.~~ **No longer blocking** - the persona-loading fix (`agent_persona.py`, implemented 2026-09-18) already landed before this entry's own implementation.
+
+### Revision (2026-09-19) - OAuth's own (already-implemented) timeout traced end-to-end; found indistinguishable from any other failure by the time it reaches the user
+
+**Context.** Raised while verifying `query_via_oauth()`/`query_via_api()` completeness (persona/tools/sessions, separately reviewed and not reproduced here) - the user asked specifically what error the OAuth path's own existing timeout (`query_via_service()`, `AGENT_QUERY_TIMEOUT_SECONDS`, already implemented, not part of this entry's own scope) actually surfaces. Traced live, not assumed: `query_via_service()` catches `concurrent.futures.TimeoutError` internally, logs it at `logger.error(...)` (no stack trace, since it's an expected/handled condition), evicts the registry entry, and returns `None` - no exception ever reaches `query_via_oauth()`, `query_llm()`, or `chat_call.py`. That `None` propagates untouched into `call_dispatch_handler.py::dispatch_call()`'s existing `if result is None:` branch, which reports `error_type="call_pipeline_unavailable"` / `"The chat agent is not currently available. Please try again later."` - **the exact same `error_type` any other `None`-returning failure produces** (service never started, an unrelated exception inside `_run_turn()`, a genuinely invalid/expired credential). The fact that it was specifically a *timeout* exists only in that one server-side log line - not in the `error_type`, not in the message shown to the end user, not anywhere else in the pipeline.
+
+**Why this belongs on this entry, not a new one:** this entry already plans to add an equivalent timeout to the API path's own `_run_query()` - doing so without also addressing this indistinguishability would just double the number of failure modes that collapse into the same generic `"call_pipeline_unavailable"`, for both access types, rather than fixing it for one and improving the other. Folded in as a fourth sub-decision (Decisions above) and a fourth open question, rather than opened separately.
+
+**Decided, same day, per explicit user instruction ("why are you planning timeout for oauth? I intend to make API the same as oauth"): option (a) below, not (b) - corrected after initially over-scoping this into a two-path redesign.**
+1. **Chosen: log-only parity, no contract change.** `query_llm()`'s `str | None` return contract, and `dispatch_call()`'s generic `"call_pipeline_unavailable"`, stay exactly as they are - OAuth's own timeout already resolves this way today, and the explicit goal is for API to match that, not to improve on it. The new API-path timeout logs with the same clear, greppable severity/phrasing `query_via_service()` already uses (`logger.error(...)`, no stack trace), then returns `None` - identical outward contract to every other failure mode on either path, unchanged from today.
+2. **Rejected: a dedicated `error_type="call_pipeline_timeout"`** (own user-facing message, wider `query_llm()` return contract, touching `agent_interface.py`/both `claude_interface.py` query functions/`dispatch_call()`'s `None`-handling branch) - out of scope. Not what was asked for; OAuth's own error surfacing is not being changed by this entry at all.
+
+### Where (Revision)
+
+- `bot_sanctuary_application/utilities/utils_agents/services/claude_session_service.py::query_via_service()` (the traced, already-implemented OAuth timeout/error path - verification only, no change made).
+- `bot_sanctuary_application/utilities/utils_calls/call_dispatch_handler.py::dispatch_call()` (the `if result is None:` branch that collapses every failure mode, including this one, into `"call_pipeline_unavailable"`).
+- Cross-reference: `bot_sanctuary_application/utilities/utils_agents/agent_interface.py::query_llm()` (the shared return-contract point either fix shape above would need to pass through).
+
+### Where
+
+- `bot_sanctuary_application/utilities/utils_agents/interfaces/claude_interface.py::_run_query()`.
+- Cross-reference: `bot_sanctuary_application/utilities/utils_agents/services/claude_session_service.py::query_via_service()` (the OAuth path's own timeout/eviction precedent, not directly reusable here), the "Token-usage cost review" entry above (the abandon-near-complete-work trade-off this entry's own caveat is drawn from).
+
+---
+
+## NEW — shared `libraries/persona/<call_name>.md` files, referenced via a `{{PERSONA}}` placeholder, replacing `chat.json`'s inline persona array — implemented 2026-09-18
+
+Status: **Implemented 2026-09-18, `chat` only - the other four Calls' persona files exist as empty placeholders, matching this codebase's own existing pattern for their still-empty `<llm_type>/<call_name>.json` files. Revised same day: placeholder capitalised to `{{PERSONA}}`, and every constant this entry introduced was relocated into `config.py` - see "Revision" below.**
+
+### Context
+
+Per explicit instruction: extract `libraries/claude/chat.json`'s inline `"persona"` array (Rukia's full character/instruction text - identity, tone, tool-reply-format contract, JSON-safety rules) out into its own file, so the character text itself doesn't have to live duplicated inside a JSON string array. This also directly answers a question raised the same day while scoping the still-open "Claude API-access-mode wiring"/persona-loading entries above (whether persona-loading could be generalised across providers rather than fixed per-provider): a **shared** `libraries/persona/` folder, outside any single `<llm_type>/` folder, referenced identically by every provider's own library file via one placeholder token, is a genuine provider-agnostic answer to that - the character text only needs writing/updating once, regardless of how many providers a given Call is ever configured to run against, even though today only Claude's `chat.json` actually references it.
+
+### Decisions
+
+- **New folder `bot_sanctuary_application/libraries/persona/`, flat, not nested under any `<llm_type>/` subfolder** - deliberately sits alongside `claude/`/`codex/`/`deepseek/`/`qwen/` rather than inside one of them, since this text is meant to be shared across whichever provider a Call is configured to use, not owned by one provider.
+- **Five files created, one per Call, matching this codebase's own established `CALL_NAME` set** (`chat`, `architect`, `coder`, `review`, `documentation`) - **note:** the instruction that requested this named the third one "code"; named the file `coder.md` instead to match the actual `CALL_NAME = "coder"` already used throughout (`coder_call.py`, `LLM_CODER_TYPE`, the existing `libraries/<llm_type>/coder.json` files) - flagging this substitution rather than silently deviating, since it wasn't confirmed which was intended.
+- **Only `chat.md` has real content** - the exact text that was previously `claude/chat.json`'s `"persona"` array, joined back into plain markdown (list items were already one-line-per-array-entry, so this is a lossless move, not a rewrite). `architect.md`/`coder.md`/`documentation.md`/`review.md` are empty placeholders, mirroring the exact pattern already used for their corresponding still-empty `<llm_type>/<call_name>.json` files elsewhere in `libraries/`.
+- **`libraries/claude/chat.json`'s own `"persona"` field is now the literal string `"{{PERSONA}}"`**, not an array - the actual text is resolved at load time from `libraries/persona/chat.md` instead of being inlined. (Capitalised to `{{PERSONA}}` in the same-day revision below - written as `"{{persona}}"` at first, superseded.)
+- **Substitution lands in `claude_session_service.py::_parse_agent()` only** - the one function that currently actually reads `chat.json`'s structured JSON shape end-to-end (the OAuth/persistent path). `claude_interface.py`'s own API-path persona handling (`_parse_persona()`) is untouched by this entry - it's still on its separate, already-tracked, not-yet-fixed frontmatter-parsing path (see the "Claude API-access-mode wiring"/persona-loading entries above), so this change does not yet reach the API access type at all.
+- **Substitution order: `{{PERSONA}}` first, then `{{BOT_NAME}}`** - `persona/chat.md`'s own content still contains `{{BOT_NAME}}` markers of its own (carried over unchanged from the original array), so resolving `{{PERSONA}}` first lets one subsequent `{{BOT_NAME}}` pass catch every occurrence regardless of which file it originated from, rather than needing two separate bot-name substitution passes.
+- **`call_name` hardcoded to `"chat"` in the new `_load_persona_text()` call site, matching `_parse_agent()`'s own pre-existing hardcoded `"chat.json"` lookup** - not a new limitation introduced here, the same already-documented "only Chat is wired end-to-end" constraint this module already carried before this change.
+
+### Implementation Notes
+
+- ~~New module constants: `_PERSONA_PLACEHOLDER = "{{persona}}"`, `_PERSONA_ROOT = _LIBRARIES_ROOT / "persona"` (deliberately not `_LIBRARIES_ROOT / _LLM_TYPE / "persona"` - see Decisions above on why this sits outside any single provider's own folder).~~ **Superseded the same day - see "Revision" below: none of these are module constants any more, all relocated to `config.py`.**
+- New `claude_session_service.py::_load_persona_text(call_name)` - reads `libraries/persona/<call_name>.md` (via `settings.PERSONA_DIR`), stripped; returns `""` (logged) on missing/unreadable, never raises - matching this module's own existing fallback-not-failure convention for `_parse_agent()` itself.
+- `_parse_agent()`'s existing `body = "\n".join(raw_body) if isinstance(raw_body, list) else str(raw_body)` line needed no change - `raw_body` is now always the string `"{{PERSONA}}"` rather than a list, and the `isinstance` check already falls through to `str(raw_body)` correctly for a plain string.
+- Module header Notes updated to describe the new `{{PERSONA}}` convention and its still-`"chat"`-only reach.
+
+### Revision (2026-09-18, same day) — placeholder capitalised, and every new constant relocated into `config.py`
+
+Per explicit follow-up instruction: capitalise `{{persona}}` → `{{PERSONA}}` (consistency with `{{BOT_NAME}}`'s own existing all-caps convention), and move `_BOT_NAME_PLACEHOLDER`, `_PERSONA_PLACEHOLDER`, `_LIBRARIES_ROOT`, `_PERSONA_ROOT` out of `claude_session_service.py` and into `config.py`, plus `agent_interface.py`'s own separate `_KNOWN_LLM_TYPES`/`_LIBRARIES_ROOT` module constants, with `_KNOWN_LLM_TYPES` itself built from named provider-identifier variables rather than a bare string tuple, shared across every `<provider>_interface.py`.
+
+- **`config.py` gains, all fixed/non-environment-driven (same "computed once here" precedent as `DATA_DIR`/`LOG_DIR`/`SESSION_DIR`):**
+  - `settings.LLM_TYPE_CLAUDE`/`LLM_TYPE_CODEX`/`LLM_TYPE_DEEPSEEK`/`LLM_TYPE_QWEN` - one named constant per provider identifier, and `settings.KNOWN_LLM_TYPES`, a tuple built from those four rather than its own separately-typed string literals.
+  - `settings.LIBRARIES_DIR` - genuine correctness improvement, not just relocation: previously `agent_interface.py` and `claude_session_service.py` each independently computed this same absolute path via a different `.parent` chain (they sit at different depths under `bot_sanctuary_application/`), a duplication risk if either file ever moved. Now computed once, relative to `config.py`'s own location.
+  - `settings.PERSONA_DIR = settings.LIBRARIES_DIR / "persona"`.
+  - `settings.BOT_NAME_PLACEHOLDER = "{{BOT_NAME}}"`, `settings.PERSONA_PLACEHOLDER = "{{PERSONA}}"` (capitalised).
+- **`agent_interface.py`**: `_KNOWN_LLM_TYPES`/`_LIBRARIES_ROOT` module constants removed. `_resolve_provider()`'s `if llm_type == "claude":`/`elif llm_type == "codex":`/etc. branches, `query_llm()`'s two `if llm_type == "claude":` checks, `load_persona()`'s root lookup, and `test_llm_tokens()`'s iteration all switched to the `settings.LLM_TYPE_*`/`settings.KNOWN_LLM_TYPES`/`settings.LIBRARIES_DIR` equivalents. Docstrings updated in place (`"claude", "codex", "deepseek", or "qwen"` → `"one of settings.KNOWN_LLM_TYPES"`).
+- **`claude_session_service.py`**: all four module constants removed outright (not deprecated/kept-as-aliases); `_load_persona_text()`/`_parse_agent()` read `settings.PERSONA_DIR`/`settings.BOT_NAME_PLACEHOLDER`/`settings.PERSONA_PLACEHOLDER`/`settings.LIBRARIES_DIR`/`settings.LLM_TYPE_CLAUDE` directly. `settings` was already imported in this file (`from ....config import AgentPersona, settings`) - no new import needed.
+- **`codex_interface.py`'s own `_CODEX_BINARY = "codex"` constant deliberately left untouched** - it names the CLI executable this module spawns as a subprocess, not the `llm_type` identifier; the two happen to share the same literal text today but are semantically different (a future rename of one would not necessarily imply the other), so it was not folded into `settings.LLM_TYPE_CODEX`.
+- **`claude/chat.json`**: `"persona": "{{persona}}"` → `"persona": "{{PERSONA}}"`.
+- **Not touched:** `deepseek_interface.py`/`qwen_interface.py` have no equivalent hardcoded provider-identifier constant to relocate; `claude_interface.py`'s own separate, already-tracked, not-yet-fixed API-path persona handling remains untouched, same as the original entry above.
+
+### Open Questions
+
+1. Whether `"coder"` vs. the requested `"code"` filename was the intended name - flagged above, not yet confirmed.
+2. `claude_interface.py`'s own API-path persona handling is unaffected by this entry - whichever fix shape is eventually chosen for the "Claude API-access-mode wiring" entry above should decide whether it also reads `libraries/persona/<call_name>.md` directly (reusing this same convention) or continues down a separate path, and whether it reads the same relocated `settings.PERSONA_PLACEHOLDER`/`settings.PERSONA_DIR` constants rather than reintroducing its own - not decided here, flagged so the two pieces of work don't diverge unintentionally.
+3. `_load_persona_text()`/`_parse_agent()` are still hardcoded to `call_name="chat"` - generalising either to the other four Calls remains exactly the same already-tracked, not-yet-done gap this module had before this change (see the "Claude session service lifecycle" entry earlier in this file), unaffected either way by this entry.
+
+### Follow-up Work
+
+- Confirm the `coder`/`code` naming question with the user.
+- Decide, when the API-path persona fix is actually implemented, whether it reuses `libraries/persona/`'s convention and the relocated `config.py` constants.
+
+### Where
+
+- New: `bot_sanctuary_application/libraries/persona/chat.md` (real content), `architect.md`/`coder.md`/`documentation.md`/`review.md` (empty placeholders).
+- `bot_sanctuary_application/libraries/claude/chat.json` (`"persona"` array → `"{{PERSONA}}"`).
+- `bot_sanctuary_application/utilities/utils_agents/services/claude_session_service.py` (`_load_persona_text()` new, `_parse_agent()` updated, module header updated, all four of its own persona/library constants removed).
+- `bot_sanctuary_application/config.py` (new: `LLM_TYPE_CLAUDE`/`CODEX`/`DEEPSEEK`/`QWEN`, `KNOWN_LLM_TYPES`, `LIBRARIES_DIR`, `PERSONA_DIR`, `BOT_NAME_PLACEHOLDER`, `PERSONA_PLACEHOLDER`).
+- `bot_sanctuary_application/utilities/utils_agents/agent_interface.py` (`_KNOWN_LLM_TYPES`/`_LIBRARIES_ROOT` module constants removed; `_resolve_provider()`, `query_llm()`, `load_persona()`, `test_llm_tokens()` switched to the `settings.*` equivalents).
+
+---
+
+## NEW — `agent_persona.py`: shared, reusable persona/library-file loading, resolved locally by each provider at its own querying point — implemented 2026-09-18, one naming-consistency question left open
+
+Status: **Implemented 2026-09-18 for all four providers.** Design went through three corrections in conversation before landing here - each retained below since they explain why the final shape looks the way it does, not just what it is.
+
+### Context
+
+Requested as "move `_parse_agent()`/`_load_persona_text()` to a file for reusability." Two corrections followed before implementation:
+
+1. **First draft (rejected): centralise resolution inside `agent_interface.py::query_llm()`**, widening the `persona` parameter's type to `AgentPersona | None` across every provider's `query_via_api()`/`query_via_oauth()`. Rejected - *"we are attempting to build for all 4 LLM, don't tell me about things meant only for claude... it is only called when each LLM is working on it's querying."* Centralising in one shared function, even a provider-agnostic one, was itself the deviation - not because it was Claude-specific (it wasn't), but because it moved the resolution away from the point where each LLM actually queries.
+2. **Final shape: each provider resolves its own persona, locally, at its own querying function** - `agent_interface.py::query_llm()` is left completely untouched. `llm_type` is fixed per interface file (never passed in); `call_name` is derived from whatever directory that function already receives (`session_dir` for Claude, `cwd` for the other three) - no new parameter added anywhere.
+
+### Decisions
+
+- **New module `utils_agents/agent_persona.py`**, sibling to `agent_interface.py`/`agent_tools.py` - not inside `interfaces/` or `services/`, since both subpackages need to reach it symmetrically.
+- **`parse_agent(llm_type, call_name)`/`load_persona_text(call_name)`** - generalised versions of `claude_session_service.py`'s former private `_parse_agent()`/`_load_persona_text()` (llm_type/call_name are now parameters, not hardcoded to Claude/`"chat"`).
+- **New `call_name_from_session_dir(session_dir)`** - derives which Call a directory belongs to from its own already-established `<root>/<call_name>/<llm_type>` shape (the same shape `chat_call.py`'s own docstring already documents building).
+- **Fallback rule, identical across all four providers:** if a `call_name` can be derived from the directory, the internally-resolved persona wins outright, discarding whatever `persona` argument was passed in; if not (no directory given), fall back to that passed-in `persona` unchanged. This is what makes `chat_call.py`'s own `load_persona(...)` call provably dead (its `session_dir` is always real - see Open Question 3) while leaving the other four `<name>_call.py` files' equivalent calls genuinely still load-bearing (they have no directory yet, so they always fall through to it).
+- **Claude's resolution is inlined directly in `_run_query()`** rather than factored into a named helper - it already took `session_dir` in its existing signature (needed for the resume-marker mechanism), and it's the one shared funnel both `query_via_oauth()`'s fallback branch and `query_via_api()` route through, so there was no duplication to prevent by extracting it. `_parse_persona()` and its frontmatter constants (`_FRONTMATTER_DELIMITER`/`_FRONTMATTER_LINE_PATTERN`) are deleted outright, fully superseded - not deprecated/kept.
+- **Codex/DeepSeek/Qwen each get a new `_resolve_persona(persona, cwd) -> str | None` helper**, called from both `query_via_oauth()`/`query_via_api()` (DeepSeek/Qwen's `query_via_oauth()` is a permanent no-op and wasn't touched) - factored out specifically because, unlike Claude, their own `_run_query()`/`_post_chat_completion()` don't take a directory at all (deliberately left untouched, to keep the blast radius smaller than adding a new parameter to three more inner functions), so the resolution had to happen one layer up, at two separate call sites per file - a real duplication risk a shared helper avoids.
+- **This is the first real use of `cwd` in `codex_interface.py`/`deepseek_interface.py`/`qwen_interface.py`** - previously accepted-and-ignored, documented as "uniform signature across every provider." Harmless today: nothing currently calls any of their `query_via_api()`/`query_via_oauth()` with a real `cwd` (none of the four non-Chat Calls pass a directory yet - see Open Question 2), so `_resolve_persona()` resolves to the unchanged fallback in practice until that changes.
+
+### Implementation Notes
+
+- `claude_session_service.py`: `_load_persona_text()`/`_parse_agent()` removed outright; `from ..agent_persona import parse_agent` added. `_get_or_create_entry()`'s call site is now `parse_agent(settings.LLM_TYPE_CLAUDE, "chat")` - still hardcoded to `"chat"` at the call site, same pre-existing "only Chat is wired" limitation, unchanged by this move.
+- `claude_interface.py`: `_run_query()` now does `call_name = call_name_from_session_dir(session_dir)`; when resolvable, `parse_agent(settings.LLM_TYPE_CLAUDE, call_name)` supplies `body`/`tools`/`model` straight into `ClaudeAgentOptions`; when not (only the startup smoke test reaches this today), falls back to the `persona` argument as a bare system prompt with no tools/model. `import re` removed (only ever used by the now-deleted `_parse_persona()`).
+- `codex_interface.py`/`deepseek_interface.py`/`qwen_interface.py`: new `_resolve_persona(persona, cwd)` per file, each importing `call_name_from_session_dir`/`parse_agent` from `agent_persona.py` and `settings` for its own `LLM_TYPE_*` constant. `_run_query()`/`_post_chat_completion()` in all three left completely untouched.
+
+### Open Questions
+
+1. **User-raised, not yet decided:** Claude's resolution is inlined; the other three providers each got a separately-named `_resolve_persona()` helper - functionally equivalent, stylistically asymmetric. **User wants this unified, one way or the other:** either remove the three helpers (inline their two lines directly into each `query_via_oauth()`/`query_via_api()`, matching Claude's style) or give Claude an equivalently-shaped helper (e.g. `_resolve_persona(persona, session_dir) -> tuple[str | None, list[str] | None, str | None]`, called once from `_run_query()`) so all four files read the same way. Purely cosmetic either direction - no functional difference. **Not yet decided which.**
+2. Whether/when `architect_call.py`/`coder_call.py`/`review_call.py`/`documentation_call.py` get their own directory wiring - the actual precondition for this whole mechanism (and `cwd` on the three non-Claude providers) to ever resolve to anything beyond the unchanged fallback for them. Unaffected by this entry, tracked as a pre-existing, separate gap.
+3. `chat_call.py`'s own `load_persona(...)` call is now provably dead (see Decisions above) - flagged in conversation, **not yet removed**, pending explicit go-ahead. The other four Calls' `load_persona(...)` calls are not dead and were deliberately left untouched.
+
+### Follow-up Work
+
+- Decide and implement Open Question 1 (inline vs. helper, applied uniformly across all four provider files).
+- Remove `chat_call.py`'s now-dead `load_persona(...)` call (Open Question 3), once confirmed.
+
+### Revision (2026-09-18, same day) — `parse_agent()` hardened per instruction ("parse whatever is available and log it")
+
+**Context this addresses, not yet a live failure:** several `libraries/<llm_type>/<call_name>.json` files are deliberately empty (0-byte) placeholders today (every non-Chat Call's own file, and `codex`/`deepseek`/`qwen`'s own `chat.json`) - confirmed directly in an earlier turn. Before this revision, `parse_agent()` treated an empty file identically to a genuinely malformed one: `json.loads("")` raises `json.JSONDecodeError`, caught and logged via `logger.exception(...)` (a full stack trace, error-level) before falling back to an empty `AgentPersona`. Once any of these three providers or four non-Chat Calls actually gets directory-wired (Open Question 2 above), every single call against one of these known-intentionally-blank files would log as if something had broken, when nothing had - a severity/framing mismatch, not a functional bug (the empty-AgentPersona fallback itself was already correct).
+
+- **`parse_agent()` now reads the file's raw text first, separately from JSON-decoding it.** An empty/whitespace-only file is treated as "not yet written," not malformed - logged at **info**, not as an exception, before returning the same empty `AgentPersona` as before. Only content that is non-empty but still fails to decode as JSON keeps the `logger.exception()` treatment - that case is a genuine authoring error, not an expected state.
+- **Per-field tolerance made explicit, not just implicit:** a successfully-parsed file missing `persona`/`tools`/`model` individually already fell back to `""`/`None`/`None` via `.get()` before this revision - unchanged behaviourally, but now documented directly in the docstring, and a successfully-parsed file with an empty persona body specifically logs at info (naming whatever `tools`/`model` *were* found), rather than that case being indistinguishable from a fully-empty file in the logs.
+- **Net effect: "parse whatever is available" - use every field that's actually present, however incomplete the file - "and log it" - always leave a log line behind, but at a severity matching whether the state is expected (empty/partial) or a real problem (missing file, undecodable content).**
+
+### Where
+
+---
+
+## NEW — `qwen_interface.py`: per-Call `model` wiring, then Responses-API `previous_response_id` session continuity with a stricter local TTL — implemented 2026-09-19
+
+Status: **Both parts implemented 2026-09-19.** Two separate, sequential instructions in the same conversation - the `model` wiring landed first and standalone, the session-continuity work followed as its own, larger piece once `libraries/qwen/chat.json` had been populated to match Claude's own `chat.json` (`name`/`model`/`description`/`persona`, `tools` deliberately excluded - see that piece's own Decisions below).
+
+### Context
+
+Started from a direct comparison request ("look into what qwen in different from claude in terms of claude/chat.json"), researched (not inferred from this codebase alone, per explicit correction - "did you do research or did you infer from current setup?") against Alibaba Cloud Model Studio's own documentation. Findings, in order:
+
+1. `libraries/qwen/chat.json` was a 0-byte placeholder (same pattern as every other non-Chat Qwen Call) - Claude's own equivalent was fully written.
+2. Qwen's `tools` mechanism is **structurally different from Claude's**, not a drop-in - Claude's `["WebSearch"]` names an SDK-native built-in tool the Claude Agent SDK executes autonomously; DashScope's OpenAI-compatible `tools` parameter is raw function-calling (full JSON Schema per tool, plus a caller-side execute-and-respond loop DashScope never does for you). This is why `tools` was deliberately left out of `libraries/qwen/chat.json` when it was written, and remains a separate, larger, undecided item - not scoped into either piece of work below.
+3. `model` **is** a direct, same-shape equivalent to Claude's - just a different string value set (`qwen-max`/`qwen-plus`/`qwen-turbo`/`qwen-coder`/`qwen-vl`/`qwen-omni`/etc., each with its own documented purpose - flagship reasoning, balanced default, fast/cheap, agentic coding, vision, multimodal, respectively).
+4. `name`/`description` are read by neither provider today (`agent_persona.py::parse_agent()` only ever reads `persona`/`tools`/`model`) - copying them from Claude's file is purely documentation, not a functional change either way.
+
+`libraries/qwen/chat.json` was then written to `{"name": "{{BOT_NAME}}", "model": "qwen3-plus", "description": <same as Claude's>, "persona": "{{PERSONA}}"}` - `persona: "{{PERSONA}}"` is a genuine shared-persona outcome, not just a copy: `parse_agent()` substitutes it via `load_persona_text(call_name)`, which reads `libraries/persona/chat.md`, a file already shared across every provider (see this file's own earlier `agent_persona.py` entry above). Both Claude's and Qwen's `chat.json` now resolve to the identical persona text at runtime.
+
+### Decisions — Part 1: `model` wiring
+
+- **`_MODEL` (hardcoded, always sent) renamed to `_DEFAULT_MODEL` (fallback only)** - `qwen_interface.py::_resolve_persona(persona, cwd)` was replaced by `_resolve_agent(persona, cwd) -> tuple[str | None, str]`, resolving persona **and** model from a single `parse_agent()` call (rather than one call each, avoiding parsing the same library file twice per query) and falling back to `_DEFAULT_MODEL` both when `cwd` is `None` and when a Call's own library file has no `model` field of its own (`parse_agent()` tolerates a missing field silently, per-field, per its own existing convention) - confirmed this matters in practice, since `architect.json`/`coder.json`/`documentation.json`/`review.json` under `libraries/qwen/` are all still empty placeholders today, same as before this change.
+- **`_post_chat_completion()` (later replaced entirely by `_post_response()` in Part 2 below) took `model: str` as an explicit parameter**, threaded through from `query_via_api()`, rather than reading a module-level constant directly - mirrors how `persona` was already threaded through, not read from a global.
+- **Deliberately excluded `tools`** - per the structural-mismatch finding above (Context, point 2). Not deferred by oversight - explicitly scoped out because adding it here would have been misleading without the execute-and-respond loop it would actually require.
+- **Scope explicitly restricted to `qwen_interface.py` only, per direct instruction** ("Do touch anything outside of qwen interface") - no other file was touched for this part.
+
+### Decisions — Part 2: session continuity (`previous_response_id`) + local TTL
+
+Chosen from three researched options (client-side message history, DashScope's `previous_response_id` Responses-API mechanism, and the `x-dashscope-session-cache` header, which turned out to be a caching optimisation layered *on top of* `previous_response_id`, not an alternative to it) - **user explicitly chose the `previous_response_id` option ("I will want to implement b)")**, with a stricter local TTL than DashScope's own server-side one:
+
+- **Full switch from DashScope's `/chat/completions` endpoint to its OpenAI-compatible `/responses` endpoint** (`_RESPONSES_API_URL`, replacing `_API_URL`/`_post_chat_completion()` entirely, not added alongside it) - `previous_response_id` only exists on that surface. `_extract_output_text()` prefers the response envelope's own top-level `output_text` convenience field, falling back to walking `output`'s own typed content list if absent.
+- **Persona is sent as the Responses API's own `instructions` field, on every call, not folded into `input`** - researched, not assumed: `previous_response_id` carries the raw conversation forward, but explicitly does **not** carry forward any prior top-level instructions (a documented OpenAI Responses API caveat DashScope's own compatibility layer was found to mirror) - if persona were only sent as an `input` system-role item on the very first turn, it would silently stop applying from the second turn onward. `input` itself now carries only the current turn's own new user message, never resent history - `previous_response_id` is what supplies continuity, not a growing `input` list.
+- **Local TTL, deliberately stricter than DashScope's own 7-day server-side context TTL** - user's own words: "I wanted it to be 1 day but I will require it to expire only on a specific timing. So it's 2 days and a specific time if available. Current specific time is \"\", thus we will implement the pipeline but not set the specific time." Implemented as two new settings (`config.py`), following `SESSION_RESET_TIME`'s own existing pattern exactly rather than inventing a new one:
+  - `QWEN_SESSION_TTL_DAYS` (`get_env_int`, default `2`).
+  - ~~`QWEN_SESSION_EXPIRY_TIME` (`get_env_time`, default `""` → `None`) - reuses `get_env_time()`/its 12h-or-24h parsing/its `settings.TZ` interpretation completely unchanged.~~ **Corrected same day, per direct instruction ("self.SESSION_RESET_TIME should be used for all LLM"): no separate Qwen-specific setting at all - `_session_expiry_cutoff()` now reads the existing, already-implemented `settings.SESSION_RESET_TIME` directly (see the "Timed session reset" entry above) as the one shared "specific timing" concept application-wide, not a Qwen-scoped duplicate of it.** Unset (`""` → `None`) today, exactly as originally instructed either way - the pipeline rolls the raw day-count cutoff forward to the next occurrence of that wall-clock time *if* `SESSION_RESET_TIME` is ever configured, but behaves as a plain day-count cutoff for as long as it stays unset. Framed from the outset as "for all LLM," not Qwen-only - any future provider adding its own local TTL logic would reuse this same setting too, rather than each minting its own.
+- **TTL is an absolute session age from the marker's own original creation, not a sliding one reset by every reply** - this was an open question left to the user in the plan ("does the 2-day clock reset on every reply... or is it fixed from the very first turn") that the user did not explicitly answer before saying "implement 1 to 5." Proceeded with the **fixed/absolute** interpretation, as recommended in that same plan (closer to what "session expiry" normally means, simpler to reason about) - **not confirmed by the user directly, flagged here explicitly as an assumption made on their behalf, reversible if they intended sliding instead.** Implemented via `_write_session_marker()` only overwriting `created_at` with a fresh timestamp when a turn genuinely started a new conversation (no marker existed, the marker was locally expired, or DashScope itself rejected `previous_response_id` - see below); a turn that successfully continued an existing session preserves its original `created_at` untouched.
+- **DashScope rejecting `previous_response_id` itself (a case our own local TTL didn't yet catch, or DashScope simply disagreeing with our bookkeeping) is treated as its own recognised case, not a generic failure** - `_is_expired_previous_response_error(status_code, body_text)` is an explicit, narrow heuristic (4xx status **and** the error body mentioning "response_id" - status code alone was deliberately rejected as too broad, since a bad model string or malformed request is also a plain 400 and should surface as an ordinary failure, not a false "start fresh"). On a recognised hit, `query_via_api()` retries once, immediately, as a fresh conversation (`previous_response_id=None`) - the end user gets a reply for that turn either way, rather than the whole call failing outright over a continuity mechanism they have no visibility into. **Unverified against a real account which exact error shape DashScope actually returns for this condition** - no execution/live-testing access was available in this session (a persistent, previously-disclosed limitation - see the "Timeout hardening" entry below for the same caveat applied to Claude's own equivalent work) - flagged for refinement once real traffic surfaces the actual format.
+- **Superseded same day, see the "timeout unified" Revision at the end of the DeepSeek entry below: the Qwen-scoped constant and the "deliberately not shared" reasoning in this bullet no longer apply - Qwen now uses the shared `settings.AGENT_QUERY_TIMEOUT_SECONDS`, and Open Question 3 below is resolved.** Original text: **Explicit outer `asyncio.wait_for()` + its own `except asyncio.TimeoutError:` branch**, per direct instruction ("I do want to catch that timeout indicator") - mirrors `claude_interface.py::_run_query()`'s own now-implemented pattern (see that entry below), but with its own, Qwen-scoped constant (`_OUTER_TIMEOUT_SECONDS = _REQUEST_TIMEOUT_SECONDS + 10`), **not** `settings.AGENT_QUERY_TIMEOUT_SECONDS` - deliberately not shared with Claude/OAuth's own timeout value, since that cross-provider parity question was raised and explicitly left as Qwen's own call in the plan, not decided as "yes, share it." The existing inner `urlopen(timeout=_REQUEST_TIMEOUT_SECONDS)` socket-level timeout (60s, unchanged) is expected to fire first in the normal case; the outer bound (70s) is a safety net for whatever the inner one doesn't cover on its own (e.g. thread-pool scheduling delay under load), not the primary enforcement mechanism - same layered-defence reasoning as the "give room for overhead" concern raised for Claude's own shared-timeout design (see that entry's still-open question below), applied here pre-emptively by giving Qwen its own independent value instead of inheriting the same open question.
+- **No new session-clearing code anywhere, deliberately** - the local marker file (`.qwen_session.json`) is stored inside `cwd`, the same directory `claude_interface.py`'s own `.claude_session_id` marker already lives in. `utils_session/session_worker.py`'s existing whole-directory removal already covers both of the exact two moments the user asked for ("only application startup, or {{BOT_NAME}} refresh yourself from telegram_gateway") with zero new code: `clear_all_session_directories()` (unconditional, every startup) and `handle_session_clear_request()` (the already-implemented `"${BOT_NAME} refresh yourself"` admin command round-trip - see this file's own `session_clear_request` entry above) both ultimately `shutil.rmtree()` the entire session tree. **"Claude should be ready for that clearing" is therefore already true, confirmed rather than newly built** - Claude's own marker lives in the identical tree shape and is already removed by the same two triggers today.
+- ~~**Deliberately not implemented (deferred, optional): a Qwen-specific `terminate_session(session_dir)` wired into `agent_interface.py`'s provider-agnostic dispatch**, for structural symmetry with Claude's own equivalent. Not required for anything above to work correctly - the full-directory wipe already handles every removal scenario identified - and would touch `agent_interface.py`, outside `qwen_interface.py`'s own scope. Presented to the user as optional and explicitly excluded from the "implement 1 to 5" instruction (item 6 in the plan).~~ **Decided against outright, same day, per direct user challenge ("I see no reason for it's existence") - correctly so, re-verified rather than defended.** Traced every call site of `terminate_session()` in the codebase: there is exactly one, `session_worker.py::clear_session_directory()`, which calls it immediately before `shutil.rmtree(session_root)` unconditionally deletes the same directory. Claude's own `terminate_session()` exists only because it tears down something a filesystem delete cannot reach - a live, in-memory `ClaudeSDKClient` connection sitting in `claude_session_service.py`'s own registry, entirely independent of anything on disk. Qwen has no equivalent - every `query_via_api()` call is a stateless HTTP request with nothing living in memory between calls; its entire state is `.qwen_session.json`, which the very next line at that one call site already deletes regardless. A Qwen `terminate_session()` would therefore do nothing but redundantly pre-empt a deletion that was about to happen anyway - "optional, deferred" was the wrong framing entirely; there was never a function here waiting to be written, only unscheduled non-work. Revisit only if a future Qwen enhancement introduces genuine live/in-memory state (e.g. a persistent connection) - not before.
+
+### Implementation Notes
+
+- `config.py`: new `QWEN_SESSION_TTL_DAYS` setting, placed in a new "Qwen Session" block directly after the existing `LLM_QWEN_ACCESS_TYPE`/`LLM_QWEN_TOKEN` settings. ~~A second new `QWEN_SESSION_EXPIRY_TIME` setting was also added here initially~~ - **removed same day (see Decisions correction above); `SESSION_RESET_TIME`'s own comment block (Session Reset section) was extended instead, to document its new shared, cross-provider role.**
+- `qwen_interface.py`: `_extract_output_text()`, `_is_expired_previous_response_error()`, `_post_response()` (replaces `_post_chat_completion()`), `_resolve_agent()` (unchanged from Part 1), `_session_expiry_cutoff()`, `_read_session_marker()`/`_write_session_marker()` (new), `query_via_api()` (rewritten to orchestrate marker read → call → conditional one-shot retry-as-fresh → marker write). `query_via_oauth()` untouched (still a permanent no-op stub). Module header Notes rewritten to describe the new endpoint, the `instructions`-vs-`input` persona decision, the fixed-TTL assumption, and every unverified-against-a-real-account caveat above, each cross-referencing this entry.
+- No changes to `agent_interface.py`, `session_worker.py`, `claude_interface.py`, or any other provider's own interface module - confirmed unnecessary for this scope (see the "no new session-clearing code" and "deferred `terminate_session()`" bullets above).
+
+### Open Questions
+
+1. **Fixed vs. sliding TTL - proceeded on an assumption, not an explicit answer.** See the Decisions bullet above. Revisit if the user actually wanted the 2-day clock to reset on every active reply instead.
+2. Exact DashScope error shape for a rejected/invalid `previous_response_id` - unverified against a real account, heuristic only (`_is_expired_previous_response_error()`). Refine once real traffic is observed.
+3. Whether Qwen's own timeout ceiling (`_OUTER_TIMEOUT_SECONDS`, Qwen-scoped) should ever be unified with `settings.AGENT_QUERY_TIMEOUT_SECONDS` (Claude/OAuth-scoped) for cross-provider parity - deliberately left un-unified here (see Decisions above), same open-ended status as the "give room for overhead" question already open against Claude's own timeout entry below.
+4. The `tools` structural mismatch (Context, point 2) remains entirely unaddressed - no plan exists yet for a Qwen function-calling execute-and-respond loop, should one ever be wanted.
+
+### Follow-up Work
+
+- Decide Open Question 1 with the user directly; adjust `_write_session_marker()`'s `created_at`-preservation logic if sliding TTL is actually wanted.
+- Revisit Open Question 2 once real DashScope traffic/errors are observable.
+- ~~Optional, deferred: implement the `terminate_session()` symmetry item (Decisions, Part 2) if ever wanted.~~ **Closed, same day - decided against, not deferred. See the corrected Decisions bullet above.**
+
+### Where
+
+- `bot_sanctuary_application/config.py`: new `QWEN_SESSION_TTL_DAYS` setting; existing `SESSION_RESET_TIME`'s own comment block extended to document its new shared, cross-provider role (see Decisions correction above).
+- `bot_sanctuary_application/utilities/utils_agents/interfaces/qwen_interface.py`: both parts, in full - see Implementation Notes above.
+- `bot_sanctuary_application/libraries/qwen/chat.json`: written (Context above), ahead of Part 1's implementation.
+
+### Revision (same day) — storage location verified; `cwd` renamed to `session_dir` throughout
+
+Direct follow-up, two parts: verify on-disk storage end-to-end, and a naming correction ("rename all cwd to session_dir or response_dir").
+
+- **Storage traced and confirmed end-to-end, no code change needed - this module's own `session_dir` (née `cwd`) was already exactly the real, already-created directory it needed to be:** `SessionWorker.session_dir` (`session_worker.py`) = `settings.SESSION_DIR / session_id` → `chat_call.py::handle()` builds `call_session_dir = session_dir / CALL_NAME / settings.LLM_CHAT_TYPE` and `mkdir(parents=True, exist_ok=True)`s it *before* calling `query_llm(..., session_dir=call_session_dir)` → `agent_interface.py::query_llm()` passes it straight through to `qwen_interface.py::query_via_api()`. Concretely, `<SESSION_DIR>/<session_id>/chat/qwen/.qwen_session.json` once Qwen is the configured `LLM_CHAT_TYPE`. The marker file itself holds exactly the two fields `_write_session_marker()` writes - `{"response_id": ..., "created_at": <ISO 8601, timezone-aware via application_time()>}` - nothing else.
+- **`cwd` renamed to `session_dir` throughout `qwen_interface.py`** (parameters, docstrings, log messages, the module header's own Notes) - `session_dir` chosen over the offered alternative `response_dir`, since it matches every other call site's own naming already (`agent_interface.py::query_llm()`'s own parameter, `claude_interface.py`'s equivalent throughout) - `response_dir` would have been a new, one-off name nothing else in the codebase uses. No behavioural change - `cwd` was never actually `os.getcwd()`-shaped to begin with (a holdover name from this file's very first, pre-session-continuity revision, before it did anything with the directory beyond persona/model lookup), it always meant the same thing `session_dir` now says directly.
+- **Where:** `bot_sanctuary_application/utilities/utils_agents/interfaces/qwen_interface.py` only - no other file's own parameter naming was in scope for this rename.
+
+### Revision (same day) — every positional tuple return converted to a named dict
+
+Direct follow-up, same instruction applied to `deepseek_interface.py` first ("I am seeing a lot of tuple, change them to dict"), then repeated against this file with `qwen_interface.py` open in the IDE.
+
+- **`_post_response()`**: `tuple[str | None, str | None, bool]` → `dict` - `{"reply", "response_id", "previous_response_id_rejected"}`.
+- **`_resolve_agent()`**: `tuple[str | None, str]` → `dict` - `{"persona", "model"}`.
+- **`_read_session_marker()`**: `tuple[str | None, datetime | None]` → `dict` - `{"response_id", "created_at"}`.
+- **`query_via_api()`** updated to match - `agent = _resolve_agent(...)`, `session_marker = _read_session_marker(...)`, `result = await asyncio.wait_for(...)`, each read by key (`agent["persona"]`, `session_marker["response_id"]`, `result["reply"]`, etc.) rather than positional unpacking. The retry-on-rejection branch keeps its own prior behaviour exactly - `result` is simply reassigned wholesale on retry, same as `reply`/`new_response_id`/`previous_response_id_rejected` were all reassigned together before.
+- **No behavioural change** - purely a return-shape change (named keys instead of positional order), same reasoning as the identical change already made in `deepseek_interface.py`'s own `_resolve_agent()`.
+- **Where:** `bot_sanctuary_application/utilities/utils_agents/interfaces/qwen_interface.py` only.
+
+### Revision (2026-09-20) — local TTL no longer aligned to `SESSION_RESET_TIME`
+
+Direct instruction, after a review of `_session_expiry_cutoff()`: `SESSION_RESET_TIME` is already used by `session_worker.py` for the daily wipe, so validating against it inside Qwen is unnecessary - "just remove the align". This supersedes the roll-forward described in Part 2's Decisions above (the bullet that reused `settings.SESSION_RESET_TIME` as the shared "specific timing" for the cutoff).
+
+#### Why it was safe to remove (verified by reading the code, not assumed)
+
+- The scheduled reset (`trigger_timed_session_reset()`) retires every `SessionWorker` in `_sessions`, and each worker's cleanup calls `clear_session_directory()`, which removes the session tree including `.qwen_session.json`.
+- `session_worker.py` has no idle eviction, so after startup every session directory that can hold a marker has a live worker. `clear_all_session_directories()` clears anything left over at startup.
+- With a reset configured, a marker therefore never survives more than about 24 hours, which is always before an aligned cutoff (the raw cutoff plus up to a day). The alignment could not be what expired a session.
+- `chat_call.py` recreates the directory with `mkdir(parents=True, exist_ok=True)` every turn, so the next marker write after a wipe works.
+
+#### Decisions
+
+- **`_session_expiry_cutoff()` now returns `created_at + timedelta(days=settings.QWEN_SESSION_TTL_DAYS)`.** The function was kept rather than inlined - one call site, and the name matches `deepseek_interface.py`'s copy.
+- **The TTL itself stays.** It is the only age limit when `SESSION_RESET_TIME` is unset (the default), and the backstop when a scheduled reset is skipped (a `session_clear_request` sweep was already running, retried 24 hours later) or the overlap window described in the module header Notes leaves a marker behind. The raw cutoff is never later than the aligned one, so removal can only expire a session sooner, never extend one.
+- **Rejected alternatives:** keeping the alignment (harmless but redundant, and a needless dependency on a setting owned by `session_worker.py`), and removing the TTL altogether (would leave no age limit when no reset is configured).
+
+#### Implementation Notes
+
+- `qwen_interface.py`: `_session_expiry_cutoff()` simplified, its docstring and the module header Notes updated. `settings.SESSION_RESET_TIME` is no longer referenced in this file.
+- `config.py`: the "Qwen Session" comment and `SESSION_RESET_TIME`'s own comment updated to say Qwen no longer aligns to it.
+- Not run - no execution access.
+
+#### Open Questions
+
+1. ~~**`deepseek_interface.py::_session_expiry_cutoff()` still aligns**, and its comments still describe it as "same design as qwen_interface.py's own TTL". Not changed, since only Qwen was in scope.~~ **Resolved later the same day: the alignment was removed there too - see the DeepSeek revision in the "age-based expiry" entry above.**
+
+#### Where
+
+- `bot_sanctuary_application/utilities/utils_agents/interfaces/qwen_interface.py`, `bot_sanctuary_application/config.py`.
+
+---
+
+## NEW — `"chat"` Call-name literal consolidated into `settings.CALL_NAME_CHAT` — implemented 2026-09-19
+
+Status: **Implemented.** Direct instruction: "update CALL_NAME = "chat" to be called from config and update for all chat type."
+
+### Context
+
+Three separate files each independently hardcoded the literal string `"chat"` to mean the Chat Call's own name - `chat_call.py::CALL_NAME`, `call_dispatch_handler.py::_ENTRY_CALL_NAME`, and `claude_session_service.py::_get_or_create_entry()`'s inline `parse_agent(settings.LLM_TYPE_CLAUDE, "chat")` call (the last one already flagged in its own comment as a known, separately-tracked "only wired to chat" limitation - unrelated to that limitation, this pass only touches the literal itself, not what it's used for). Three independently-typed copies of the same fixed value, with no single source of truth - the same shape of problem `LLM_TYPE_CLAUDE`/`LLM_TYPE_CODEX`/`LLM_TYPE_DEEPSEEK`/`LLM_TYPE_QWEN` already solve for provider identifiers in `config.py`.
+
+### Decisions
+
+- **New `settings.CALL_NAME_CHAT = "chat"`** - a fixed identifier, not environment-driven, added to `config.py` in a new "Call Names" block, immediately following the existing `LLM_CHAT_TYPE`/`LLM_ARCHITECT_TYPE`/etc. block. Same "named once, referenced everywhere" reasoning as the existing `LLM_TYPE_*` block just above it in the same file.
+- **Scope deliberately limited to `"chat"` only, per the instruction's own wording** ("for all chat type," not "for all Call types") - `architect_call.py`/`coder_call.py`/`review_call.py`/`documentation_call.py`'s own `CALL_NAME` constants remain local, hardcoded literals, unchanged. Not an oversight - a narrower, explicitly-scoped request, consistent with this file's own incremental-change convention (no "while we're here" extension to the other four).
+- **`call_router.py` needed no change at all** - its own `_CALL_REGISTRY`/`CALL_NAMES` are already built by reading `chat_call.CALL_NAME` (the module attribute), never a separate literal - it picks up the config-sourced value automatically, for free.
+- **Every other `"chat"` occurrence found (via a full-codebase grep) left untouched, deliberately** - all remaining hits are prose inside comments/docstrings illustrating an example value (e.g. `agent_persona.py`'s "matches that Call's own CALL_NAME (e.g. \"chat\")"), not literals a code path actually branches or looks anything up on - nothing left to consolidate.
+
+### Implementation Notes
+
+- `config.py`: new `self.CALL_NAME_CHAT = "chat"`.
+- `chat_call.py`: `CALL_NAME = "chat"` → `CALL_NAME = settings.CALL_NAME_CHAT`.
+- `call_dispatch_handler.py`: `_ENTRY_CALL_NAME = "chat"` → `_ENTRY_CALL_NAME = settings.CALL_NAME_CHAT`.
+- `claude_session_service.py`: `parse_agent(settings.LLM_TYPE_CLAUDE, "chat")` → `parse_agent(settings.LLM_TYPE_CLAUDE, settings.CALL_NAME_CHAT)`, inline comment updated to match (still notes the pre-existing "only wired to chat" limitation - unchanged by this pass).
+- No import changes needed anywhere - `settings` was already imported in all three files.
+
+### Where
+
+- `bot_sanctuary_application/config.py`, `bot_sanctuary_application/utilities/utils_calls/chat_call.py`, `bot_sanctuary_application/utilities/utils_calls/call_dispatch_handler.py`, `bot_sanctuary_application/utilities/utils_agents/services/claude_session_service.py`.
+
+---
+
+## NEW — `deepseek_interface.py`: per-Call `model`/`reasoning_effort` wiring, plus a correctness fix for a now-dead default model — implemented 2026-09-19
+
+Status: **Implemented.** Same research-then-wire pattern as the Qwen entry above, run against DeepSeek instead - a `chat.json`/Claude comparison request, followed by explicit model/effort selection and a wiring plan, then "I accept the assumption, proceed with implementation."
+
+### Context
+
+Researched (not inferred from this codebase alone, same discipline as the Qwen pass) against DeepSeek's own API docs and independent coverage of its 2026 model migration. Findings, in order:
+
+1. `libraries/deepseek/chat.json` was a 0-byte placeholder, same starting state Qwen's was in before its own pass.
+2. **`deepseek_interface.py::_MODEL = "deepseek-chat"` names a model identifier that no longer resolves** - `deepseek-chat`/`deepseek-reasoner` were discontinued 2026-07-24 15:59 UTC, a hard cutover with no grace period and no automatic fallback. This is a genuine, pre-existing correctness bug this research surfaced, not a hypothetical - live calls using the un-updated constant would already be failing as of today's date (2026-09-19), independent of anything about persona/chat.json completeness.
+3. Current models are `deepseek-v4-flash` (default/balanced tier) and `deepseek-v4-pro` (flagship tier), both dual-mode (thinking/non-thinking), both accepting a graded `reasoning_effort` request-body field (`low`/`medium`/`high`/`max`/`xhigh`, with `low`/`medium` collapsing to `high` and `xhigh` collapsing to `max` server-side) - `reasoning_effort` has no Claude equivalent at all, a genuinely DeepSeek-specific field, not a renamed version of anything Claude/Qwen already have.
+4. DeepSeek's `/chat/completions` is **genuinely, fully stateless** - no Responses-API equivalent, no `previous_response_id`-shaped mechanism exists at all. The official docs are explicit that the caller must resend the entire conversation history on every call. This rules out porting Qwen's marker-file/TTL pattern directly - the only route to real DeepSeek-side multi-turn memory would be this application storing and replaying a growing local transcript itself, a materially larger and different feature, not attempted here.
+5. `tools` carries the same structural mismatch already found for Qwen (OpenAI-shaped function-calling, full JSON Schema + caller-side execute-and-respond loop) against Claude's SDK-native, autonomously-executed `tools` - not addressed here either, same as Qwen.
+6. `name`/`description` are read by neither provider (`parse_agent()` only reads `persona`/`tools`/`model`) - copied from Claude's file for documentation purposes only, same as Qwen.
+
+`libraries/deepseek/chat.json` was written to `{"name": "{{BOT_NAME}}", "model": "deepseek-v4-pro", "reasoning_effort": "high", "description": <same as Claude's>, "persona": "{{PERSONA}}"}` - `model`/`reasoning_effort` both explicitly selected by the user ("select high effort deepseek-v4-pro for chat_call"), not inferred/defaulted. `persona: "{{PERSONA}}"` resolves to the same shared `libraries/persona/chat.md` text every other provider's `chat.json` already resolves to.
+
+### Decisions
+
+- **`_MODEL` (hardcoded, always sent, and now factually wrong) renamed to `_DEFAULT_MODEL`, repointed at `"deepseek-v4-flash"`** - used only as the fallback for a Call whose own `libraries/deepseek/<call_name>.json` is empty/missing (today: architect/coder/review/documentation, all still empty placeholders). Chat's own `chat.json` overrides this explicitly to `"deepseek-v4-pro"`. `"deepseek-v4-flash"` chosen as the generic fallback (cheaper/faster default tier) rather than `-pro` - **a judgement call flagged to the user as an assumption, accepted** ("I accept the assumption, proceed with implementation").
+- **`_resolve_persona(persona, cwd) -> str | None` replaced by `_resolve_agent(persona, cwd) -> tuple[str | None, str, str | None]`**, resolving persona **and** model **and** reasoning_effort from a single `parse_agent()` call - same reasoning as Qwen's own identical rename (avoid parsing the same library file twice per query), extended one field further since DeepSeek needed a third resolved value Qwen didn't.
+- **`reasoning_effort` given no dedicated `AgentPersona` attribute** - read off `AgentPersona.persona` (the raw parsed JSON `parse_agent()` already returns in full) via `agent.persona.get("reasoning_effort")`, rather than extending the shared `AgentPersona` dataclass for one DeepSeek-specific field no other provider has a use for. Passed straight through to the request body untouched, no validation against DeepSeek's own known value set - trusting the library file's content, consistent with how `model`/`tools` are already trusted everywhere else in this codebase.
+- **`reasoning_effort` omitted from the request body entirely when unset (`None`)**, rather than sending an explicit default value - a Call with no `reasoning_effort` configured (every non-chat Call today) behaves exactly as it did before this field existed; DeepSeek's own model-level default (both V4 tiers default to thinking-mode-enabled already) applies unchanged.
+- **Sent as a top-level request-body field (`request_payload["reasoning_effort"] = ...`), not wrapped in an `extra_body`/`thinking` object** - the `extra_body` wrapping documented in some DeepSeek guides is an OpenAI-SDK-specific workaround (the SDK has no native `reasoning_effort` passthrough); irrelevant here since this module already talks to DeepSeek's own native REST endpoint directly via `urllib`, not through the OpenAI SDK.
+- **Session continuity (local transcript store/replay) deliberately not attempted in this pass** - see Context, point 4. Flagged as a real, separate, larger piece of future work, not a small follow-up.
+- **`tools` deliberately excluded from `chat.json`, same as Qwen** - per the structural-mismatch finding (Context, point 5).
+- **Scope restricted to `deepseek_interface.py` only** - `cwd`→`session_dir` rename (applied to `qwen_interface.py` on a separate, explicit instruction) was **not** applied here; not requested for DeepSeek, left as `cwd` throughout for now. Flagged, not actioned unilaterally.
+
+### Implementation Notes
+
+- `deepseek_interface.py`: `_MODEL` → `_DEFAULT_MODEL` (value changed); `_post_chat_completion(prompt, token, persona, model, reasoning_effort)` (two new required parameters, request body now built as a named `request_payload` dict with `reasoning_effort` added conditionally, renamed from an unnamed inline dict to avoid shadowing the response-parsing variable of the same prior name); `_resolve_persona()` → `_resolve_agent()` (see Decisions); `query_via_api()` now unpacks all three resolved values and threads them through. `query_via_oauth()` untouched (still a permanent no-op stub - DeepSeek remains API-key-only). Module header Notes rewritten to document the corrected default model, the `reasoning_effort` field's resolution/pass-through behaviour, and the out-of-scope session-continuity note.
+- No changes to `agent_interface.py`, `config.py`, or any other provider's own interface module.
+
+### Open Questions
+
+1. Whether `"deepseek-v4-flash"` is the right generic non-chat fallback default (vs. `-pro`) - accepted as an assumption, not independently confirmed as a preference.
+2. ~~Whether/when local session continuity (transcript store/replay) is actually wanted for DeepSeek - no plan exists yet; flagged as a separate, larger feature in the wiring plan and not raised again since.~~ **Resolved and implemented, same day - see the "Revision" entry below.**
+3. The `tools` structural mismatch (Context, point 5) remains entirely unaddressed, same open status as Qwen's own equivalent open question.
+4. Whether `cwd` should be renamed to `session_dir` here too, for consistency with `qwen_interface.py`/`claude_interface.py` - not requested, not applied (still true after the Revision below - the rename was not extended to this pass either).
+
+### Follow-up Work
+
+- ~~Decide Open Question 2 with the user directly before attempting any DeepSeek session-continuity work - it is not a small addition on top of this pass.~~ **Done, same day - see the "Revision" entry below.**
+- Revisit Open Question 1 if the generic fallback tier ever turns out to matter in practice (i.e. a non-chat Call actually goes live against DeepSeek).
+
+### Where
+
+- `bot_sanctuary_application/utilities/utils_agents/interfaces/deepseek_interface.py`: full change - see Implementation Notes above.
+- `bot_sanctuary_application/libraries/deepseek/chat.json`: written (Context above), ahead of the interface wiring.
+
+### Revision (same day) — local transcript-based session continuity, a `"session"`-role storage convention, a byte-size safety cap, and outer timeout handling
+
+Direct follow-up: a "look into sessions behaviour for deepseek" investigation, a plan built from two of its own findings (local transcript replay as the only real continuity option, plus the pre-existing missing-outer-timeout gap), and then "instead of considering role: user, consider role: session, Implement 1 to 4."
+
+#### Context
+
+Investigation confirmed DeepSeek's `/chat/completions` has no server-side conversation concept whatsoever, on any current model - no session/thread ID, nothing `previous_response_id`-shaped. The official docs are explicit that the full `messages` history must be resent every call. "Chat Prefix Completion" (a beta feature that surfaces nearby in DeepSeek's own docs) was checked and ruled out - it controls the shape of the assistant's *own next output*, unrelated to remembering prior turns. This left exactly one real option: this application storing and replaying the growing conversation itself - genuinely different in kind from Claude's resume-id/Qwen's `previous_response_id` marker (real growing data, not a small pointer) - which is why it was scoped as its own, separate follow-up rather than folded into the original wiring pass.
+
+#### Decisions
+
+- **New per-session file, same convention as Claude's/Qwen's own markers** - `_TRANSCRIPT_FILENAME = ".deepseek_transcript.json"`, stored inside `cwd`, a plain JSON array of `{"role", "content"}` turns, oldest first. Persona is deliberately excluded from the stored transcript - it continues to be resolved fresh via `_resolve_agent()` and sent as its own leading `"system"` message every call, never duplicated into the persisted file.
+- ~~The stored human-turn role is `"session"`, not `"user"` - an explicit, direct instruction, not an inference. DeepSeek's own wire API only accepts `"system"`/`"user"`/`"assistant"`/`"tool"` as a message role, so `"session"` can never be sent to DeepSeek as-is - `_to_api_messages()` translates every persisted `role="session"` entry to `role="user"` when assembling the outbound request, immediately before the call. The translation exists purely for API compatibility; `"session"` only ever exists in the locally-persisted file, never over the wire.~~ **Reverted same day, per direct follow-up instruction ("Remove session reference and let assistant only") once the indirection itself turned out to be the source of confusion, not a clarity aid.** `_to_api_messages()` deleted entirely; the transcript now stores `role: "user"` directly, identical to what's actually sent to DeepSeek - no local-only role label, no translation step, nothing to keep in sync between "what's stored" and "what's sent." DeepSeek's conversation model is inherently system+user/assistant (a hard external constraint, not this module's choice) - storing anything else was always going to need translating back before every call regardless, so storing the wire-native role directly removes a whole function and a whole category of "why does this say session" confusion for zero functional loss.
+- **Full history resent every call, always** - `query_via_api()` builds `messages` as persona (if any) + every prior turn from `cwd`'s own transcript (translated via `_to_api_messages()`) + this turn's own prompt. No truncation/summarisation beyond the byte-size cap below - DeepSeek's 1,000,000-token context window on both current models, plus its own automatic disk-based context caching on repeated/stable prefixes, was the basis for treating full replay (rather than, say, a fixed small sliding window) as viable rather than something requiring a smarter strategy up front.
+- **Byte-size safety cap, not a time-based expiry** - new `settings.DEEPSEEK_TRANSCRIPT_MAX_BYTES` (`get_env_int`, default `200000`), in a new "DeepSeek Session" block in `config.py` mirroring `QWEN_SESSION_TTL_DAYS`'s own pattern. `_trim_transcript()` drops the oldest **complete turn** (both its stored `"session"`-role entry and its paired `"assistant"` reply together, never a lone half-turn) while the transcript's own serialized size exceeds the cap - applied both on write (`_write_transcript()`, so the file on disk never grows past the cap going forward) and on read (`_read_transcript()`'s own return path is not itself trimmed, but `_write_transcript()` runs on every successful turn, so any pre-existing oversized file self-heals on its very next successful call). Never trims below the single most-recently-appended turn, even if that turn alone exceeds the cap - a safety net against unbounded growth over time, not a hard per-request ceiling. A byte-size proxy, not a token-accurate budget - no DeepSeek tokenizer is vendored here; deliberately simple over precise.
+- **Superseded 2026-09-20 - a time-based expiry (`DEEPSEEK_SESSION_TTL_DAYS`, 2 days) was added; see the "age-based expiry" Revision at the end of this entry.** Original text: **No time-based expiry (TTL/`SESSION_RESET_TIME` alignment) added** - not requested for this pass (the ask was specifically "safety in case the file gets too huge," a size concern), not assumed. Flagged as a possible, separate future addition if ever wanted, same shape as Qwen's own TTL, not implemented here.
+- **Transcript is only appended to and persisted after a confirmed-successful reply** - a failed/timed-out call leaves `cwd`'s own persisted transcript untouched, same "write only after confirmed success" convention Claude's/Qwen's own marker files already follow.
+- **Superseded same day, see the "timeout unified" Revision at the end of this entry: the DeepSeek-scoped `_REQUEST_TIMEOUT_SECONDS`-derived constant described here was replaced by the shared `settings.AGENT_QUERY_TIMEOUT_SECONDS`.** Original text: **Outer `asyncio.wait_for()` + explicit `except asyncio.TimeoutError:` added to `query_via_api()`**, closing the gap the same investigation surfaced - own, DeepSeek-scoped `_OUTER_TIMEOUT_SECONDS = _REQUEST_TIMEOUT_SECONDS + 10` constant, not shared with Claude's `settings.AGENT_QUERY_TIMEOUT_SECONDS` or Qwen's own identically-shaped constant - same "each provider owns its own timeout budget" precedent already established for Qwen. The existing inner `urlopen(timeout=_REQUEST_TIMEOUT_SECONDS)` socket timeout is unchanged and still expected to fire first in the normal case.
+- **No new session-clearing code** - `.deepseek_transcript.json` lives inside the same `cwd`/`session_dir` tree (`<SESSION_DIR>/<session_id>/chat/deepseek/`) already swept wholesale by `clear_all_session_directories()` (startup), `handle_session_clear_request()` (`"${BOT_NAME} refresh yourself"`), and `trigger_timed_session_reset()` (if `SESSION_RESET_TIME` is set) - all three `shutil.rmtree()` the entire directory regardless of contents. Confirmed, not newly built - same conclusion already reached for Claude's/Qwen's own marker files.
+- ~~`cwd`→`session_dir` rename not extended to this pass - not requested here either; `deepseek_interface.py` still says `cwd` throughout.~~ **Done same day too - see the second Revision below.**
+
+#### Implementation Notes
+
+- `config.py`: new "DeepSeek Session" block, `DEEPSEEK_TRANSCRIPT_MAX_BYTES` (default `200000`), placed directly after the existing "Qwen Session" block.
+- `deepseek_interface.py`: `_TRANSCRIPT_FILENAME` (new); `_read_transcript()`/`_write_transcript()` (new, mirroring `_read_resume_id()`/`_write_resume_id()`'s and `_read_session_marker()`/`_write_session_marker()`'s own conventions); `_transcript_size_bytes()`/`_trim_transcript()` (new); ~~`_to_api_messages()` (new, the `"session"`→`"user"` translation)~~ **deleted same day, see the first Revision below**; `_post_chat_completion()` now takes a pre-assembled `messages: list[dict]` directly instead of building it from a single `prompt`+`persona` pair internally; `query_via_api()` rewritten to orchestrate transcript read → message assembly → outer-timeout-bounded call → conditional append-and-persist. `query_via_oauth()` untouched. Module header Notes rewritten to document the transcript design, the byte-size cap, and the new outer timeout.
+- No changes to `agent_interface.py` or any other provider's own interface module.
+
+#### Open Questions
+
+1. ~~Resolved 2026-09-20 - added, see the "age-based expiry" Revision at the end of this entry.~~ Whether a time-based expiry should ever be added alongside the byte-size cap (mirroring Qwen's `QWEN_SESSION_TTL_DAYS`/`SESSION_RESET_TIME` alignment) - not requested, not implemented; revisit only if raised directly.
+2. Whether `200000` bytes is the right default cap in practice - a starting value, not independently validated against real DeepSeek traffic/pricing.
+3. `tools` and the non-chat fallback-tier choice (Open Questions 1/3 above, prior to this Revision) remain exactly as open as before - not touched by either Revision below. (Open Question 4, `cwd`→`session_dir`, was resolved - see the second Revision below.)
+
+#### Where
+
+- `bot_sanctuary_application/config.py`: new `DEEPSEEK_TRANSCRIPT_MAX_BYTES` setting.
+- `bot_sanctuary_application/utilities/utils_agents/interfaces/deepseek_interface.py`: full change - see Implementation Notes above.
+
+### Revision (same day) — `"session"`-role storage indirection removed; store `role: "user"` directly
+
+Direct follow-up, after the `"session"`-role naming (chosen in the Revision above, at explicit instruction) turned out in practice to cause more confusion than it prevented once actually read back and reasoned about: "Remove session reference and let assistant only."
+
+- **`_to_api_messages()` deleted entirely** - the persisted transcript now stores `role: "user"` for the human side of each turn, identical to what DeepSeek's own wire API requires and identical to what's actually sent. `messages.extend(transcript)` replaces `messages.extend(_to_api_messages(transcript))` - the transcript is sent as-is, no translation step.
+- **Rationale, stated plainly**: DeepSeek's conversation model is inherently `system`+`user`/`assistant` - a hard constraint of the API itself, not something this module can redefine or usefully relabel locally. Storing anything other than `"user"` was always going to require translating back to `"user"` before every single call regardless - the indirection bought nothing, and cost a whole extra function plus an extra concept to explain/maintain.
+- **`role: "assistant"` untouched** - only the human-turn label changed; the reply side of each stored/sent turn was never in question.
+- **Where:** `bot_sanctuary_application/utilities/utils_agents/interfaces/deepseek_interface.py` only.
+
+### Revision (same day) — `cwd` renamed to `session_dir` throughout
+
+Direct follow-up, same instruction as above, second half: "Change all cwd to session_dir." Same rename `qwen_interface.py` already went through on an earlier, separate instruction, now applied here too - every parameter, docstring, log message, and comment in `deepseek_interface.py` (`_read_transcript()`, `_write_transcript()`, `_resolve_agent()`, `query_via_api()`, `query_via_oauth()`) updated from `cwd` to `session_dir`. No behavioural change - `session_dir` chosen over any alternative for the same reason already established for Qwen: it matches every other call site's own naming (`agent_interface.py::query_llm()`'s own parameter, `claude_interface.py` throughout).
+
+- **Where:** `bot_sanctuary_application/utilities/utils_agents/interfaces/deepseek_interface.py` only.
+
+### Revision (same day) — `_resolve_agent()` tuple → dict; then a gap review against `claude_interface.py`, and a question over the 60s request timeout
+
+`_resolve_agent()` was converted from a positional tuple to a named dict (`{"persona", "model", "reasoning_effort"}`) on the "I am seeing a lot of tuple, change them to dict" instruction, with `query_via_api()` reading each value by key. No behavioural change. The same instruction was then repeated against `qwen_interface.py` (see that entry's own Revision above). `claude_interface.py::_collect_claude_response()` still returns a tuple - not converted, not requested.
+
+A gap review against `claude_interface.py` followed, together with the question "why both qwen and deepseek request timeout is set to 60s?". Findings below. **Nothing was changed for these - review and recording only.**
+
+#### The 60s timeout - not a deliberate decision
+
+- `_REQUEST_TIMEOUT_SECONDS = 60` was already present in both `deepseek_interface.py` and `qwen_interface.py` before this session's work began (both files date from 2026-09-10 and were written in the same pass). No rationale is documented anywhere in code or in this file, so it is most likely a shared default that was copied across, not a per-provider choice.
+- The outer `_OUTER_TIMEOUT_SECONDS = _REQUEST_TIMEOUT_SECONDS + 10` added to both modules this session derived from that number without questioning it. That propagated the same unexamined value into a second place in each file.
+- **It is probably too short for DeepSeek's configured model.** `libraries/deepseek/chat.json` selects `deepseek-v4-pro` with `reasoning_effort: "high"`, and thinking mode produces its chain of thought before the answer. One third-party benchmark reported roughly 128s to the first answer token on DeepSeek's official API at high effort. It is a single data point and should be treated cautiously, but it is well above the 70s outer bound. A legitimate reply could be abandoned, the user would see the generic "not currently available" message, and the worker thread would carry on regardless because a Python thread cannot be cancelled.
+- The timeout was left at 60s when the model/effort selection was wired earlier this session. That pairing was an oversight in the wiring pass, not something reviewed at the time.
+- DeepSeek's docs state that non-streaming requests receive periodic empty keep-alive lines while the request is processed, and that the server closes a request that has not completed within 30 minutes. If those keep-alive bytes reset urllib's per-read socket timeout, the inner 60s may never fire and the outer 70s is the only effective bound. **Unverified** - how `http.client` treats those lines was not tested.
+- Claude's equivalent is `settings.AGENT_QUERY_TIMEOUT_SECONDS` (default 120, environment-configurable). The Qwen and DeepSeek values are hardcoded module constants.
+- Qwen is less affected: its configured model (`qwen3-plus`) is not a high-effort reasoning model. Still hardcoded, still unexamined.
+
+#### Gaps found in `deepseek_interface.py` compared with `claude_interface.py`
+
+Recommended:
+
+1. Timeout is too tight for `deepseek-v4-pro`/`high` and is not configurable (see above).
+2. The startup smoke test (`agent_interface.py::test_llm_tokens()`) calls `query_llm()` with no `session_dir`, so it runs with `_DEFAULT_MODEL` (`deepseek-v4-flash`) and no `reasoning_effort`. It therefore never exercises the request shape `chat.json` actually produces. `reasoning_effort` as a top-level request field is research-derived and unverified against a live DeepSeek account; several third-party gateways were reported to drop or rewrite it, and it is unconfirmed whether the official endpoint honours it as documented. The header Notes do not carry the "unverified against a real account" caveat that the Qwen header does.
+
+Optional:
+
+3. No retry on transient failures. DeepSeek documents 429/500/503 as retry-after-waiting conditions; a single blip currently becomes an immediate `None`. **Verified 2026-09-20 (research, not run): Claude does get retries, but from the SDK/CLI underneath, not from this codebase** - Claude Code retries server errors, 529 overloads, request timeouts and transient 429s with exponential backoff, up to `CLAUDE_CODE_MAX_RETRIES` (default 10, capped at 15), each retry getting its own `API_TIMEOUT_MS` window. Nothing in `claude_interface.py` adds a retry of its own. So this is a real gap for DeepSeek and Qwen, not an unknown. Caveat: those retries run inside Claude's `asyncio.wait_for(AGENT_QUERY_TIMEOUT_SECONDS)`, so the 120s outer bound cuts them short (inferred, not tested). Qwen behaves the same way as DeepSeek here.
+4. `finish_reason` is never inspected. A reply cut off at the token limit is returned as complete and persisted to the transcript. Claude's `is_error` is likewise only logged, so this is close to parity rather than a clear gap.
+5. The response's `usage` block (including DeepSeek's prompt-cache hit/miss token counts) is not logged. The byte cap is only a proxy for tokens, and this bears directly on the cost concerns in the "Token-usage cost review" entry above.
+6. `chat_call.py` passes `agent_tools.build_tool_prompt(prompt)` into every turn, so each stored user turn carries the full tool-format instruction block (about 1.3 KB by estimate) alongside a much shorter real message. That consumes `DEEPSEEK_TRANSCRIPT_MAX_BYTES` faster than the conversation itself would. Claude's own session history holds the same boilerplate, so this is a cost observation rather than a parity gap.
+7. `tools` remains structurally unaddressed (unchanged, already recorded above).
+
+Checked and not gaps: persona resolution, per-Call model resolution, outer timeout presence, session clearing (covered by the existing whole-directory wipe), OAuth/credential bridging (not applicable to an API-key-only provider), `terminate_session()` (decided against for Qwen, same reasoning applies), local TTL (Claude has none either; only Qwen does).
+
+#### Open Questions
+
+1. What timeout should DeepSeek use, and should it move into `settings` alongside `AGENT_QUERY_TIMEOUT_SECONDS`, or stay a module constant? Not decided.
+2. Should Qwen's identical 60s/70s pair be revisited at the same time? Not decided.
+3. Is a single retry on 429/5xx wanted for either provider? Not decided.
+
+#### Follow-up Work
+
+- Decide Open Question 1 with the user, then apply it to `deepseek_interface.py` (and to `qwen_interface.py` if Open Question 2 is answered yes).
+- Run one real call through the chat path (not the smoke test) to confirm `reasoning_effort` is honoured and to observe real latency at `high` effort. No execution access was available in this session.
+
+### Revision (same day) — request timeout unified onto `settings.AGENT_QUERY_TIMEOUT_SECONDS` for both Qwen and DeepSeek
+
+Direct instruction, following the 60s-timeout review above: change `_REQUEST_TIMEOUT_SECONDS` in both `qwen_interface.py` and `deepseek_interface.py` to follow Claude's `AGENT_QUERY_TIMEOUT_SECONDS` from `config.py`. This resolves the timeout Open Questions 1 and 2 of the previous Revision, and Qwen's own Open Question 3 (whether to unify with Claude's setting - answered yes).
+
+- **`_REQUEST_TIMEOUT_SECONDS` deleted from both modules.** The inner `urlopen(timeout=...)` socket timeout now reads `settings.AGENT_QUERY_TIMEOUT_SECONDS` directly at the call site, the same way `claude_interface.py` reads it, rather than aliasing it into a new module global.
+- **`_OUTER_TIMEOUT_SECONDS` kept, now `settings.AGENT_QUERY_TIMEOUT_SECONDS + 10`.** The instruction named only `_REQUEST_TIMEOUT_SECONDS`, so the outer constant was not removed. Keeping the 10s margin preserves the existing layered design (inner socket timeout fires first and returns a clean result; the outer `wait_for` is a safety net). **This is an assumption made on the user's behalf:** if the two were meant to be exactly equal, the outer bound would race the inner one and could discard a result the inner call was about to return.
+- **Effective values change from 60s inner / 70s outer to 120s inner / 130s outer** at the current default, for both providers.
+- **The setting is now shared by three providers, so it is one knob.** Raising `AGENT_QUERY_TIMEOUT_SECONDS` to suit DeepSeek's high-effort reasoning also raises Claude's timeout, and vice versa. The single third-party latency figure cited above (about 128s to first answer token at high effort) is still above the 120s/130s pair, so `deepseek-v4-pro`/`high` may still time out at the default. Not changed here; it is tunable via the environment variable without a code change.
+- **`config.py`:** the comment on `AGENT_QUERY_TIMEOUT_SECONDS` said it applied only to an always-on, persistent-connection platform. It already covered Claude's one-shot API path before this change, and now covers Qwen and DeepSeek too; the comment was extended to say so.
+- **Also corrected in passing:** `qwen_interface.py`'s outer-timeout comment still described a tuple return (`(None, None, False)`) left over from the earlier tuple-to-dict change; it now says a clean `{"reply": None, ...}` dict.
+- **Not verified:** whether DeepSeek's non-streaming keep-alive lines reset urllib's socket timeout (see the previous Revision). Nothing was run in this session.
+- **Where:** `bot_sanctuary_application/config.py` (comment only), `qwen_interface.py`, `deepseek_interface.py`.
+
+#### Open Questions
+
+1. Whether a shared 120s is enough for `deepseek-v4-pro` at `high` effort, or whether DeepSeek needs a larger value than Claude - which the shared setting cannot express without also raising Claude's.
+
+### Revision (2026-09-20) — age-based expiry: the DeepSeek transcript is discarded after 2 days
+
+Direct instruction, phrased as a summary of the intended lifecycle: "deepseek has history removal when file is > 200kb. also it could have it's history removed when a session reset request is triggered. The history file will reset every 2 days." The first two already existed; the third did not. DeepSeek had no time-based expiry before this change - the stated behaviour was not true of the code as it stood - so it was implemented, mirroring Qwen's `QWEN_SESSION_TTL_DAYS` design.
+
+#### The four ways the transcript is removed (as of this change)
+
+1. **Size** - `DEEPSEEK_TRANSCRIPT_MAX_BYTES` (default 200000, about 195 KiB). This trims the oldest complete turns and keeps the file; it does not delete it. Existing.
+2. **Age** - new, `DEEPSEEK_SESSION_TTL_DAYS` (default 2). Discards the whole transcript.
+3. **Session reset** - a telegram_gateway `"${BOT_NAME} refresh yourself"` request, and the timed global reset when `SESSION_RESET_TIME` is set. Existing, via `session_worker.py`'s whole-directory wipe.
+4. **Application startup** - `clear_all_session_directories()`, same wipe. Existing.
+
+#### Decisions
+
+- **The 2 days is an absolute age from the transcript's original creation, not a sliding window reset by activity** - "reset every 2 days" was read literally, and this is also what was implemented for Qwen. A conversation that stays active still starts fresh 2 days after it began. Stated as an interpretation; if a sliding window was meant, `_write_transcript()` would refresh `created_at` on every write.
+- **Setting name `DEEPSEEK_SESSION_TTL_DAYS`, default 2, `get_env_int`** - provider-scoped days value, same pattern as `QWEN_SESSION_TTL_DAYS`. The wall-clock alignment reuses the shared `settings.SESSION_RESET_TIME` ("should be used for all LLM" instruction earlier in this file), unset by default, so today it is a plain 2-day cutoff. `SESSION_RESET_TIME`'s comment in `config.py` now names DeepSeek alongside Qwen.
+- **File format changed from a bare list to `{"created_at": <ISO 8601>, "turns": [...]}`** - a creation time has to be stored somewhere, and file modification time cannot serve because every write updates it. A file in the old bare-list format (in use for roughly a day) is treated as no history and replaced on the next successful call; nothing is migrated. This drops at most a day of one conversation's history and was judged not worth migration code.
+- **`_read_transcript()` now returns a dict** (`{"turns", "created_at"}`), consistent with the earlier "change tuples to dict" instruction. The two values are always empty/None together. `_trim_transcript()`, `_transcript_size_bytes()` and `_write_transcript()` take the turns list (renamed `turns` to avoid confusion with the new wrapper dict), and `_write_transcript()` takes `created_at` (None means start fresh, stamp now) - the same convention as `qwen_interface.py::_write_session_marker()`.
+- **The size check measures the turns list only, not the small wrapper** (a few dozen bytes) - negligible against the cap.
+- **An expired transcript is not deleted at read time.** It is ignored, and overwritten by the next successful call. Same behaviour as Qwen's marker.
+- **`_session_expiry_cutoff()` is duplicated from `qwen_interface.py`** rather than shared, because extracting a shared helper would have meant changing the Qwen module, which was not requested. About ten lines; the two copies differ only in which TTL setting they read.
+
+#### Implementation Notes
+
+- `config.py`: `DEEPSEEK_SESSION_TTL_DAYS` added to the "DeepSeek Session" block; that block's comment and `SESSION_RESET_TIME`'s comment updated.
+- `deepseek_interface.py`: new imports (`datetime`, `timedelta`, `application_time`); new `_session_expiry_cutoff()`; `_read_transcript()`, `_trim_transcript()`, `_transcript_size_bytes()`, `_write_transcript()` and `query_via_api()` updated as above. The header Notes now list the four removal mechanisms and the new file format.
+- Not run - no execution access in this session. The expiry comparison, the old-format fallback and the roll-forward branch (only active once `SESSION_RESET_TIME` is set) are all untested.
+
+#### Open Questions
+
+1. Sliding vs absolute 2 days - implemented absolute; not confirmed as the intent.
+2. Whether `_session_expiry_cutoff()` should become one shared helper used by both Qwen and DeepSeek.
+
+#### Where
+
+- `bot_sanctuary_application/config.py`, `bot_sanctuary_application/utilities/utils_agents/interfaces/deepseek_interface.py`.
+
+### Revision (2026-09-20, later same day) — local TTL no longer aligned to `SESSION_RESET_TIME`; shared-helper question closed
+
+Direct instruction: "resolve `_session_expiry_cutoff` and remove align too", following the identical change to `qwen_interface.py` (see the "Revision (2026-09-20) — local TTL no longer aligned to `SESSION_RESET_TIME`" section of the Qwen entry above, which records the verification that the scheduled reset removes every session directory and why the alignment was redundant). That reasoning applies unchanged: the reset retires every `SessionWorker`, whose cleanup removes the whole session tree, `.deepseek_transcript.json` included.
+
+#### Decisions
+
+- **`_session_expiry_cutoff()` now returns `created_at + timedelta(days=settings.DEEPSEEK_SESSION_TTL_DAYS)`.** The TTL stays as a backstop for when no reset is configured (the default), a scheduled reset is skipped, or its clearing fails. The raw cutoff is never later than the aligned one, so this can only expire a transcript sooner, never extend one.
+- **Open Question 2 above (one shared helper for Qwen and DeepSeek) is closed as "no".** "Resolve" was read as closing that question as well as removing the alignment, which is an interpretation, not something the instruction stated. With the alignment gone each copy is a single expression reading its own provider's TTL setting, so a shared helper would add indirection for nothing. Reopen if a third provider needs the same thing.
+
+#### Implementation Notes
+
+- `deepseek_interface.py`: `_session_expiry_cutoff()` simplified; its docstring and the header Notes (mechanism 2, Age) updated. `settings.SESSION_RESET_TIME` is no longer referenced in this file.
+- `config.py`: the "DeepSeek Session" comment and `SESSION_RESET_TIME`'s own comment updated. `SESSION_RESET_TIME` is now used only by the timed reset in `session_worker.py`.
+- Not run - no execution access.
+
+#### Where
+
+- `bot_sanctuary_application/utilities/utils_agents/interfaces/deepseek_interface.py`, `bot_sanctuary_application/config.py`.
+
+---
+
+## NEW — API retry on transient failures for `deepseek_interface.py` and `qwen_interface.py` — planned 2026-09-20, not yet approved or implemented
+
+Status: **Implemented 2026-09-20, not run (no execution access).** Follows up Open Question 3 of the DeepSeek "gaps found" revision above ("Is a single retry on 429/5xx wanted for either provider?"), which was left undecided. The Decisions and Implementation Notes directly below are the original plan; the final Revision at the end of this entry records what was actually built and where it differs. A billing-error plan is recorded in the same Revision.
+
+### Goal
+
+A single transient provider failure (rate limit, server error, dropped connection) should no longer turn straight into a `None` reply and the generic `"call_pipeline_unavailable"` message for the end user, for both DeepSeek and Qwen, without changing either module's outward `str | None` contract.
+
+### Context
+
+Both modules make one blocking `urllib` request inside `asyncio.to_thread()`, and `_post_chat_completion()`/`_post_response()` collapse every failure into `None`, so there is no way for the caller to tell a retryable failure from a permanent one. DeepSeek documents 429/500/503 as retry-after-waiting conditions. Claude does get retries, but from the SDK/CLI underneath (research on 2026-09-20, not run), not from this codebase, so this is a real gap for these two providers only. Qwen already has one narrow retry - a fresh-conversation retry when DashScope rejects `previous_response_id` - which is a different concern and stays as it is.
+
+### Decisions (proposed, not yet approved)
+
+- **Retry only fast, unambiguous failures:** HTTP 429, 500, 502, 503, 504, and connection-level errors (`urllib.error.URLError` that is not an `HTTPError`, `ConnectionError`). Every other 4xx (400, 401, 402 - DeepSeek's insufficient balance -, 404, 422) is permanent and is not retried.
+- **A socket timeout is not retried.** It would multiply a wait that is already up to `AGENT_QUERY_TIMEOUT_SECONDS`, and the outcome is ambiguous (the request may still be running provider-side). The outer `asyncio.wait_for()` timeout is likewise not retried.
+- **Default 3 total attempts** (2 retries), exponential backoff with jitter (about 2s, then 4s), each delay capped at 30s, and `Retry-After` honoured when present, also capped.
+- **The retry loop lives in the async layer, using `asyncio.sleep()`,** not `time.sleep()` inside the worker thread, so a backing-off call does not hold a thread-pool slot. Each attempt keeps its own `_OUTER_TIMEOUT_SECONDS` bound, as Qwen's existing fresh-conversation retry already does.
+- **Two shared settings in `config.py`, not provider-scoped ones,** following the `AGENT_QUERY_TIMEOUT_SECONDS` precedent of one value across providers: an attempts setting and a base-delay setting, both via `get_env_int()`. Names are not decided.
+- **Outward contract unchanged:** on exhaustion the function still returns `None`, and `dispatch_call()` still reports `"call_pipeline_unavailable"`. This matches the earlier log-only-parity decision in the timeout-hardening entry above.
+- **State handling needs no change.** DeepSeek's transcript and Qwen's marker are only written after a confirmed success, and the request is rebuilt identically per attempt, so a retry cannot double-append or corrupt either.
+
+### Implementation Notes (planned)
+
+1. `config.py`: add the two shared retry settings next to `AGENT_QUERY_TIMEOUT_SECONDS`, with a comment saying they apply to the DeepSeek and Qwen HTTP paths only.
+2. `deepseek_interface.py`: change `_post_chat_completion()` from `str | None` to a named dict `{"reply", "retryable", "retry_after"}`, consistent with the earlier "positional tuple to named dict" convention. Wrap the existing `asyncio.wait_for(asyncio.to_thread(...))` call in `query_via_api()` in the retry loop. The transcript write stays after the loop, on success only.
+3. `qwen_interface.py`: add `"retryable"` and `"retry_after"` to `_post_response()`'s existing dict. Wrap both existing calls in `query_via_api()` (the normal one and the fresh-conversation one) in the same loop. A rejected `previous_response_id` is a 400/404, so it is never retryable and the two mechanisms do not conflict. Worst case in the combined path is two retry sequences.
+4. Log each retry at `warning` (attempt n of N, status, delay) and exhaustion at `error`. Keep the existing per-request `logger.error` lines.
+5. Update both module headers and the affected docstrings' Notes.
+6. Verify with a stub server or patched `urlopen` returning 503, 503, 200, then a permanent 401, then a socket timeout. Nothing has been run in any session so far.
+
+### Open Questions
+
+1. Shared helper or per-module copies? A new shared module (for example under `utils_agents/`, like `agent_persona.py`) avoids a third duplicated helper, but touches `qwen_interface.py` the same way the earlier `_session_expiry_cutoff()` sharing question did. Duplication matches the existing precedent. Not decided.
+2. Should 429 always be retried? DashScope may use 429 for quota exhaustion as well as rate limiting, and that is unverified against a real account. Retrying a quota error is wasted delay, not harm.
+3. Total worst-case wait is about 3 x (`AGENT_QUERY_TIMEOUT_SECONDS` + 10s) only if every attempt fails slowly, which the no-timeout-retry rule mostly prevents. Is a separate total-deadline setting worth having? Proposed answer: no.
+4. Should the startup `test_llm_tokens()` smoke test also retry, or bypass it? It goes through `query_llm()`, so it would retry by default.
+5. Should exhausted retries surface a distinct `error_type`? Rejected for now, for the same reason as in the timeout-hardening entry above.
+
+### Follow-up Work
+
+- Get approval on the proposals above and answer Open Questions 1 and 2, then implement.
+- Confirm DeepSeek's and DashScope's real retryable status codes and `Retry-After` behaviour against a live account.
+
+### Where
+
+- `bot_sanctuary_application/config.py`, `bot_sanctuary_application/utilities/utils_agents/interfaces/deepseek_interface.py`, `bot_sanctuary_application/utilities/utils_agents/interfaces/qwen_interface.py`.
+- Cross-reference: the DeepSeek "gaps found" revision above (item 3 and Open Question 3), `call_dispatch_handler.py::dispatch_call()`'s `if result is None:` branch.
+
+### Revision (2026-09-20, same day) — retry loop placement questioned, and Claude's own error handling re-checked (it does not classify errors either)
+
+**Loop placement.** Questioned by the user: the richer `_post_*` return dict (`retryable`, `retry_after`) exists only to carry a retry decision out of the worker thread to a loop in the async layer. A loop inside the sync `_post_*` functions (`time.sleep()` between attempts) needs no contract change, because `HTTPError` is already in scope there. Its cost is that `_OUTER_TIMEOUT_SECONDS` must cover every attempt plus delays, since `asyncio.wait_for()` cannot stop a running thread. Each `SessionWorker` is already blocked in `asyncio.run()` waiting for the reply, so a sleeping thread costs little. **Now recommended over the async-layer loop; supersedes Implementation Notes 2 and 3 above once approved.** Not yet approved.
+
+**Claude's error handling, re-read rather than recalled.** The user recalled that Claude already handles permanent errors. It does not, in this codebase: `_collect_claude_response()` and `_run_turn()` only log `is_error` (on `ToolResultBlock` and `ResultMessage`), `_run_query()` and `_run_turn()` catch a bare `Exception` and return `None`, and a timeout returns `None`. All of these reach `dispatch_call()` as `error_type="call_pipeline_unavailable"`, the same as DeepSeek and Qwen. Claude's retries come from the SDK/CLI underneath, as recorded above. The SDK does expose an `AssistantMessage.error` field (documented values `authentication_failed`, `billing_error`, `rate_limit`, `invalid_request`, `server_error`, `unknown`; an earlier bug where it was never populated is reported fixed) which this codebase never reads. Not checked against the pinned `claude-agent-sdk==0.2.152`.
+
+**What the gateway already understands.** `telegram_gateway`'s `_handle_error()` special-cases only `error_type="token_exhausted"` (message = seconds left; a missing or invalid duration is tolerated and omitted, and the persona "is exhausted and is taking a nap" text is sent). Every other `error_type` shows the `message` text as-is. Nothing in `bot_sanctuary` emits `token_exhausted` today. Observed in the gateway logs: `call_pipeline_unavailable` is the only error type seen.
+
+**Options for surfacing permanent failures, none decided:**
+1. Log-only classification, no contract change: Claude reads `AssistantMessage.error`, DeepSeek/Qwen name the class of failure in their existing HTTP-error log line.
+2. Map billing/quota exhaustion (DeepSeek 402, Claude `billing_error`) onto the existing `token_exhausted` type with no duration - no gateway change, but "nap" implies a temporary condition and billing does not recover by itself.
+3. A typed exception or new return shape from the interfaces, mapped to a distinct `error_type` in `dispatch_call()` - widens the `str | None` contract that the timeout-hardening entry above deliberately left alone.
+4. Operator alert by email for auth/billing failures, reusing the SMTP mailer and cooldown pattern already used for `gateway_alert` - largest scope.
+
+**Open Questions (added):** which option, if any, for permanent failures; whether to keep the retry loop in the sync function.
+
+### Revision (2026-09-20, later same day) — retry implemented around `asyncio.wait_for()`; billing-error plan
+
+#### Implemented
+
+Direct instruction: implement retry for the listed error codes, covering both `await asyncio.wait_for(...)` call sites, with the response outside of it unchanged.
+
+- **Decision: the retry loop wraps `asyncio.wait_for()` in the async layer** - the original plan, not the in-thread loop recommended in the Revision above. Each attempt therefore keeps its own `_OUTER_TIMEOUT_SECONDS` bound, and a timeout raises out of the loop unchanged, into the existing `except asyncio.TimeoutError:` branch. This is why `_post_*` had to return a classification after all.
+- **New `utils_agents/api_retry.py`** (shared, next to `agent_persona.py`): `run_with_retry(attempt_call, provider)`, `RETRYABLE_STATUS_CODES` (429, 500, 502, 503, 504) and `parse_retry_after()`. Backoff is exponential with jitter, each delay capped at 30s, `Retry-After` (integer seconds only; the HTTP-date form is ignored) replaces the computed delay. Sleeps with `asyncio.sleep()`. Open Question 1 above (shared vs per-module) was answered by assumption, not by the user: shared, since both interfaces were being edited anyway.
+- **`config.py`:** `API_RETRY_MAX_ATTEMPTS` (default 3, total attempts including the first, 1 disables retrying) and `API_RETRY_BASE_DELAY_SECONDS` (default 2), both `get_env_int()`, shared across providers.
+- **`deepseek_interface.py`:** `_post_chat_completion()` now returns a named dict `{"reply", "retryable", "retry_after"}` instead of `str | None`. `query_via_api()` wraps its single `wait_for` in `run_with_retry()` and reads `result["reply"]`. Its own return value is unchanged.
+- **`qwen_interface.py`:** `_post_response()`'s existing dict gained `"retryable"` and `"retry_after"`. Both `wait_for` calls in `query_via_api()` (the normal one and the fresh-conversation one) are wrapped. A rejected `previous_response_id` is a 400/404, so it is never retryable and the two mechanisms do not interact, except that the rare case where both fire gives each its own full set of attempts.
+- **Connection-level errors** (`URLError` or `ConnectionError`, unless the reason is a `TimeoutError`) are retryable. They are now logged with `logger.error` and no stack trace, where before they fell into the generic `logger.exception` branch. A malformed response and every other exception stay non-retryable and keep the old log line.
+- Not run. Untested: the backoff timing, `Retry-After` parsing, the connection-error classification, and that `asyncio.wait_for()` called from a lambda behaves as expected per attempt.
+
+#### Known limitation, found while researching billing
+
+Search results indicate DashScope returns **HTTP 429 with code `insufficient_quota`** when the free/allocated quota is exhausted. That is a quota (billing-adjacent) failure, but it is a 429, so **the new retry loop will retry it** for Qwen, costing about 6 seconds of pointless waiting per turn. Open Question 2 above, now confirmed as real rather than hypothetical (from search results, not tested against a real account). Fix is small and belongs to the billing work below: mark it not retryable when the body names `insufficient_quota`.
+
+#### Billing-error plan (proposed, nothing implemented)
+
+**Goal.** A depleted balance or quota should stop being retried, be clearly visible to the operator, and give the end user a message that says more than "not currently available", without leaking account details.
+
+**What each provider reports** (search-derived, not run against a real account, and the official pages were not fetched directly):
+
+| Provider | Signal |
+|---|---|
+| DeepSeek | HTTP 402, body `{"error":{"message":"Insufficient Balance", ...}}` |
+| Qwen | HTTP 429 with code `insufficient_quota` (quota exhausted). Account overdue is documented, but its HTTP status and code were not confirmed. |
+| Claude | `AssistantMessage.error == "billing_error"` from the SDK, never read today. Unverified against the pinned `0.2.152`. |
+
+**Phases, each independently approvable:**
+
+1. **Classify and stop retrying** (small, no contract change). Add a shared `is_billing_failure(status_code, body_text)` next to `RETRYABLE_STATUS_CODES`. In `_post_response()`, mark a billing 429 as not retryable. Log billing failures at `logger.error` with a fixed, greppable tag. Claude reads `AssistantMessage.error` in `_collect_claude_response()` and `_run_turn()` and logs it. DeepSeek's 402 is already non-retryable.
+2. **Tell the user.** The interfaces still return `str | None`, so the signal needs a carrier. Proposed: a small `LLMBillingError` exception in a new lowest-level module (for example `agent_errors.py`, it cannot live in `agent_interface.py`, which imports the interfaces), raised only for billing failures, caught in `dispatch_call()` beside its existing `except Exception`. Two traps: `_send_llm_test_prompt()` must catch it or the startup smoke test would crash startup, and Claude's `_run_query()` and `_run_turn()` have bare `except Exception` handlers that would swallow it, so they need an `except LLMBillingError: raise` ahead of them. The user-facing outcome is either reuse of the existing `token_exhausted` (no duration, no gateway change, but "nap" implies a temporary state) or a new `error_type` with a fixed message. The gateway shows an unknown type's `message` verbatim, so never pass the provider's body through.
+3. **Tell the operator.** Email on billing failure, throttled by a cooldown so an empty balance does not send one email per chat message. Reuses `smtp_handler.send_mail()` and the cooldown pattern of the `gateway_alert` notification in `utils_queue/message_handler.py`. Its throttle-state storage has not been read yet; read it before implementing.
+4. **Optional:** a short circuit-breaker that skips provider calls for a few minutes after a billing failure. Not needed for correctness, since a 402 fails fast, so it only saves calls.
+
+**Open Questions.** Reuse `token_exhausted` or add a new `error_type` (and its wording)? Is the exception an acceptable exception to the modules' "never raises" convention, given the alternative is widening the return type? Phases 3 and 4 wanted at all? What DashScope returns for an overdue account.
+
+**Files affected if approved:** `api_retry.py`, `deepseek_interface.py`, `qwen_interface.py`, `claude_interface.py`, `claude_session_service.py`, `agent_interface.py` (`_send_llm_test_prompt()`), `call_dispatch_handler.py`, a new `agent_errors.py`, and `config.py` only if phase 3 adds a cooldown setting.
+
+### Revision (2026-09-20, later still) — billing phases 1 and 2 implemented for DeepSeek and Qwen only, as `billing_exhausted`
+
+Direct instruction: add "those 2" billing errors (read as DeepSeek's 402 and Qwen's 429 `insufficient_quota`), do not reuse `token_exhausted` "as that error type consider 5hours wait", use `billing_exhausted` instead, and record a new message plus a button in `telegram_gateway`'s TODO.
+
+#### Decisions
+
+- **New `error_type="billing_exhausted"`, not `token_exhausted`.** `token_exhausted` is the gateway's "taking a nap" message with a countdown, modelled on a known wait of roughly 5 hours (the user's stated reason). A depleted balance has no known end time, so reusing it would promise a recovery the system cannot know about. Supersedes option 2 in the earlier Revision, which proposed reusing it.
+- **Claude's `billing_error` is not covered.** The instruction named two errors, so only DeepSeek and Qwen are done. Claude still collapses into `call_pipeline_unavailable`. Reading `AssistantMessage.error` remains an open item, unverified against `claude-agent-sdk==0.2.152`.
+- **Phases 3 (operator email) and 4 (circuit breaker) of the plan above were not requested and are not implemented.**
+- **The end user sees a fixed message,** "The chat agent's usage allowance has run out for now. Please try again later." The provider's own response body is written to the log only. Until the gateway gives `billing_exhausted` its own handling, `_handle_error()`'s generic branch shows this text under its "having difficulty managing a problem" wrapper.
+
+#### Implementation Notes
+
+- **New `utils_agents/agent_errors.py`:** `LLMBillingError(provider)`. A leaf module with no application imports, since `agent_interface.py` imports every interface and so cannot host it.
+- **`api_retry.py`:** new `is_billing_failure(status_code, body_text)` - HTTP 402, or HTTP 429 with `insufficient_quota` in the body (lower-cased match). A plain 429 stays an ordinary retryable rate limit.
+- **`deepseek_interface.py` and `qwen_interface.py`:** each `_post_*` result dict gained `"billing_failure"`, and a billing failure is forced non-retryable. This fixes the known limitation above where Qwen's `insufficient_quota` 429 would have been retried. `query_via_api()` raises `LLMBillingError` when the flag is set, and never returns `None` in that case. Qwen checks after both the normal and the fresh-conversation request. The error body is still logged as before.
+- **`call_dispatch_handler.py::dispatch_call()`:** a new `except LLMBillingError` ahead of the existing `except Exception`, returning `error_type="billing_exhausted"` with the fixed message and logging at `logger.error`. Every Call (chat, architect, coder, review, documentation) reaches its LLM through this `try`, so all of them are covered. Nothing else calls `query_llm()` except the startup smoke test.
+- **`agent_interface.py::_send_llm_test_prompt()`:** catches `LLMBillingError`, logs it and returns, so a depleted balance cannot abort startup. `query_llm()`'s docstring now states it can raise.
+- **This is a deliberate exception to the interfaces' "never raises, returns `None`" convention,** recorded in `agent_errors.py`'s header and each interface's Notes. It was chosen over widening `query_llm()`'s return type.
+- Not run - no execution access. Untested: the 402 and 429 classification against real responses, that the exception propagates through `chat_call.handle()`, and the `dispatch_call()` branch.
+
+#### Open Questions
+
+1. **DashScope's overdue-account (Arrearage) response is not detected.** Its HTTP status and code were not confirmed, so it still falls into `call_pipeline_unavailable`. Nothing matches it today.
+2. **The `insufficient_quota` and 402 signals come from search results, not a real account.**
+3. Whether Claude's `billing_error` should follow, and whether phases 3 and 4 are wanted.
+
+#### Follow-up Work
+
+- `telegram_gateway`'s own message and button for `billing_exhausted` is recorded in `telegram_gateway/CODE_TODO.md`. Nothing was changed in `telegram_gateway` code.
+- `bot_sanctuary/README.md` may list the error types this application emits - not checked, not updated.
+
+#### Where
+
+- `bot_sanctuary_application/utilities/utils_agents/agent_errors.py` (new), `api_retry.py`, `agent_interface.py`, `interfaces/deepseek_interface.py`, `interfaces/qwen_interface.py`.
+- `bot_sanctuary_application/utilities/utils_calls/call_dispatch_handler.py`.
+
+#### Challenge raised after implementation (2026-09-20): exception vs. "error as a response"
+
+The user observed that the exception approach differs from Claude, which they recall treating an error as a response and returning `{error: type}`. Checked, not assumed: no code in `bot_sanctuary` turns a Claude API failure into that shape. The only response-as-error route is the LLM's own `error` tool (`agent_tools.TOOLS`, `libraries/persona/chat.md` line 211), where the model chooses `error_type` and `message` and `dispatch_call()` publishes it as an ordinary reply. That needs a model reply, so it cannot cover a billing failure, where no reply exists. The gateway logs only ever show `call_pipeline_unavailable`. Unverified, from a search result only: the SDK may return API errors as assistant text (claude-agent-sdk-python issue #472), which would reach `message_dissect()` as invalid JSON and loop through corrective retries up to `CALL_MAX_HOPS`.
+
+**Alternative, not implemented:** an interface returns `{"type": "error", "error_type": "billing_exhausted", "message": "..."}` as its result, which `message_dissect()` already accepts (`dict | str`). That would remove `agent_errors.py` and the `except LLMBillingError` branches. Costs: `query_llm()`'s return type widens to `str | dict | None`, the startup smoke test would log the dict as a reply, and `execute_dispatch_call()` would publish `completed` after the `error` (it does so after any non-poll, non-button message), so the gateway would see a `completed` for a task whose mapping `_handle_error()` had just deleted (expected to log "No task mapping found", not verified in any log). ~~**Decision pending** - the exception approach stays as built until the user chooses.~~ **Decided 2026-09-20, same day: use the response dict** (`{"type": "error", "error_type": "billing_exhausted", "message": "..."}`). The exception approach in the Implementation Notes above is superseded - see the next section for what replaced it.
+
+#### Implemented: billing failure as an "error" tool reply, not an exception (2026-09-20)
+
+- **`agent_errors.py` repurposed, not deleted** (no delete capability in this session, and it fits): `LLMBillingError` removed, replaced by `billing_exhausted_response()`, which returns a fresh `{"type": "error", "error_type": "billing_exhausted", "message": <fixed text>}` dict. The fixed message is unchanged. The file can be deleted or merged elsewhere later if a dedicated module is not wanted.
+- **`deepseek_interface.py` and `qwen_interface.py`:** `query_via_api()` returns `billing_exhausted_response()` where it raised before, and is now typed `str | dict | None`. It returns before the transcript append (DeepSeek) and before the session-marker write (Qwen), so nothing is persisted for a billing failure. Qwen still checks after both the normal and the fresh-conversation request.
+- **`call_dispatch_handler.py::dispatch_call()`:** the `except LLMBillingError` branch and its import are removed - the dict needs no special handling, since `message_dissect()` already accepts `dict | str` and `validate_message()` accepts the `error` tool.
+- **`call_dispatch_handler.py` ends up with no net change.** `execute_dispatch_call()` briefly gained an `elif` closing a published `error` reply without a `completed`, plus docstring notes. **Reverted the same day on the user's instruction ("the previous error handling should handle them, I do not want a new error handler").** The billing dict is handled by the existing code: `message_dissect()` wraps a dict result as `{"message": <dict>, "error_type": None, ...}`, so `execute_dispatch_call()` publishes it through its existing `else` branch via `execute_tool()`, exactly as it already did for an LLM's own `error` tool reply. Known consequence, accepted: that branch then also publishes `completed`, which the gateway is expected to drop with a logged "No task mapping found" line after `_handle_error()` has deleted the mapping (not seen in any log). Rejected alternatives: the `elif` above, and translating an error-tool result into the outcome's `error_type` fields inside `message_dissect()`.
+- **`agent_interface.py`:** `query_llm()` typed `str | dict | None`. `_send_llm_test_prompt()` logs a dict reply as an error ("no balance or quota left") instead of as a credential-test response. `chat_call.handle()` typed the same, with its docstring updated. `architect_call.py`, `coder_call.py`, `review_call.py` and `documentation_call.py` still annotate `str | None` (hint only, placeholder Calls, not changed).
+- Not run - no execution access. Untested: the dict flowing through `message_dissect()`/`execute_tool()`, the trailing `completed` after the `error`, and the gateway's handling of the published payload.
+
+### Revision (2026-09-20, later still) — Qwen: `http.client.IncompleteRead` is now a retryable failure
+
+Direct instruction: "IncompleteRead can be a retry", given in reply to a review of `qwen_interface.py`'s error checks.
+
+#### Context
+
+The review found two places where a response body cut short mid-read was not handled as a transient failure:
+
+- **Success path:** `response.read()` raising `IncompleteRead` (an `http.client.HTTPException`, not an `OSError`, so neither the `URLError`/`ConnectionError` branch nor the timeout logic matched) fell into the generic `except Exception`, which is never retryable.
+- **Error path:** `error.read()` inside the `HTTPError` handler was unguarded. An exception raised inside an `except` block is not caught by that `try`'s sibling handlers, so it escaped `_post_response()`, passed through `run_with_retry()` (which only handles `retryable` results) and out of `query_via_api()` (which only catches `asyncio.TimeoutError`). That broke the module's "returns `None` on any other failure" contract. No handler was seen around `provider.query_via_api()` in `query_llm()`, but only part of `agent_interface.py` was read.
+
+#### Decisions
+
+- **`IncompleteRead` is retryable on the success path only.** It joins the existing connection-level `except` tuple, so it is classified retryable because its reason is not a `TimeoutError`. ~~On the error path only that one exception is caught around `error.read()`, and it returns a retryable result.~~ **Removed the same day, on the user's instruction, after its likelihood was questioned.** An error body is a few hundred bytes that normally arrives with the headers, so a cut-off one is very unlikely, and the guard would not have been worth carrying. An `IncompleteRead` from `error.read()` therefore escapes the `HTTPError` handler again, like any other exception raised there (Open Question 1).
+- ~~**A truncated error body is retried whatever its status code.**~~ Moot once the error-path guard was removed. It would have retried a permanent 4xx with a truncated body, and would not have recognised a billing 429 with one.
+- **A retried request may already have been processed by DashScope,** so a retry after a truncated 200 can be billed twice. The retry resends the same `previous_response_id`, so conversation continuity is unaffected. Accepted.
+- **Scoped to `IncompleteRead` only,** as instructed.
+
+#### Implementation Notes
+
+- `qwen_interface.py`: `import http.client`; `IncompleteRead` added to the connection-level `except`; the header Notes and `_post_response()`'s docstring updated. `error.read()` was also wrapped at first, then unwrapped the same day (see Decisions).
+- Not run - no execution access. Untested: that a truncated body actually raises `IncompleteRead` from `response.read()` and `error.read()` as expected, and the resulting retry timing.
+
+#### Open Questions and Follow-up Work (review findings not acted on)
+
+1. **Every exception from `error.read()`, `IncompleteRead` and `ConnectionResetError` included, escapes the `HTTPError` handler,** and so `_post_response()`. Judged very unlikely, so left unguarded on the user's instruction.
+2. **`_read_session_marker()`'s "never raises" claim is not fully true:** `UnicodeDecodeError` from corrupt bytes, JSON that is not an object, a non-string `created_at`, and a naive `created_at` (comparing with an aware `application_time()` raises `TypeError`) all escape. It would take a corrupt or hand-edited marker; this module writes the marker itself.
+3. **A rejected `previous_response_id` that `_is_expired_previous_response_error()` fails to recognise never self-heals,** because a failed call leaves the marker in place. It is bounded by the scheduled reset (about 24 hours) or `QWEN_SESSION_TTL_DAYS`. The heuristic is already unconfirmed against a real account.
+4. **SSL and certificate failures arrive as `URLError` and are marked retryable.** A preference.
+5. **`deepseek_interface.py`'s equivalent error paths were not checked** for the same `IncompleteRead` gap.
+
+#### Where
+
+- `bot_sanctuary_application/utilities/utils_agents/interfaces/qwen_interface.py`.
+
+---
+
+## NEW — `libraries/codex/chat.json` written, but `codex_interface.py` does not read any of its new fields yet — 2026-09-20
+
+Status: **File written 2026-09-20. Interface wiring not started.** Until `codex_interface.py` is changed, only `persona` in this file has any effect - `model`, `reasoning_effort` and `sandbox` are inert.
+
+### Goal
+
+A Codex-backed "chat" Call configured the same way as the Claude, DeepSeek and Qwen ones, restricted to a sandbox that cannot modify anything.
+
+### Context
+
+`libraries/codex/chat.json` was a 0-byte placeholder, like every other non-Chat library file, so Codex chat ran with no persona at all (`parse_agent()` returns an empty persona for an empty file, and `_run_query()` writes `AGENTS.md` only `if persona:`). The file was designed by comparing it with Claude's `chat.json` field by field, from documentation and search results, not by running the CLI.
+
+- `name`, `description` - read by no provider, kept for parity.
+- `persona` - `{{PERSONA}}`, resolved by `parse_agent()` from the shared `libraries/persona/chat.md`, delivered to Codex as a per-call `AGENTS.md`.
+- `model` - Codex takes `-m <model>`.
+- `tools` - **deliberately not included.** Codex has no per-call tools array (same structural mismatch as Qwen). Claude's `["WebSearch"]` has no direct equivalent; web search is a config option (`web_search`, or the `--search` flag). `sandbox` is the closest analogue to what `tools` restricts.
+
+### Decisions
+
+- **`"model": "gpt-5.6-terra"`** - the user's choice. It is the current default and the "balanced agentic coding model" on Codex's Models page (search result, not verified against the installed CLI). Model names change, so confirm with `/model`.
+- **`"reasoning_effort": "high"`** - the user's choice. `high` is a confirmed value; `xhigh`, `max` and `ultra` also exist per the changelog. Whether `low`, `medium` and `minimal` exist for Codex, and which levels each model accepts, was not confirmed.
+- **`"sandbox": "read-only"`** - the user's choice.
+- **`sandbox` and `reasoning_effort` are this project's own field names, not a Codex schema.** They follow DeepSeek's convention of reading extra provider-specific fields off the raw persona JSON (`AgentPersona.persona`). `parse_agent()` tolerates extra fields.
+- **`web_search` omitted.** It was floated as optional for parity with Claude's `WebSearch` and was not requested.
+
+### Implementation Notes
+
+- Only `libraries/codex/chat.json` was written. **`codex_interface.py` was not changed.** It reads only `parse_agent(...).body` and never passes `-m`, a reasoning level or a sandbox flag, so the CLI's own configured defaults still apply.
+- Not run - no execution access.
+
+### Open Questions
+
+1. **`read-only` does not meet the stated requirement that "the bot should not be able to read anything".** The built-in `read-only` sandbox stops writes, but the agent can still read files. Codex has custom permission profiles (`[permissions.<name>.filesystem]`, with `":minimal" = "read"` and `"deny"` rules), but a GitHub issue (#22179) reports that `deny-globs` did not block reads in v0.130.0, and another (#5237) reports Codex reading outside its working directory. Neither was tested here. `read-only` was written as instructed and is defence in depth only. Rejected as insufficient on its own: relying on the working directory (a temp directory holding only `AGENTS.md`) to limit reads.
+2. **Whether Codex should back chat at all,** given the API-based providers have no filesystem access by design. Not decided.
+3. Whether to add `"web_search"` for parity with Claude.
+
+### Follow-up Work
+
+- **Wire the fields in `codex_interface.py`:** pass `-m`, `-c model_reasoning_effort=...` and `--sandbox`.
+- **`--skip-git-repo-check`** - Codex requires a Git repository by default and the persona's temp directory is not one, so this path has never run for chat and may refuse to start. Verify before setting `LLM_CHAT_TYPE` to `codex`.
+- **Minimal subprocess environment.** `query_via_api()` passes `{**os.environ, "OPENAI_API_KEY": token}`, so every secret in the bot's environment (other LLM tokens, the Telegram token) is visible to a command the model runs, whatever the sandbox says. The OAuth path removes only `OPENAI_API_KEY`. The OAuth login file under `~/.codex` is also readable by the same OS user.
+- **`--ephemeral`** - otherwise Codex stores session files on disk with no continuity mechanism using them.
+- **Real read isolation** if wanted: a dedicated unprivileged user or a container with nothing mounted, or a custom permission profile once its deny behaviour is verified.
+- **`codex_interface.py` is behind the other interfaces:** it still uses `cwd` rather than `session_dir`, and has no timeout, retry or session continuity. Its `_resolve_persona()` also has no fallback to the `persona` argument when a `call_name` is derivable, unlike DeepSeek.
+- `AGENTS.md` is read as project instructions, not a system prompt, so persona adherence may be weaker than with the API providers.
+
+### Where
+
+- `bot_sanctuary_application/libraries/codex/chat.json` (written), `bot_sanctuary_application/utilities/utils_agents/interfaces/codex_interface.py` (unchanged, needs the wiring above).
+
+---
+
+## NEW — Codex OAuth: finish and harden the existing login-session path — planned 2026-09-21, not yet approved or implemented
+
+Status: **Planned 2026-09-21, revised the same day after review. Nothing implemented.** Requested as "implement Codex OAuth"; on inspection the basic path already exists, so this entry covers only the gaps.
+
+### Goal
+
+Codex working reliably with `LLM_CODEX_ACCESS_TYPE="OAUTH"` from a fresh container, following the shape of Claude's OAuth handling where Codex's own credential model allows it: login is possible headlessly, the login survives restarts, and a broken or expired login is detected and reported.
+
+### Context
+
+Already in place: `codex_interface.query_via_oauth()` (runs `codex exec` with `OPENAI_API_KEY` removed, so the CLI uses its persisted login), `agent_interface.query_llm()` routing on `"OAUTH"`, the native `codex` CLI in `Dockerfile.dev`/`Dockerfile.prod`, the `~/.codex` bind mount in `setup.sh`/`compose.dev.yml`, and the README's `codex login` instructions.
+
+Gaps found:
+
+1. **Codex has no startup step, unlike Claude.** Claude's OAuth is bridged once by `claude_interface.initialise_claude()`, called from `agent_interface.initialise_llm_services()`. Codex has no equivalent, so a missing or expired login is only discovered on the first real call.
+2. **Headless login is undocumented for Codex.** The README's `docker exec -it <container_name> codex login` uses the default browser-callback flow. OpenAI's own authentication documentation (developers.openai.com/codex/auth) and CLI reference (developers.openai.com/codex/cli/reference) describe `codex login --device-auth` as the flow for headless machines. It requires "device code login" to be enabled in the ChatGPT account's security settings (or by the workspace admin). The administrator logs in personally inside the container; no credentials are copied from another machine and no third-party tooling is involved. Copying `~/.codex/auth.json` from another machine is a documented fallback and is deliberately not planned. Not yet tried in this container.
+3. **No detection of an expired or missing login.** `_run_query()` logs the exit code and stderr and returns `None`, which the caller cannot tell apart from any other failure. There is also no timeout.
+
+### Decisions
+
+- Scope is the OAuth path only. No new Codex auth mechanism is invented; the CLI owns the login file and its own token refresh.
+- **Claude's `setup-token` / `LLM_CLAUDE_TOKEN` / env-var bridge is not replicated for Codex.** Codex's login is an `auth.json` holding access and refresh tokens, and the CLI rewrites it after each refresh. A copy held in `config.ini` would go stale, and re-writing it on each startup would overwrite a newer refreshed file. Rejected.
+- **`test_llm_tokens()` is unchanged.** Skipping a provider with an empty token is the intended convention. An earlier version of this entry proposed changing it; rejected on review.
+- Removed from this entry on review: the `config_sample.ini` `API_KEY` wording (out of scope for OAuth), and wiring the `chat.json` fields plus `--skip-git-repo-check` (not a priority, still tracked in the previous entry).
+
+### Implementation Notes (planned order)
+
+1. Verify `codex login --device-auth` end-to-end in the container, then document it in the README's "LLM Provider CLI Login" section.
+2. Add `initialise_codex()` to `codex_interface.py`, mirroring `initialise_claude()`'s role: log the resolved access type at startup and, for `OAUTH`, check the persisted login (`codex login status` prints the active authentication mode and exits 0 when logged in, per the official CLI reference) and log a clear warning if there is none. Call it from `agent_interface.initialise_llm_services()`. It does not start a service and does not touch `auth.json`.
+3. In `codex_interface._run_query()`: add a timeout using `AGENT_QUERY_TIMEOUT_SECONDS`, matching Claude's `_run_query()` (same constant, bare `None` on timeout), and recognise an authentication failure in stderr so it is logged distinctly (`agent_errors.py` not yet reviewed for alert-path fit).
+
+### Open Questions
+
+1. **Concurrent `codex exec` processes refreshing the same `auth.json`** could race. Not verified; a per-provider `asyncio.Lock` is the fallback if it is a real problem, at the cost of serialising Codex calls.
+2. **Whether `bot_directory/codex` is writable by `bot_sanctuary_usr` (uid 1000) is unproven either way.** The container user is uid 1000 (`Dockerfile.*`), and `bot_directory/` is gitignored and not created by `setup.sh` (only the Redis data directory is). If the host directory is missing, Docker creates it as root, which would break login writes. The Claude mount is identical, so if Claude's login persists on the host, Codex's will too. Verify on the host, not a code change.
+3. Whether a subscription-based ChatGPT login is permitted for this kind of automated, always-on bot use under OpenAI's terms. Not checked.
+
+### Follow-up Work
+
+- Minimal subprocess environment for the OAuth path, which currently passes the whole bot environment through (see the previous entry).
+- Real read isolation, if wanted (see the previous entry).
+- `chat.json` field wiring, `--skip-git-repo-check`, `--ephemeral` (see the previous entry).
+
+### Where
+
+- `bot_sanctuary_application/utilities/utils_agents/interfaces/codex_interface.py`, `bot_sanctuary_application/utilities/utils_agents/agent_interface.py`, `bot_sanctuary/README.md`.

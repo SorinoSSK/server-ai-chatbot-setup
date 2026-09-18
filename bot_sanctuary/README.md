@@ -10,7 +10,7 @@ Python application root is located at `bot_sanctuary/bot_sanctuary_application`.
 
 - Python 3.12 (`python:3.12.4-slim` base image), run as a Docker container on the project's isolated bridge network.
 - Depends on RabbitMQ for internal messaging.
-- Four LLM providers are wired, each with its own credential pair: `claude` (Claude Agent SDK), `codex` (shells out to the `codex` CLI), `deepseek`/`qwen` (direct REST call to each provider's own OpenAI-compatible endpoint). More than one can be configured at once. `claude`/`codex` support OAuth login via their own CLIs, both installed natively in the image; `deepseek`/`qwen` are API-key-only.
+- Four LLM providers are wired, each with its own credential pair: `claude` (Claude Agent SDK), `codex`/`deepseek`/`qwen` (direct REST call to each provider's own OpenAI-compatible endpoint). More than one can be configured at once. `claude` supports OAuth login via its own CLI, installed natively in the image; `codex`/`deepseek`/`qwen` are API-key-only - Codex's own OAuth path is not developed, see `CODE_TODO.md`.
 - Optionally depends on an SMTP relay for `gateway_alert` alerting - inert until configured.
 - Optionally depends on Redis for a durable, once-per-day throttle on `gateway_alert` notifications, and for crash-recovery task tracking - not a hard startup dependency.
 
@@ -94,14 +94,13 @@ Once built, use the same helper script for day-to-day container management:
 
 #### LLM Provider CLI Login
 
-`claude`/`codex` persist their login sessions to `bot_directory/claude`/`bot_directory/codex` (bind-mounted, so a login survives a container recreation). `deepseek`/`qwen` are API-key-only and need no login.
+`claude` persists its login session to `bot_directory/claude` (bind-mounted, so a login survives a container recreation). `codex`/`deepseek`/`qwen` are API-key-only and need no login.
 
 ```bash
 docker exec -it <container_name> claude setup-token
-docker exec -it <container_name> codex login
 ```
 
-Copy the resulting Claude token into `config.ini`'s `CHATBOT_LLM_CLAUDE_TOKEN` and restart the container. Codex's credentials are written directly to its persisted mount.
+Copy the resulting Claude token into `config.ini`'s `CHATBOT_LLM_CLAUDE_TOKEN` and restart the container.
 
 #### Testing SMTP Configuration
 
@@ -154,6 +153,7 @@ Exits `0` on success, `1` on failure - check the container logs either way for d
 - The crash-recovery startup sweep still over-triggers for any task predating this pipeline (or from an application version that never wired it) - `mark_task_complete()` is now called for a coalesced batch's final task_id too, on every exit path that actually closes it out on `telegram_gateway`'s side, but this only takes effect going forward.
 - The `gateway_alert` throttle window is a rolling cooldown, not a calendar-day reset.
 - `qwen_interface.py`'s endpoint/model are unconfirmed assumptions, not verified against a real account.
+- `codex_interface.py`'s accepted `reasoning_effort` values per model, and its previous_response_id-rejection detection, are unconfirmed against a real account.
 - A failed `session_reset`/rejection publish during a global session reset has no retry or backstop - the requesting admin's task may be left open on `telegram_gateway`'s side.
 - A session receiving a continuous, gapless stream of messages can delay its own retirement indefinitely during a global session reset, blocking every later reset request until it finishes.
 - A call against Claude's persistent session platform that exceeds `AGENT_QUERY_TIMEOUT_SECONDS` is only best-effort cancelled - the abandoned call may continue running in the background, though the next call for that same session always builds a fresh client rather than queuing behind it.
@@ -181,7 +181,7 @@ Exits `0` on success, `1` on failure - check the container logs either way for d
 | LLM_CHAT_TYPE | Provider used by the Chat Call, and the fallback for every other Call's own type below. |
 | LLM_ARCHITECT_TYPE / LLM_CODER_TYPE / LLM_REVIEW_TYPE / LLM_DOCUMENTATION_TYPE | Per-Call provider override, falling back to LLM_CHAT_TYPE if unset. |
 | LLM_CLAUDE_ACCESS_TYPE / LLM_CLAUDE_TOKEN | Claude's access type (`"OAUTH"` or `"API"`) and credential. |
-| LLM_CODEX_ACCESS_TYPE / LLM_CODEX_TOKEN | Codex's access type and credential. |
+| LLM_CODEX_ACCESS_TYPE / LLM_CODEX_TOKEN | Codex's access type (`"API"` only - OAuth is not developed) and API key. |
 | LLM_DEEPSEEK_ACCESS_TYPE / LLM_DEEPSEEK_TOKEN | DeepSeek's access type (`"API"` only) and API key. |
 | LLM_QWEN_ACCESS_TYPE / LLM_QWEN_TOKEN | Qwen's access type (`"API"` only) and API key. |
 

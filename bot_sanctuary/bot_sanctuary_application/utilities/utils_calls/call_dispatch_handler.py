@@ -41,7 +41,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_ENTRY_CALL_NAME = "chat"
+_ENTRY_CALL_NAME = settings.CALL_NAME_CHAT
 
 # Matches a reply wrapped in a ```json ... ``` (or plain ``` ... ```) code fence, capturing the content between
 # the fences - see _strip_code_fence()'s own docstring for why this is stripped before json.loads() is attempted.
