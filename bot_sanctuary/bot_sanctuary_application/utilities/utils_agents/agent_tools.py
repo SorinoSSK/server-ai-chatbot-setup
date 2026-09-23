@@ -6,6 +6,7 @@
 #
 # Features    :
 #   - TOOLS - the tool list (name/description/format) an LLM is told it may reply with.
+#   - build_tool_prompt() - appends TOOLS' own instructions (and, if permitted, the call-pass/handoff format) to a prompt.
 #   - execute_tool() - validates a message and, if valid, publishes it to telegram_gateway.
 #   - execute_completed() - publishes the "completed" close-out directly - bot_sanctuary's own decision, never the agent's.
 #
@@ -13,6 +14,12 @@
 #   - A message is exactly telegram_gateway's own per-type payload shape, minus task_id/session_id (added here).
 #   - session_reset/bot_started are excluded on purpose - those are orchestrator-only actions, never agent-decided.
 #   - "completed" is deliberately not in TOOLS - only bot_sanctuary's own dispatch logic may close a task with no further reply.
+#   - build_tool_prompt()'s own coding_allowed parameter is advisory only, a persona-level hint so an LLM knows
+#     upfront whether a handoff is even worth attempting - it is not itself an enforcement mechanism. The actual
+#     control is call_dispatch_handler.py::message_dissect(), which rejects a call pass's own requested
+#     target_call regardless of what this function told the LLM beforehand (§5 Phase 6 plan, CODE_TODO.md).
+#     Defaults to False (fail closed), matching session_worker.py::_extract_coding_allowed()'s own default for
+#     a caller that doesn't pass a real value.
 #   - See README.md and telegram_gateway/README.md for the authoritative payload formats.
 #
 # =============================================================================
@@ -60,7 +67,29 @@ def _tool_instructions() -> str:
         lines.append(f"- {tool['name']}: {tool['description']} Format: {tool['format']}")
     return "\n".join(lines)
 
-def build_tool_prompt(prompt: str) -> str:
+def _call_pass_instructions(coding_allowed: bool) -> str:
+    """
+    Builds the call-pass (handoff) instruction line used by build_tool_prompt().
+
+    Args:
+        coding_allowed (bool):
+            Whether a handoff is actually available for this turn - see build_tool_prompt()'s own Args.
+
+    Returns:
+        str:
+            A line describing the call-pass format, if coding_allowed; otherwise a line stating plainly that no
+            handoff tool is available right now.
+
+    Notes:
+        - Advisory only - see this module's own header Notes. The requested target_call of a call pass this
+          instructed a caller to attempt anyway is still rejected downstream regardless of what this text said.
+    """
+    if coding_allowed:
+        return 'You may also hand off to a specialised agent instead of using one of the tools above: {"target_call": "<a call name>", "message": "..."}.'
+    else:
+        return "You do not have a handoff tool available right now - always reply with one of the tools above."
+
+def build_tool_prompt(prompt: str, coding_allowed: bool = False) -> str:
     """
     Appends tool instructions to prompt, so the LLM's own reply is one of TOOLS' formats - not decided in Python.
 
@@ -68,11 +97,16 @@ def build_tool_prompt(prompt: str) -> str:
         prompt (str):
             The turn's own prompt/context.
 
+        coding_allowed (bool, optional):
+            Whether a handoff (call pass) is available for this turn - see this module's own header Notes.
+            Defaults to False (fail closed) for a caller that doesn't pass a real value.
+
     Returns:
         str:
-            prompt, followed by the list of available tools and the format each one expects.
+            prompt, followed by the list of available tools and the format each one expects, followed by the
+            call-pass instruction line (see _call_pass_instructions()).
     """
-    return f"{prompt}\n\n{_tool_instructions()}"
+    return f"{prompt}\n\n{_tool_instructions()}\n\n{_call_pass_instructions(coding_allowed)}"
 
 def _is_valid_album_item(item: dict) -> bool:
     """

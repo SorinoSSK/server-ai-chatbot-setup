@@ -17,6 +17,9 @@
 #   - A session's on-disk directory is only ever removed via clear_session_directory(), never on worker creation.
 #   - A global session reset may only be triggered by a whitelisted admin command or the optional daily schedule.
 #   - The Call pipeline handed off to is Chat-only for now, with no handoff between Calls - see CODE_TODO.md.
+#   - _process_batch() resolves coding_allowed per turn, from the coalesced batch's own final task_id, failing
+#     closed (False) if the field is absent - enforced downstream by call_dispatch_handler.py::message_dissect()
+#     against a call pass's own requested target_call (§5 Phase 6 plan, CODE_TODO.md).
 #   - See README.md for the full coalescing, crash-recovery, and session reset design.
 #
 # =============================================================================
@@ -544,6 +547,35 @@ def _extract_item_text(item: dict) -> str:
             else:
                 return ""
 
+def _extract_coding_allowed(batch: list[dict], final_task_id: str) -> bool:
+    """
+    Resolves the coding_allowed flag telegram_gateway stamped on a coalesced batch's own final task_id.
+
+    Args:
+        batch (list[dict]):
+            One or more task payloads belonging to this session, oldest first.
+
+        final_task_id (str):
+            The batch's own final task_id (see _process_batch()) - whichever payload carries this task_id is
+            this resolution's source, not simply batch's own last item positionally, in case they differ.
+
+    Returns:
+        bool:
+            final_task_id's own payload's coding_allowed value, or False if that payload doesn't carry the
+            field at all - an older/malformed payload, or a payload type telegram_gateway doesn't currently
+            stamp it on (e.g. a poll_answer/delivery_failed push - see telegram_gateway's own CODE_TODO.md).
+
+    Notes:
+        - Fails closed - a missing field is treated as not permitted, never as permitted, matching
+          telegram_gateway's own documented default ("False by default otherwise").
+        - Searched from the end of batch, since final_task_id is itself resolved as the last occurrence of a
+          task_id in batch, not necessarily its only occurrence - see _process_batch()'s own final_task_id derivation.
+    """
+    for item in reversed(batch):
+        if item.get("task_id") == final_task_id:
+            return item.get("coding_allowed", False)
+    return False
+
 def _close_intermediate_task_ids(task_ids: list[str]) -> None:
     """
     Publishes a silent completion marker for every task_id, on a dedicated, disposable publish connection.
@@ -748,6 +780,9 @@ class SessionWorker:
         Notes:
             - Every task_id in the batch except the last is closed out immediately.
             - The batch's text fields are combined into one input, as one continued thought.
+            - coding_allowed is resolved once here, from the batch's own final task_id (see
+              _extract_coding_allowed()), and handed to execute_dispatch_call() alongside the combined turn -
+              enforced downstream against a call pass's own requested target_call (see this module's own header Notes).
             - The combined turn is delegated to call_dispatch_handler.execute_dispatch_call() for the actual run.
         """
         task_ids = [item.get("task_id") for item in batch if item.get("task_id")]
@@ -766,11 +801,12 @@ class SessionWorker:
 
             final_task_id = task_ids[-1]
             combined_text = "\n".join(text for text in (_extract_item_text(item) for item in batch) if text.strip())
+            coding_allowed = _extract_coding_allowed(batch, final_task_id)
 
             logger.info(
                 f"session_id={self.session_id}: coalesced {len(batch)} message(s) (task_ids={task_ids}) into one "
-                f"turn (final task_id={final_task_id})."
+                f"turn (final task_id={final_task_id}, coding_allowed={coding_allowed})."
             )
-            call_dispatch_handler.execute_dispatch_call(self._publisher, self.session_id, final_task_id, combined_text, self.dispatch_queue, self.session_dir)
+            call_dispatch_handler.execute_dispatch_call(self._publisher, self.session_id, final_task_id, combined_text, self.dispatch_queue, self.session_dir, coding_allowed)
 
 # =============================================================================

@@ -9,7 +9,10 @@
 #
 # Notes       :
 #   - Conversation/routing only - has no filesystem or code tool access, unlike Architect/Coder/Review/Documentation.
-#   - Which reply tool to use, or whether to hand off via target_call, is decided entirely by the LLM itself.
+#   - Which reply tool to use, or whether to hand off via target_call, is decided entirely by the LLM itself -
+#     handle()'s own coding_allowed just tells it upfront whether a handoff is worth attempting at all (see
+#     agent_tools.build_tool_prompt()'s own Notes); the actual enforcement lives in
+#     call_dispatch_handler.py::message_dissect(), not here.
 #   - This file never parses/validates/retries the LLM's raw reply - call_dispatch_handler.py owns all of that.
 #   - Persona content is loaded per provider from libraries/<llm_type>/chat.md.
 #   - See README.md for how this interacts with Claude's own persistent-platform persona.
@@ -34,7 +37,7 @@ CALL_NAME = settings.CALL_NAME_CHAT
 
 # =============================================================================
 
-async def handle(prompt: str, session_dir: Path) -> str | None:
+async def handle(prompt: str, session_dir: Path, coding_allowed: bool) -> str | None:
     """
     Handles a single turn for the Chat Call.
 
@@ -44,6 +47,13 @@ async def handle(prompt: str, session_dir: Path) -> str | None:
 
         session_dir (Path):
             This session's own on-disk root directory - this function derives its own Call/LLM-scoped leaf directory before passing it on to query_llm().
+
+        coding_allowed (bool):
+            This turn's own resolved coding_allowed (see call_dispatch_handler.py::execute_dispatch_call()'s own
+            Notes) - passed straight through to agent_tools.build_tool_prompt() so the LLM is told upfront
+            whether a handoff is actually available. Advisory only - message_dissect() is what actually
+            enforces it against whatever target_call the LLM's reply ends up requesting, regardless of what it
+            was told here (§5 Phase 6 plan, CODE_TODO.md).
 
     Returns:
         str | None:
@@ -62,6 +72,6 @@ async def handle(prompt: str, session_dir: Path) -> str | None:
         persona = load_persona(settings.LLM_CHAT_TYPE, CALL_NAME)
         call_session_dir = session_dir / CALL_NAME / settings.LLM_CHAT_TYPE
         call_session_dir.mkdir(parents=True, exist_ok=True)
-        return await query_llm(settings.LLM_CHAT_TYPE, agent_tools.build_tool_prompt(prompt), persona=persona, session_dir=call_session_dir)
+        return await query_llm(settings.LLM_CHAT_TYPE, agent_tools.build_tool_prompt(prompt, coding_allowed), persona=persona, session_dir=call_session_dir)
 
 # =============================================================================
