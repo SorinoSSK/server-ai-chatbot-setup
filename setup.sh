@@ -51,6 +51,7 @@ get_masked_config_variables()
     echo "CHATBOT_LLM_DEEPSEEK_TOKEN"
     echo "CHATBOT_LLM_QWEN_ACCESS_TYPE"
     echo "CHATBOT_LLM_QWEN_TOKEN"
+    echo "CHATBOT_GIT_HOSTS"
     echo "CHATBOT_SMTP_FROM_EMAIL"
     echo "CHATBOT_SMTP_TO_EMAIL"
     echo "CHATBOT_SMTP_USERNAME"

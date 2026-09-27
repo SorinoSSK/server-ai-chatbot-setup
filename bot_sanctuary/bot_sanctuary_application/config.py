@@ -271,6 +271,43 @@ class Settings:
         self.SESSION_INBOX_MAX_SIZE                             = get_env_int("SESSION_INBOX_MAX_SIZE", DEFAULT_SESSION_INBOX_MAX_SIZE)
         self.SESSION_DIR                                        = self.DATA_DIR / "sessions"
 
+        # Repository Workspace (see §6 "Workspace / repository access", CODE_TODO.md - Phase 1, 2026-09-23)
+        # A persistent, per-repository git workspace, deliberately a sibling of SESSION_DIR under DATA_DIR, not
+        # nested inside it - shared by every LLM provider/Call (not per-provider, unlike bot_directory), one
+        # subdirectory per repository, named after the repository it was pulled from (Phase 2, not yet built).
+        # Lifetime is the application's own - the entire lifetime of the deployment until an admin destroys it
+        # directly on the host, never wiped by clear_all_session_directories() or any other startup/reset sweep
+        # the way SESSION_DIR's own children are - see main.py's own WORKSPACE_DIR.mkdir() call and
+        # utils_session/session_worker.py's own header Notes for the explicit exemption.
+        # In dev, this already persists on the host for free, since compose.dev.yml bind-mounts the whole
+        # bot_sanctuary_application directory (data/ included) - no separate mount was added for this path.
+        # Prod has no equivalent bind mount at all yet (no compose.prod.yml exists in this repository), so
+        # WORKSPACE_DIR does not yet survive a prod container recreation - a known, accepted gap for now, to be
+        # closed whenever prod's own deployment/volume mechanism is actually built.
+        self.WORKSPACE_DIR                                      = self.DATA_DIR / "repositories"
+
+        # Git Hosts (see §6 "Workspace / repository access", CODE_TODO.md - Phase 2, 2026-09-24)
+        # GIT_HOSTS is the authoritative, comma-separated list of git host domains this application may pull
+        # from/push to (e.g. "gitea.example.com,github.com") - every other Phase 2 git setting is derived from
+        # these exact domains, not independently discovered, so a typo here simply leaves that domain
+        # unresolvable rather than silently inventing one.
+        # Plain domains only - no scheme, no port. A non-standard SSH port is never configured here: it is read
+        # from the clone URL a user actually sends (ssh://git@gitea.example.com:2222/owner/repo.git), the same
+        # way a plain `git clone` would - see utils_workspace/repository_pull.py.
+        # GIT_SSH_DIR is a sibling of WORKSPACE_DIR/SESSION_DIR under DATA_DIR, not a second Docker mount - see
+        # utils_workspace/git_hosts.py's own header Notes for the full generation/sync design. Its ssh_config
+        # file and the deploy keypair each Host block references are generated automatically by this
+        # application's own startup routine (utils_workspace/git_hosts.py::sync_git_hosts(), called from
+        # initialise.py) - one generated "<uuid>-pull"/"<uuid>-push" Host alias pair per GIT_HOSTS domain,
+        # sharing one keypair. This is deliberately still not something the LLM-facing Call pipeline/agents can
+        # reach - it is plain deterministic application code, entirely separate from anything an LLM prompt or
+        # tool call can trigger, keeping the "bots must not have access to credentials" constraint intact while
+        # still automating generation, and keeping this application's own git filesystem access confined to one
+        # directory tree (WORKSPACE_DIR) the same way SESSION_DIR/WORKSPACE_DIR themselves already are.
+        DEFAULT_GIT_HOSTS                                       = ""
+        self.GIT_HOSTS                                          = get_env_list("GIT_HOSTS", DEFAULT_GIT_HOSTS)
+        self.GIT_SSH_DIR                                        = self.DATA_DIR / "git_ssh"
+
         DEFAULT_SESSION_SHUTDOWN_TIMEOUT_SECONDS                = 30
         self.SESSION_SHUTDOWN_TIMEOUT_SECONDS                   = get_env_int("SESSION_SHUTDOWN_TIMEOUT_SECONDS", DEFAULT_SESSION_SHUTDOWN_TIMEOUT_SECONDS, minimum=0)
 
@@ -344,6 +381,25 @@ def get_env_bool(name: str, default: bool) -> bool:
         """
         value = os.getenv(name)
         return default if value is None else value.strip().lower() == "true"
+
+def get_env_list(name: str, default: str = "") -> "tuple[str, ...]":
+        """
+        Reads a comma-separated environment variable into a tuple of trimmed, non-empty values.
+
+        Args:
+            name (str):
+                Environment variable name.
+
+            default (str, optional):
+                Fallback raw comma-separated value if unset. Defaults to "" (an empty tuple).
+
+        Returns:
+            tuple[str, ...]:
+                Each comma-separated entry, trimmed of surrounding whitespace, with empty entries dropped -
+                preserves the given order, does not deduplicate.
+        """
+        raw_value = os.getenv(name) or default
+        return tuple(entry.strip() for entry in raw_value.split(",") if entry.strip())
 
 def get_env_timezone(name: str, default: str) -> ZoneInfo:
         """

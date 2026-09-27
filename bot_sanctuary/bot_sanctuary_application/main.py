@@ -38,6 +38,8 @@ def main():
     """
     settings.DATA_DIR.mkdir(parents=True, exist_ok=True)
     settings.SESSION_DIR.mkdir(parents=True, exist_ok=True)
+    settings.WORKSPACE_DIR.mkdir(parents=True, exist_ok=True)
+    settings.GIT_SSH_DIR.mkdir(parents=True, exist_ok=True)
 
     setup_logging()
     logger = logging.getLogger(__name__)

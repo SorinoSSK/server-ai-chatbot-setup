@@ -8,6 +8,7 @@
 #   - Startup sweep clearing every leftover on-disk session directory, ahead of everything else.
 #   - Starts/stops every LLM provider's own always-on service, ahead of the LLM credential smoke test.
 #   - One-off LLM credential smoke test performed during startup.
+#   - One-off git host sync (generating any newly-needed deploy keypair/ssh_config Host block) then resolution/diagnostic performed during startup (settings.GIT_HOSTS against GIT_SSH_DIR's own ssh_config).
 #   - RabbitMQ consume connection and background consumer lifecycle management.
 #   - Unconditional bot_started broadcast on every startup, ahead of crash recovery.
 #   - Crash-recovery sweep for sessions left dangling by a prior run.
@@ -34,6 +35,7 @@ from .utils_queue.queue import (
     RabbitMQPublisher
 )
 from .utils_redis.database import close_redis_connection
+from .utils_workspace.git_hosts import sync_git_hosts, resolve_git_hosts
 from .utils_session.session_worker import (
     clear_all_session_directories,
     resync_orphaned_sessions,
@@ -78,7 +80,7 @@ def initialise_application() -> None:
     """
     Runs application startup steps.
 
-    Starts every LLM provider's own always-on service, performs the LLM credential smoke test, establishes the RabbitMQ consume connection, broadcasts bot_started, recovers any sessions left dangling by a prior run, starts the optional timed session reset schedule, and starts the background message consumer.
+    Starts every LLM provider's own always-on service, performs the LLM credential smoke test, syncs then resolves settings.GIT_HOSTS against GIT_SSH_DIR's own ssh_config, establishes the RabbitMQ consume connection, broadcasts bot_started, recovers any sessions left dangling by a prior run, starts the optional timed session reset schedule, and starts the background message consumer.
 
     Args:
         None
@@ -93,6 +95,9 @@ def initialise_application() -> None:
 
     initialise_llm_services()
     test_llm_tokens()
+
+    sync_git_hosts()
+    resolve_git_hosts()
 
     initialise_rabbitmq_connection()
     _push_bot_started()

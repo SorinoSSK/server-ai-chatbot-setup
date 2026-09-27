@@ -10,7 +10,9 @@
 #   - Startup crash-recovery sweep requesting a session reset for sessions left dangling by a prior run.
 #   - Admin-triggered and optional scheduled global session resets.
 #   - Graceful per-session and application-wide shutdown that drains outstanding work before exiting.
-#   - Hands each coalesced batch off to utils_calls/call_dispatch_handler.py for the actual Call pipeline run.
+#   - Hands each coalesced batch off to utils_calls/call_dispatch_handler.py for the actual Call pipeline run -
+#     unless it's recognised as a git repository reference, in which case it's handed to
+#     utils_workspace/repository_pull.py instead (§6 Phase 2, CODE_TODO.md).
 #
 # Notes       :
 #   - stop() abandons whatever remains queued; shutdown()/retire() both drain it fully before exiting.
@@ -20,6 +22,13 @@
 #   - _process_batch() resolves coding_allowed per turn, from the coalesced batch's own final task_id, failing
 #     closed (False) if the field is absent - enforced downstream by call_dispatch_handler.py::message_dissect()
 #     against a call pass's own requested target_call (§5 Phase 6 plan, CODE_TODO.md).
+#   - _process_batch() also only ever attempts repository_pull.extract_repository_reference() when
+#     coding_allowed is True - a session without it never reaches the classifier at all, mirroring the same
+#     tiered-access gate as the Call pipeline's own handoff enforcement (§6 Phase 2, CODE_TODO.md).
+#   - clear_all_session_directories()/clear_session_directory() only ever iterate/remove under settings.SESSION_DIR
+#     - settings.WORKSPACE_DIR (a sibling of SESSION_DIR under DATA_DIR, see config.py) is structurally
+#     untouched by either, deliberately - a repository workspace's own lifetime is the application's, not a
+#     session's, and neither function should ever be changed to reach into it (§6 Phase 1 plan, CODE_TODO.md).
 #   - See README.md for the full coalescing, crash-recovery, and session reset design.
 #
 # =============================================================================
@@ -36,6 +45,7 @@ from ...config import settings
 from ..utilities import application_time
 from ..utils_agents.agent_interface import terminate_session
 from ..utils_calls import call_dispatch_handler
+from ..utils_workspace import repository_pull
 from ..utils_redis.database import mark_task_active, mark_task_complete, sweep_orphaned_sessions
 
 # =============================================================================
@@ -783,7 +793,12 @@ class SessionWorker:
             - coding_allowed is resolved once here, from the batch's own final task_id (see
               _extract_coding_allowed()), and handed to execute_dispatch_call() alongside the combined turn -
               enforced downstream against a call pass's own requested target_call (see this module's own header Notes).
-            - The combined turn is delegated to call_dispatch_handler.execute_dispatch_call() for the actual run.
+            - When coding_allowed, the combined text is first checked for a recognised git repository reference
+              (see repository_pull.extract_repository_reference() - §6 Phase 2, CODE_TODO.md). A recognised
+              reference bypasses the Call pipeline entirely and is handed to
+              repository_pull.execute_repository_pull() instead - this is the deterministic (non-LLM) classifier
+              that decides between the two. Otherwise, the combined turn is delegated to
+              call_dispatch_handler.execute_dispatch_call() for the normal Call pipeline run.
         """
         task_ids = [item.get("task_id") for item in batch if item.get("task_id")]
         if not task_ids:
@@ -803,10 +818,17 @@ class SessionWorker:
             combined_text = "\n".join(text for text in (_extract_item_text(item) for item in batch) if text.strip())
             coding_allowed = _extract_coding_allowed(batch, final_task_id)
 
+            repository_reference = repository_pull.extract_repository_reference(combined_text) if coding_allowed else None
+
             logger.info(
                 f"session_id={self.session_id}: coalesced {len(batch)} message(s) (task_ids={task_ids}) into one "
-                f"turn (final task_id={final_task_id}, coding_allowed={coding_allowed})."
+                f"turn (final task_id={final_task_id}, coding_allowed={coding_allowed}, "
+                f"repository_reference={repository_reference.raw_url if repository_reference else None!r})."
             )
-            call_dispatch_handler.execute_dispatch_call(self._publisher, self.session_id, final_task_id, combined_text, self.dispatch_queue, self.session_dir, coding_allowed)
+
+            if repository_reference is not None:
+                repository_pull.execute_repository_pull(self._publisher, self.session_id, final_task_id, repository_reference)
+            else:
+                call_dispatch_handler.execute_dispatch_call(self._publisher, self.session_id, final_task_id, combined_text, self.dispatch_queue, self.session_dir, coding_allowed)
 
 # =============================================================================

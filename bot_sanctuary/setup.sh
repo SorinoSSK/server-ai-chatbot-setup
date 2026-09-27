@@ -84,6 +84,7 @@ bs_dev_run_docker()
             -e "LLM_DEEPSEEK_TOKEN=${CHATBOT_LLM_DEEPSEEK_TOKEN}" \
             -e "LLM_QWEN_ACCESS_TYPE=${CHATBOT_LLM_QWEN_ACCESS_TYPE}" \
             -e "LLM_QWEN_TOKEN=${CHATBOT_LLM_QWEN_TOKEN}" \
+            -e "GIT_HOSTS=${CHATBOT_GIT_HOSTS}" \
             -e "TELEGRAM_BOT_NAME=${CHATBOT_NAME}" \
             -e "SMTP_ENABLE_MAILER=${CHATBOT_SMTP_ENABLE_MAILER}" \
             -e "SMTP_FORCE_SSL=${CHATBOT_SMTP_FORCE_SSL}" \
@@ -119,6 +120,7 @@ bs_dev_run_docker()
             -e "LLM_DEEPSEEK_TOKEN=${CHATBOT_LLM_DEEPSEEK_TOKEN}" \
             -e "LLM_QWEN_ACCESS_TYPE=${CHATBOT_LLM_QWEN_ACCESS_TYPE}" \
             -e "LLM_QWEN_TOKEN=${CHATBOT_LLM_QWEN_TOKEN}" \
+            -e "GIT_HOSTS=${CHATBOT_GIT_HOSTS}" \
             -e "TELEGRAM_BOT_NAME=${CHATBOT_NAME}" \
             -e "SMTP_ENABLE_MAILER=${CHATBOT_SMTP_ENABLE_MAILER}" \
             -e "SMTP_FORCE_SSL=${CHATBOT_SMTP_FORCE_SSL}" \

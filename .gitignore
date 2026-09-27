@@ -4,3 +4,5 @@ __pycache__/
 **/data/logs/
 **/bot_directory/
 **/bot_sanctuary_application/data/sessions/
+**/bot_sanctuary_application/data/repositories/
+**/bot_sanctuary_application/data/git_ssh/
