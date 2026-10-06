@@ -180,7 +180,7 @@ sequenceDiagram
 
 ## 4. Media & Draft Handling
 
-### 4.1 – 4.3 New media received (draft creation)
+### 4.1 – 4.3 New media received (captioned: task; captionless: draft creation)
 
 ```mermaid
 sequenceDiagram
@@ -192,6 +192,19 @@ sequenceDiagram
 
     User->>TG: sends photo / video / document
     TG-->>Gateway: update (media)
+    alt caption non-blank (checked before any draft lookup)
+        alt update is an edited_message
+            Gateway->>Gateway: ignored (logged)
+        else new message
+            Gateway->>TG: POST /getFile (file_id)
+            alt getFile fails after retries
+                Gateway->>TG: sendMessage ("had trouble receiving, please resend")
+            else getFile succeeds
+                Gateway->>Gateway: _push_task(chat_id, user_id, caption, <type>_url)
+                Note over Gateway,Redis: no draft created; an already-pending draft is left untouched
+            end
+        end
+    else no caption (or whitespace-only)
     Gateway->>Redis: get_chat_draft(chat_id)
     alt existing draft already pending
         Redis-->>Gateway: draft
@@ -207,6 +220,7 @@ sequenceDiagram
             Gateway->>Redis: create_chat_draft(chat_id, media_type, url, caption, has_caption)
             Gateway->>DraftTimer: start_draft_timer(chat_id, media_type)
         end
+    end
     end
 ```
 

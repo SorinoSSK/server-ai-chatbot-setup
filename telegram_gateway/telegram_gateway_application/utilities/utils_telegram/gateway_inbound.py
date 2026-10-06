@@ -6,14 +6,16 @@
 #
 # Features    :
 #   - Long-polls the Telegram Bot API for new updates (messages, button presses, poll answers, etc.)
-#   - Resolves incoming photo/video/document to a fetchable URL and stages it as a pending draft until an instruction (text) arrives, or the draft times out.
+#   - Resolves incoming photo/video/document to a fetchable URL. Media with a non-blank caption is accepted straight away as a task input (caption = text); media without one is staged as a pending draft until an instruction (text) arrives, or the draft times out.
 #   - Detects the global-reset admin command ("${BOT_NAME} refresh yourself", from a chat_id in SESSION_RESET_ALLOWED_CHAT_IDS) on a plain text message and pushes a session_clear_request instead of a normal task - see _is_reset_command()/_handle_reset_command().
 #
 # Notes       :
 #   - Uses Telegram's getUpdates long polling method, not webhooks.
 #   - Updates missing a chat_id/user_id, or from a chat not in TELEGRAM_ALLOWED_CHAT_IDS, are skipped (unauthorised chats get one reply - see utils_gatekeeper/gatekeeper.py).
 #   - poll_answer updates carry no chat_id of their own and are routed separately - see _handle_poll_answer() - correlating instead via the poll's own Redis mapping (see utils_telegram/utilities/poll_response_handler.py).
-#   - Media without an instruction is staged as a Redis-backed draft (see utils_redis/database.py) until a text update finalises it, or it times out - see utilities/image_draft_handler.py.
+#   - Captionless media is staged as a Redis-backed draft (see utils_redis/database.py) until a text update finalises it, or it times out - see utilities/image_draft_handler.py.
+#   - Captioned media (caption non-blank after strip) never creates a draft and is checked before the pending-draft check, so it is pushed as its own task even while a draft is pending (the draft stays pending). An edited_message carrying a caption is ignored.
+#   - Drafts created before captioned media stopped being staged may still hold a caption - the finalisation branch that joins it with the follow-up text is kept for them only, and is otherwise unreachable.
 #   - Only one pending draft per chat_id at a time.
 #   - Album items (media_group_id) are never staged as a draft - the user is asked to resend one at a time; the reply is deduped per media_group_id.
 #   - Accepted updates get a task_id via create_task_mapping() before being queued - chat_id/user_id live only in Redis, keyed by task_id.
@@ -515,6 +517,22 @@ def _handle_update(chat_id: int, user_id: int, update: dict) -> None:
                         f"at a time with instructions for each, please?"
                     )
             return
+        elif media and (media["caption"] or "").strip():
+            if "edited_message" in update and "message" not in update:
+                logger.info(f"Ignored edited caption on {media['media_type']} for chat_id={chat_id}.")
+                return
+            else:
+                media_url = _resolve_file_url(media["file_id"])
+                if not media_url:
+                    logger.error(f"Failed to resolve file_id={media['file_id']} for chat_id={chat_id}. Captioned {media['media_type']} not pushed.")
+                    send_message(
+                        chat_id,
+                        f"{settings.TELEGRAM_BOT_NAME} had trouble receiving that - could you try resending it?"
+                    )
+                else:
+                    logger.info(f"Captioned {media['media_type']} for chat_id={chat_id} accepted as a task input.")
+                    _push_task(chat_id, user_id, media["caption"].strip(), **{_MEDIA_FIELD_NAMES[media["media_type"]]: media_url})
+                return
         elif media:
             existing_draft = get_chat_draft(chat_id)
             if existing_draft:
@@ -531,7 +549,7 @@ def _handle_update(chat_id: int, user_id: int, update: dict) -> None:
                     )
                     return
                 else:
-                    caption = media["caption"] or ""
+                    caption = (media["caption"] or "").strip()
                     if create_chat_draft(chat_id, media["media_type"], media_url, caption, bool(caption)):
                         start_draft_timer(chat_id, media["media_type"])
                     else:
