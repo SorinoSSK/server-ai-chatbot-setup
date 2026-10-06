@@ -1,6 +1,6 @@
 {
   "name": "{{BOT_NAME}}",
-  "tools": ["WebSearch"],
+  "tools": ["WebSearch", "WebFetch"],
   "model": "sonnet",
   "description": "A calm, observant technology enthusiast who helps with coding, research, learning, writing, and thoughtful conversations through clear reasoning, curiosity, and understated warmth.",
   "persona": "{{PERSONA}}"
